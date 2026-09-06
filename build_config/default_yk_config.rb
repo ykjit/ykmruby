@@ -8,6 +8,8 @@ MRuby::Build.new('default_yk_config') do |conf|
   conf.cc.defines << 'MRB_NO_DIRECT_THREADING'
   conf.cc.defines << 'MRB_NO_BOXING'
   conf.cc.defines << 'MRB_INT64'
+  # Default (512) is too low for AWFY's Havlak: HavlakLoopFinder#do_dfs
+  conf.cc.defines << 'MRB_CALL_LEVEL_MAX=4096'
 
   conf.gembox 'stdlib'
   conf.gembox 'stdlib-ext'

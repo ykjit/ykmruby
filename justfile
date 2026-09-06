@@ -1,5 +1,8 @@
 build: build-yk-config
 
+build-plain:
+    rake
+
 build-yk-config: build-plain
     rake MRUBY_CONFIG=default_yk_config
 
