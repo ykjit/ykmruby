@@ -15,6 +15,14 @@ assert('GC.disable') do
   end
 end
 
+# mrb_gc_add_region() must refuse a buffer too small to hold a page once its
+# base is aligned, rather than wrapping the usable size and carving a page out
+# past the buffer's end. Driven from C (mrbgems/mruby-test/gc.c) since the
+# function has no Ruby-visible face.
+assert('GC heap region smaller than the alignment padding') do
+  assert_equal 0, __gc_add_region_undersized
+end
+
 assert('GC.interval_ratio=') do
   origin = GC.interval_ratio
   begin
@@ -32,6 +40,28 @@ assert('GC.step_ratio=') do
     assert_raise(ArgumentError) { GC.step_ratio = -1 }
   ensure
     GC.step_ratio = origin
+  end
+end
+
+assert('GC.step_ratio= / GC.interval_ratio= reject an out-of-int-range value') do
+  # The ratios are stored in a C int. A value past its range must be rejected,
+  # not truncated: truncating 2**32 to 0 leaves the incremental collector with
+  # a zero step budget and it stops making progress.
+  origin_s = GC.step_ratio
+  origin_i = GC.interval_ratio
+  begin
+    huge = 1 << 40 # fits a 64-bit mrb_int, overflows a 32-bit C int
+  rescue RangeError
+    skip 'mrb_int is not wider than a C int on this build'
+  end
+  begin
+    # On a wide mrb_int the setter's own bounds check rejects it (ArgumentError);
+    # on a narrower one the argument conversion rejects it first (RangeError).
+    assert_raise(ArgumentError, RangeError) { GC.step_ratio = huge }
+    assert_raise(ArgumentError, RangeError) { GC.interval_ratio = huge }
+  ensure
+    GC.step_ratio = origin_s
+    GC.interval_ratio = origin_i
   end
 end
 
@@ -209,6 +239,7 @@ def with_builtin_string_aref
 end
 
 assert('OP_GETIDX does not retain its result in the GC arena') do
+  stress
   with_builtin_string_aref do
     s = "hello"
     GC.start
@@ -224,6 +255,7 @@ assert('OP_GETIDX does not retain its result in the GC arena') do
 end
 
 assert('OP_GETIDX does not retain a Hash default in the GC arena') do
+  stress
   h = Hash.new { Object.new }
   GC.start
   base = GC.stat[:live]
@@ -237,6 +269,7 @@ assert('OP_GETIDX does not retain a Hash default in the GC arena') do
 end
 
 assert('OP_GETIDX0 does not retain a String result in the GC arena') do
+  stress
   with_builtin_string_aref do
     s = "hello"
     GC.start
@@ -252,6 +285,7 @@ assert('OP_GETIDX0 does not retain a String result in the GC arena') do
 end
 
 assert('OP_GETIDX0 does not retain a Hash default in the GC arena') do
+  stress
   h = Hash.new { Object.new }
   GC.start
   base = GC.stat[:live]
@@ -265,6 +299,7 @@ assert('OP_GETIDX0 does not retain a Hash default in the GC arena') do
 end
 
 assert('OP_SETIDX does not retain a duplicated Hash key in the GC arena') do
+  stress
   h = {}
   k = "a"
   GC.start
@@ -278,7 +313,35 @@ assert('OP_SETIDX does not retain a duplicated Hash key in the GC arena') do
   assert_operator GC.stat[:live] - base, :<, 100
 end
 
+assert('OP_ENTER keeps the block alive while it lays out a short argument list') do
+  stress
+  # A call that passes fewer positional arguments than the `*rest` and post
+  # parameters span has its post arguments moved to the end of that span,
+  # and when nothing but the required arguments came, or they came packed in
+  # one array with a keyword hash after it, that is the register the block
+  # arrived in.  The empty `rest` is allocated right after, with the block
+  # held in a C local and nowhere the marker looks, so a collection landing
+  # on that allocation freed the `Proc`, and what the method then read as its
+  # block was whatever the cell was reused for.  Enough calls for the
+  # collector to land there.
+  def gc_test_short_args(x, *r, y, &blk); blk; end
+  def gc_test_short_args_kw(x, *r, y, **o, &blk); blk; end
+  args = [1, 2]
+  kw = {}
+  bad = 0
+  i = 0
+  while i < 5000
+    b = gc_test_short_args(1, 2) { :c }
+    bad += 1 unless b.call == :c
+    b = gc_test_short_args_kw(*args, **kw) { :c }
+    bad += 1 unless b.call == :c
+    i += 1
+  end
+  assert_equal 0, bad
+end
+
 assert('OP_ADD does not retain an overflowed Integer in the GC arena') do
+  stress
   # The overflow branch promotes to a big integer, so it only exists with
   # mruby-bigint.  The shift count is a variable because a constant shift is
   # folded at compile time, and a folded result out of mrb_int range makes the
@@ -318,6 +381,7 @@ end
 # of mrb_int range makes the build fail rather than raise.
 
 assert('OP_ADD does not retain a boxed Integer in the GC arena') do
+  stress
   [30, 31, 62].each do |shift|
     begin
       x = 1 << shift
@@ -339,6 +403,7 @@ assert('OP_ADD does not retain a boxed Integer in the GC arena') do
 end
 
 assert('OP_DIV does not retain a boxed Integer in the GC arena') do
+  stress
   [30, 31, 62].each do |shift|
     begin
       x = 1 << shift
@@ -359,6 +424,7 @@ assert('OP_DIV does not retain a boxed Integer in the GC arena') do
 end
 
 assert('OP_LOADI32 does not retain a boxed Integer in the GC arena') do
+  stress
   # `1073741824` is `2**30`, which fits in the operand of `OP_LOADI32` rather
   # than going to the pool, and is the first value outside the fixnum range of
   # a 32-bit host under word boxing.  That is the only configuration where this
@@ -388,6 +454,7 @@ end
 # retain nothing and the assertions hold trivially.
 
 assert('OP_MATH does not retain a boxed Float in the GC arena') do
+  stress
   skip unless Object.const_defined?(:Float)
   [1.0e100, 5.0e-324].each do |x|
     zero = 0.0
@@ -409,6 +476,7 @@ assert('OP_MATH does not retain a boxed Float in the GC arena') do
 end
 
 assert('OP_DIV does not retain a boxed Float in the GC arena') do
+  stress
   skip unless Object.const_defined?(:Float)
   # OP_DIV boxes from a helper outside the interpreter loop, so it restores to
   # its own saved arena index rather than to the frame's.
@@ -429,6 +497,7 @@ assert('OP_DIV does not retain a boxed Float in the GC arena') do
 end
 
 assert('OP_ADDI does not retain a boxed Float in the GC arena') do
+  stress
   skip unless Object.const_defined?(:Float)
   x = 1.0e100
   y = nil
@@ -449,6 +518,7 @@ assert('OP_ADDI does not retain a boxed Float in the GC arena') do
 end
 
 assert('OP_LOADL does not retain a boxed Float in the GC arena') do
+  stress
   skip unless Object.const_defined?(:Float)
   y = nil
   GC.start

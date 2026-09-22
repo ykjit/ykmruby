@@ -10,15 +10,22 @@ jobs:
   GCC-CLANG:
     name: "${{ matrix.os }}-${{ matrix.altname || matrix.cc }}"
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
+    # A row that installs a toolchain is given room for that step's own
+    # budget on top of the work: 15 is what the rest of a job takes at
+    # worst, and an apt allowed 10 minutes does not fit beside it.  The
+    # rows that install nothing keep the 15 the whole job costs them.
+    timeout-minutes: ${{ matrix.timeout || 15 }}
     strategy:
       fail-fast: false
       max-parallel: 8
       matrix:
         include:
-          # x86-64 LP64 with signed plain `char`.
-          - {os: ubuntu-24.04, cc: gcc, cxx: g++}
-          - {os: ubuntu-24.04, cc: clang, cxx: clang++}
+          # x86-64 LP64 with signed plain `char`.  These two also run the
+          # stress tests (test/assert.rb, `stress`): what those check is
+          # neither ABI nor compiler specific, and they are the bulk of a
+          # suite's running time, many times so under MRB_GC_STRESS.
+          - {os: ubuntu-24.04, cc: gcc, cxx: g++, stress: "1"}
+          - {os: ubuntu-24.04, cc: clang, cxx: clang++, stress: "1"}
           - {os: ubuntu-22.04, cc: gcc, cxx: g++}
           - {os: ubuntu-22.04, cc: clang, cxx: clang++}
           # AArch64 LP64 with unsigned plain `char`.
@@ -28,6 +35,7 @@ jobs:
             cc: i686-linux-gnu-gcc
             cxx: i686-linux-gnu-g++
             altname: "i686-gcc"
+            timeout: 25
           # AArch32 ILP32 with unsigned plain `char`, run under qemu.  The
           # emulation is why this one says so: see build_config/ci/gcc-clang.rb.
           - os: ubuntu-24.04
@@ -35,34 +43,59 @@ jobs:
             cxx: arm-linux-gnueabihf-g++
             altname: "armhf-gcc"
             emulated: "1"
+            abi_only: "1"
+            timeout: 25
           # AArch64 LP64 with signed plain `char`.
           - {os: macos-26, cc: clang, cxx: clang++}
           - {os: macos-15, cc: clang, cxx: clang++}
           # x86-64 LLP64 with signed plain `char`.
-          - {os: windows-2025, cc: gcc, cxx: g++, altname: "mingw-gcc"}
-          - {os: windows-2022, cc: gcc, cxx: g++, altname: "mingw-gcc"}
+          # The mingw compiler is what costs here: the suites finish in under
+          # a minute together while the seven builds take ten of the job's
+          # fifteen, so this runner is asked for its ABI and not for what
+          # reads the same everywhere.  See build_config/ci/gcc-clang.rb.
+          - os: windows-2025
+            cc: gcc
+            cxx: g++
+            altname: "mingw-gcc"
+            abi_only: "1"
+          - os: windows-2022
+            cc: gcc
+            cxx: g++
+            altname: "mingw-gcc"
+            abi_only: "1"
     env:
       MRUBY_CONFIG: ci/gcc-clang
       CC: ${{ matrix.cc }}
       CXX: ${{ matrix.cxx }}
       LD: ${{ matrix.cc }}
       MRUBY_CI_EMULATED: ${{ matrix.emulated }}
+      MRUBY_CI_ABI_ONLY: ${{ matrix.abi_only }}
+      MRBTEST_STRESS: ${{ matrix.stress }}
     steps:
       - name: "Checkout ${{ github.ref }} ( ${{ github.sha }} )"
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           submodules: true
+      # 10, not 5: the download is 64.6 MB and the step has taken more than
+      # five minutes, which failed master rather than the pull request that
+      # would have shown it.  A whole job here finishes in four to five, so
+      # five for one step of it was never the headroom it looked like.  The
+      # job is given 25 for the same reason: an apt that takes the ten it is
+      # allowed leaves nothing of a fifteen-minute job for the build and the
+      # suites, and a slow mirror cancelled the tests rather than failing the
+      # step that was slow.
       - name: Install i386 cross-build toolchain
         if: matrix.altname == 'i686-gcc'
-        timeout-minutes: 5
+        timeout-minutes: 10
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             crossbuild-essential-i386
+      # The same, for a download that also carries qemu and binfmt.
       - name: Install armhf cross-build toolchain
         if: matrix.altname == 'armhf-gcc'
-        timeout-minutes: 5
+        timeout-minutes: 10
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \

@@ -57,7 +57,10 @@ mrb_class(mrb_state *mrb, mrb_value v)
    19:   is_prepended
    18:   is_origin
    17:   is_inherited (used by method cache)
-   7-16: unused
+   16:   eq_defined (a class among the ancestors defines its own `==`)
+   8:    is_refined (MRB_USE_REFINEMENTS)
+   7:    is_refinement (MRB_USE_REFINEMENTS)
+   9-15: unused
    6:    prohibit Class#allocate
    0-5:  instance type
 */
@@ -72,6 +75,22 @@ mrb_class(mrb_state *mrb, mrb_value v)
   }\
 } while (0)
 #define MRB_FL_CLASS_IS_INHERITED (1 << 17)
+/* A class among the ancestors defines a `==` that is not the builtin one.
+   `OP_EQ` answers `obj == obj` from the identity of the operands only for a
+   class without it; with it the class's own `==` is asked, as CRuby asks it.
+   Set by `mrb_define_method_raw()` and carried to subclasses, singleton
+   classes and includers; never cleared, since a stale flag only costs a
+   send whose answer is the same. `OP_EQ` reads the flag itself for a heap
+   receiver; for `nil`, `true` and `false`, which carry no class pointer, it
+   reads `MRB_BOP_NIL_TRUE_FALSE_EQ`, which the flag of the three sets. */
+#define MRB_FL_CLASS_EQ_DEFINED (1 << 16)
+#ifdef MRB_USE_REFINEMENTS
+/* A module made by Module#refine: its `super` is the class it refines. */
+#define MRB_FL_CLASS_IS_REFINEMENT (1 << 7)
+#define MRB_CLASS_REFINEMENT_P(c) (((c)->flags & MRB_FL_CLASS_IS_REFINEMENT) != 0)
+/* A class or module some refinement targets; never cleared. */
+#define MRB_FL_CLASS_IS_REFINED (1 << 8)
+#endif
 #define MRB_INSTANCE_TT_MASK (0x1F)
 #define MRB_SET_INSTANCE_TT(c, tt) ((c)->flags = (((c)->flags & ~MRB_INSTANCE_TT_MASK) | (char)(tt)))
 #define MRB_INSTANCE_TT(c) (enum mrb_vtype)((c)->flags & MRB_INSTANCE_TT_MASK)

@@ -94,7 +94,13 @@ binding_env_new_lvspace(mrb_state *mrb, const struct REnv *e)
      carries the special-variable slot past its one local from the start
      (MRB_ENV_SET_SVAR below; see internal.h). */
   mrb_value *stacks = (mrb_value*)mrb_malloc(mrb, MRB_ENV_SVAR_STACK_SIZE(1));
-  env->mid = 0;
+  /* The space stands in for the frame the binding was taken from, so it
+     answers for the class that frame ran under and for the method it was
+     called by: a string evaluated in the binding takes the first as the
+     class its constants, `class` bodies and class variables belong to, and
+     is named for the second. */
+  env->c = e ? e->c : NULL;
+  env->mid = e ? e->mid : 0;
   env->stack = stacks;
   if (e && e->stack && MRB_ENV_LEN(e) > 0) {
     env->stack[0] = e->stack[0];
@@ -118,7 +124,7 @@ binding_check_proc_upper_count(mrb_state *mrb, const struct RProc *proc)
       mrb_raise(mrb, E_RUNTIME_ERROR,
                 "too many upper procs for local variables (mruby limitation; maximum is " MRB_STRINGIZE(BINDING_UPPER_MAX) ")");
     }
-    if (MRB_PROC_SCOPE_P(proc)) break;
+    if (MRB_PROC_LVAR_BOUNDARY_P(proc)) break;
   }
 }
 
@@ -239,7 +245,7 @@ binding_local_variable_search(mrb_state *mrb, const struct RProc *proc, struct R
       }
     }
 
-    if (MRB_PROC_SCOPE_P(proc)) break;
+    if (MRB_PROC_LVAR_BOUNDARY_P(proc)) break;
     env = MRB_PROC_ENV(proc);
     proc = proc->upper;
   }

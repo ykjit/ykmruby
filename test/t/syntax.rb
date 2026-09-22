@@ -34,6 +34,114 @@ assert('super', '11.3.4') do
   assert_equal [1,2,3], bar.bar(1,2,3)
 end
 
+assert('super forwards the caller\'s block from inside a block') do
+  # `super` reads the block from the frame of the method it belongs to.  From
+  # inside a block that frame is reached through an env, and the level the
+  # instruction carries counts the envs above this frame's own, one fewer
+  # than the scopes the compiler walked to find the method.
+  base = Class.new { def m; block_given? ? yield(:b) : :noblk; end }
+  sub = Class.new(base) { def m; r = nil; [1].each { r = super }; r; end }
+  assert_equal [:blk, :b], sub.new.m { |v| [:blk, v] }
+
+  deep = Class.new(base) { def m; r = nil; [1].each { [2].each { r = super } }; r; end }
+  assert_equal [:blk, :b], deep.new.m { |v| [:blk, v] }
+end
+
+assert('super forwards the keyword arguments at their current values') do
+  # Each keyword parameter is moved into its local by deleting it from the
+  # dictionary the frame received, so by the time `super` runs the dictionary
+  # holds only what no parameter claimed, and it is the object `**rest`
+  # names.  A bare `super` builds the parent's dictionary afresh from the
+  # keyword locals and a copy of `rest`, as CRuby does.
+  base = Class.new do
+    def kw(a:, b: 2); [a, b]; end
+    def rest(a:, **o); [a, o]; end
+    def restonly(**o); o; end
+    def all(x, *r, y, a:, b: 2, **o, &blk); [x, r, y, a, b, o, blk ? blk.call : nil]; end
+  end
+  sub = Class.new(base) do
+    def kw(a:, b: 2); super; end
+    def rest(a:, **o); super; end
+    def restonly(**o); [super, o]; end
+    def all(x, *r, y, a:, b: 2, **o, &blk); super; end
+  end
+  o = sub.new
+  assert_equal [1, 3], o.kw(a: 1, b: 3)
+  assert_equal [1, 2], o.kw(a: 1)
+  assert_equal [1, {c: 3}], o.rest(a: 1, c: 3)
+  assert_equal [1, [2], 3, 4, 2, {c: 5}, :blk], o.all(1, 2, 3, a: 4, c: 5) { :blk }
+
+  # the parent's dictionary is a copy, so what its keyword parameters delete
+  # from it stays in the child's `rest`
+  parent_dict, own = o.restonly(a: 1)
+  assert_equal({a: 1}, parent_dict)
+  assert_equal({a: 1}, own)
+  assert_false parent_dict.equal?(own)
+  twice = Class.new(base) do
+    def kw(a:, b: 2); [super, super]; end
+    def rest(a:, **o); [super, super, o]; end
+  end
+  assert_equal [[1, 2], [1, 2]], twice.new.kw(a: 1)
+  assert_equal [[1, {c: 2}], [1, {c: 2}], {c: 2}], twice.new.rest(a: 1, c: 2)
+
+  # the locals are read where `super` is, so a keyword reassigned before it
+  # reaches the parent reassigned, a declared keyword wins over a key of its
+  # name in `rest`, and the child's default is what the parent sees when the
+  # caller passed nothing
+  reassign = Class.new(base) do
+    def kw(a:, b: 2); a *= 10; b = :changed; super; end
+    def rest(a:, **o); o = {a: 5, z: 1}; super; end
+  end
+  assert_equal [10, :changed], reassign.new.kw(a: 1)
+  assert_equal [1, {z: 1}], reassign.new.rest(a: 1)
+  defaults = Class.new(Class.new { def m(a: :parent); a; end }) { def m(a: :child); super; end }
+  assert_equal :child, defaults.new.m
+
+  # from inside a block, a nested block or a lambda, up more than one level,
+  # with a block of its own, and through `...` and the anonymous `**`
+  blk = Class.new(base) do
+    def kw(a:, b: 2); r = nil; [0].each { r = super }; r; end
+    def rest(a:, **o); r = nil; [0].each { [1].each { r = super } }; r; end
+    def restonly(**o); -> { super }.call; end
+    def all(x, *r, y, a:, b: 2, **o, &blk); super { :from_child }; end
+  end
+  assert_equal [1, 2], blk.new.kw(a: 1)
+  assert_equal [1, {c: 2}], blk.new.rest(a: 1, c: 2)
+  assert_equal({a: 1}, blk.new.restonly(a: 1))
+  assert_equal [1, [], 2, 3, 2, {}, :from_child], blk.new.all(1, 2, a: 3)
+  deep = Class.new(sub) { def kw(a:, b: 2); super; end }
+  assert_equal [1, 3], deep.new.kw(a: 1, b: 3)
+  fwd = Class.new(base) { def rest(...); super; end }
+  assert_equal [1, {c: 2}], fwd.new.rest(a: 1, c: 2)
+  anon = Class.new(base) { def rest(*, **, &); super; end }
+  assert_equal [1, {c: 2}], anon.new.rest(a: 1, c: 2)
+end
+
+assert('super forwards from a scope that has closed') do
+  # A block that outlives its method reads the method's locals through an
+  # env moved off the stack when the frame popped, holding exactly the
+  # locals the scope declared.  The argument slots, the keyword dictionary
+  # and the block all reach `super` through that copy, so what it was sized
+  # for is what a `super` running this late can forward.
+  base = Class.new do
+    def kw(a, k: 1); [a, k, block_given? ? yield : nil]; end
+    def rest(a:, **o); [a, o]; end
+    def post(a, *r, z, k: 1); [a, r, z, k]; end
+  end
+  sub = Class.new(base) do
+    def kw(a, k: 1); -> { super }; end
+    def rest(a:, **o); -> { super }; end
+    def post(a, *r, z, k: 1); -> { super }; end
+  end
+
+  fwd = sub.new.kw(1, k: 2) { :caller }
+  assert_equal [1, 2, :caller], fwd.call
+  assert_equal [1, 2, :caller], fwd.call
+  assert_equal [9, 1, :caller], sub.new.kw(9) { :caller }.call
+  assert_equal [1, {c: 2}], sub.new.rest(a: 1, c: 2).call
+  assert_equal [1, [2, 3], 4, 5], sub.new.post(1, 2, 3, 4, k: 5).call
+end
+
 assert('yield', '11.3.5') do
 # it's syntax error now
 #  assert_raise LocalJumpError do
@@ -181,6 +289,23 @@ assert('safe navigation operator-assignment short-circuits on nil') do
   d = acc.new
   d&.x ||= 7
   assert_equal 7, d.x
+end
+
+class SelfSafeCall
+  def y(*); :called; end
+  # `[nil].first` leaves nil in the first temporary register, which is
+  # the one the nil check of the call below reads when the receiver is
+  # not loaded; a receiver written as `self` is never nil
+  def bare;  [nil].first; self&.y;     end
+  def args;  [nil].first; self&.y(1);  end
+  def value; [nil].first; x = self&.y; x; end
+end
+
+assert('a safe navigation call on a written self is made') do
+  o = SelfSafeCall.new
+  assert_equal :called, o.bare
+  assert_equal :called, o.args
+  assert_equal :called, o.value
 end
 
 assert('local variable or/and-assignment yields its value') do
@@ -514,6 +639,16 @@ assert('multiple assignment (rest+post)') do
   assert_equal 2, b
   assert_equal [], c
   assert_equal 3, d
+
+  # each post target takes the next value left after the rest, and nil once
+  # they run out; the counter that walks them stood still, so every post
+  # target after the first took the value of the one before it
+  e, f, *g, h, i = 1, 2, 3
+  assert_equal [1, 2, [], 3, nil], [e, f, g, h, i]
+  e, f, *g, h, i = 1, 2, 3, 4
+  assert_equal [1, 2, [], 3, 4], [e, f, g, h, i]
+  e, f, *g, h, i = 1, 2, 3, 4, 5
+  assert_equal [1, 2, [3], 4, 5], [e, f, g, h, i]
 end
 
 assert('multiple assignment (nosplat array rhs)') do
@@ -975,6 +1110,54 @@ assert 'keyword arguments' do
   assert_equal([:a, nil, :c], m(a: :a, c: :c))
 end
 
+assert('keyword arguments with fifteen or more positional parameters') do
+  # 15 is the mark for arguments packed into an array in the 4 bits that carry
+  # the positional count, so a method this wide cannot be asked which register
+  # its keyword dictionary was left in
+  a14 = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+  a15 = a14 + [15]
+  a16 = a15 + [16]
+
+  def m14(p1,p2,p3,p4,p5,p6,p7,p8,p9,p10,p11,p12,p13,p14, k: 1) [p14, k] end
+  assert_equal([14, 7], m14(*a14, k: 7))
+
+  def m15(p1,p2,p3,p4,p5,p6,p7,p8,p9,p10,p11,p12,p13,p14,p15, k: 1) [p15, k] end
+  assert_equal([15, 7], m15(*a15, k: 7))
+  assert_equal([15, 1], m15(*a15))
+  assert_raise(ArgumentError) { m15(*a15, z: 9) }
+
+  def m16(p1,p2,p3,p4,p5,p6,p7,p8,p9,p10,p11,p12,p13,p14,p15,p16, k: 1) [p16, k] end
+  assert_equal([16, 7], m16(*a16, k: 7))
+
+  def m15r(p1,p2,p3,p4,p5,p6,p7,p8,p9,p10,p11,p12,p13,p14,p15, k:) k end
+  assert_equal(7, m15r(*a15, k: 7))
+  assert_raise(ArgumentError) { m15r(*a15) }
+
+  # a declared keyword is taken out of the rest of them
+  def m15k(p1,p2,p3,p4,p5,p6,p7,p8,p9,p10,p11,p12,p13,p14,p15, k: 1, **o) [k, o] end
+  assert_equal([7, {x: 8}], m15k(*a15, k: 7, x: 8))
+
+  # 14 mandatory parameters and a rest count 15 as well
+  def m14s(p1,p2,p3,p4,p5,p6,p7,p8,p9,p10,p11,p12,p13,p14, *rest, k: 1) [rest, k] end
+  assert_equal([[15], 7], m14s(*a15, k: 7))
+
+  # a lambda and a block are entered the same way
+  l = ->(p1,p2,p3,p4,p5,p6,p7,p8,p9,p10,p11,p12,p13,p14,p15, k: 1) { [p15, k] }
+  assert_equal([15, 7], l.call(*a15, k: 7))
+  def m15y(*a, **k) yield(*a, **k) end
+  result = m15y(*a15, k: 7) {|p1,p2,p3,p4,p5,p6,p7,p8,p9,p10,p11,p12,p13,p14,p15, k: 1| [p15, k] }
+  assert_equal([15, 7], result)
+
+  # and `super` forwards them
+  class KeywordWideParent
+    def m(p1,p2,p3,p4,p5,p6,p7,p8,p9,p10,p11,p12,p13,p14,p15, k: 1) [p15, k] end
+  end
+  class KeywordWideChild < KeywordWideParent
+    def m(p1,p2,p3,p4,p5,p6,p7,p8,p9,p10,p11,p12,p13,p14,p15, k: 1) super end
+  end
+  assert_equal([15, 7], KeywordWideChild.new.m(*a15, k: 7))
+end
+
 assert('numbered parameters') do
   assert_equal(15, [1,2,3,4,5].reduce {_1+_2})
   assert_equal(45, Proc.new do _1 + _2 + _3 + _4 + _5 + _6 + _7 + _8 + _9 end.call(*[1, 2, 3, 4, 5, 6, 7, 8, 9]))
@@ -1367,6 +1550,111 @@ assert('pattern matching - hash patterns') do
   end
 end
 
+assert('pattern matching - a clause that names `**rest` keeps its own value') do
+  # Capturing `**rest` left the frame one register short of where the pattern
+  # began, so the value the clause produced landed where the `case` read it
+  # from, and what came out was the rest Hash, or whatever else that register
+  # held.
+  h = {a: 1, b: 2, c: 3}
+  r = case h
+      in {a:, **rest} then [a, rest]
+      end
+  assert_equal [1, {b: 2, c: 3}], r
+
+  r = case h
+      in {a:, **rest} then :body
+      end
+  assert_equal :body, r
+
+  # no key of its own: the rest is a copy of the whole subject
+  r = case h
+      in {**rest} then [:all, rest]
+      end
+  assert_equal [:all, {a: 1, b: 2, c: 3}], r
+
+  # the value of `in` is the match, not the captured Hash
+  r = (h in {a:, **rest})
+  assert_equal [true, {b: 2, c: 3}], [r, rest]
+
+  # the statement after `=>` reads its locals from the shifted frame
+  f = ->(x) { x => {a:, **rest}; [a, rest] }
+  assert_equal [1, {b: 2, c: 3}], f.call(h)
+
+  # a rest clause that does not match must leave the subject to the next
+  # clause and to `else`
+  r = case {z: 0}
+      in {a:, **rest} then :no
+      in {z:} then [:z, z]
+      end
+  assert_equal [:z, 0], r
+
+  r = case {z: 0}
+      in {a:, **rest} then :no
+      else :else
+      end
+  assert_equal :else, r
+
+  # each `**rest` of a nested pattern captures from its own subject
+  r = case [h, h]
+      in [{a:, **r1}, {b:, **r2}] then [a, r1, b, r2]
+      end
+  assert_equal [1, {b: 2, c: 3}, 2, {a: 1, c: 3}], r
+end
+
+assert('pattern matching - a capture in a block binds the local of the enclosing scope') do
+  # A capture looked its variable up in the scope of the block alone and
+  # bound nothing when the local lived outside it, so the block left the
+  # outer local as it was.
+  v = w = r = pre = post = h = nil
+  f = ->(x) {
+    x => [v]
+    x => [Integer => w]
+    x => [*r]
+    x => [*pre, 1, *post]
+    {k: 2} => {k: h}
+  }
+  f.call([1])
+  assert_equal [1, 1, [1], [], [], 2], [v, w, r, pre, post, h]
+
+  k = rest = nil
+  [{k: 3, m: 4}].each { |x| x => {k:, **rest} }
+  assert_equal [3, {m: 4}], [k, rest]
+
+  # a `case` in a block
+  a = nil
+  [[5, 6]].each do |x|
+    case x
+    in [_, a] then nil
+    end
+  end
+  assert_equal 6, a
+
+  # the local of an enclosing block, two scopes up
+  z = nil
+  [1].each { [[7]].each { |y| y => [z] } }
+  assert_equal 7, z
+
+  # a `for` body is not a scope of its own, and a block inside it is
+  b = c = nil
+  for x in [[8]]
+    x => [b]
+    [x].each { x => [c] }
+  end
+  assert_equal [8, 8], [b, c]
+
+  # an array literal subject takes the path that knows its length
+  r = nil
+  [3].each do |x|
+    case [x, x]
+    in [*r] then nil
+    end
+  end
+  assert_equal [3, 3], r
+
+  # a local of the block's own scope is bound as before
+  assert_equal [9], [[9]].map { |x| x => [q]; q }
+end
+
 assert('pattern matching - value patterns as a hash value') do
   # a value pattern is the receiver of `===`, the hash value its argument
   case {a: 1}
@@ -1635,6 +1923,62 @@ assert('pattern matching - find pattern as the last expression of a frame') do
   assert_equal [[], 1, [2, 3]], f.call([1, 2, 3])
 end
 
+assert('pattern matching - operators the frame sends rather than answers') do
+  # An operator instruction answers itself only while the operator is the
+  # builtin one; once it is redefined the instruction sends, and the send
+  # needs a block slot after its two operands. The frames here are as wide
+  # as the pattern's own code declares, so that slot has to be counted.
+  # The overrides are aliased back at the end, which re-arms the fast paths.
+  class Array
+    alias __orig_aref []
+    def [](*a); __orig_aref(*a); end
+  end
+  class Integer
+    alias __orig_ge >=
+    alias __orig_sub -
+    alias __orig_add +
+    alias __orig_eq ==
+    def >=(o); __orig_ge(o); end
+    def -(o); __orig_sub(o); end
+    def +(o); __orig_add(o); end
+    def ==(o); __orig_eq(o); end
+  end
+  begin
+    f = ->(x) { x => [a, *, b]; [a, b] }
+    assert_equal [1, 3], f.call([1, 2, 3])
+
+    f = ->(x) { x => [a, b]; [a, b] }
+    assert_equal [1, 2], f.call([1, 2])
+
+    f = ->(x) { x => [*, a, *]; a }
+    assert_equal 1, f.call([1, 2, 3])
+
+    f = ->(x) { x => [*, a, b, *]; [a, b] }
+    assert_equal [1, 2], f.call([1, 2, 3])
+
+    f = ->(x) { x => [*p, a, *q]; [p, a, q] }
+    assert_equal [[], 1, [2, 3]], f.call([1, 2, 3])
+
+    f = ->(x) { x => {}; true }
+    assert_true f.call({})
+  ensure
+    class Array
+      alias_method :[], :__orig_aref
+      undef_method :__orig_aref
+    end
+    class Integer
+      alias_method :>=, :__orig_ge
+      alias_method :-, :__orig_sub
+      alias_method :+, :__orig_add
+      alias_method :==, :__orig_eq
+      undef_method :__orig_ge
+      undef_method :__orig_sub
+      undef_method :__orig_add
+      undef_method :__orig_eq
+    end
+  end
+end
+
 assert('defined? on statically-decidable operands') do
   # literals and pure expressions
   assert_equal 'expression', defined?(1)
@@ -1747,8 +2091,11 @@ module DefinedDeepOuter
   def self.from_lexical_scope_miss; defined?(Mid::Missing); end
 end
 
-class DefinedPathRaises
-  def self.boom; raise 'defined? evaluated a constant path root'; end
+class DefinedPathRoot
+  @evaluated = 0
+  def self.count; @evaluated; end
+  def self.seen; @evaluated += 1; DefinedDeepOuter; end
+  def self.boom; raise 'defined? let a constant path root raise'; end
 end
 
 assert('defined? on a constant path of any depth') do
@@ -1792,10 +2139,57 @@ assert('defined? on a constant path rooted at Object') do
   assert_nil defined?(::DefinedDeepOuter::Missing)
 end
 
-assert('defined? does not evaluate a constant path') do
-  # a root that would have to be evaluated is not a path the compiler names,
-  # and the call it is built from stays unmade
-  assert_nil defined?(DefinedPathRaises.boom::Leaf)
+module DefinedPathHooked
+  def self.const_missing(name); @asked = name; end
+  def self.asked; @asked; end
+end
+
+assert('defined? on a constant path resolves each name as reading it does') do
+  # a constant Object holds is out of reach through any other module, as it
+  # is for the read itself, and the walk past one does not raise
+  assert_equal 'constant', defined?(Object::String)
+  assert_nil defined?(String::String)
+  assert_nil defined?(String::Object)
+  assert_nil defined?(String::String::Leaf)
+  assert_nil defined?(Comparable::String)
+  assert_nil defined?(DefinedPathOuter::String)
+
+  # const_missing is not asked
+  assert_nil defined?(DefinedPathHooked::Missing)
+  assert_nil defined?(DefinedPathHooked::Missing::Leaf)
+  assert_nil DefinedPathHooked.asked
+end
+
+assert('defined? resolves a constant path from an evaluated root') do
+  # a root that is not a constant is evaluated, once, and the names are
+  # looked up from its value, the way a receiver is evaluated for its method
+  m = DefinedDeepOuter
+  assert_equal 'constant', defined?(m::Mid)
+  assert_equal 'constant', defined?(m::Mid::Leaf)
+  assert_nil defined?(m::Missing)
+  assert_nil defined?(m::Mid::Missing)
+  assert_nil defined?(m::NotAModule::Leaf)
+  before = DefinedPathRoot.count
+  assert_equal 'constant', defined?(DefinedPathRoot.seen::Mid::Leaf)
+  assert_equal before + 1, DefinedPathRoot.count
+  assert_nil defined?(DefinedPathRoot.seen::Missing)
+  assert_equal before + 2, DefinedPathRoot.count
+
+  # a root that is not a module, that is not itself defined, which leaves it
+  # unevaluated, or that raises, which answers nil rather than letting it out
+  n = 1
+  assert_nil defined?(n::Leaf)
+  assert_nil defined?(no_such_method_at_all::Leaf)
+  assert_nil defined?(DefinedPathRoot.seen(no_such_method_at_all)::Mid)
+  assert_equal before + 2, DefinedPathRoot.count
+  assert_nil defined?(DefinedPathRoot.boom::Leaf)
+
+  # the path is a receiver, or an argument, like any other
+  assert_equal 'method', defined?(m::Mid::Leaf.to_s)
+  assert_nil defined?(m::Mid::Leaf.no_such_method_at_all)
+  assert_nil defined?(m::Missing.to_s)
+  assert_equal 'method', defined?(assert(m::Mid::Leaf))
+  assert_nil defined?(assert(m::Missing))
 end
 
 class DefinedRecv
@@ -1844,6 +2238,94 @@ assert('defined? weighs how a method on a receiver may be called') do
   assert_nil defined?(o.prot)       # self here is not a DefinedRecv
   assert_equal 'method', o.from_inside(DefinedRecv.new)
   assert_equal 'method', defined?(o.ghost)   # through respond_to_missing?
+end
+
+class DefinedBareCall
+  private def priv; end
+  def respond_to_missing?(name, include_private = false)
+    @asked = include_private
+    name == :ghost
+  end
+  def asked; @asked; end
+  def bare_priv;  defined?(priv); end
+  def bare_ghost; defined?(ghost); end
+  def bare_none;  defined?(no_such_method_at_all); end
+  def bare_args;  defined?(ghost(1)); end
+end
+
+class DefinedBareCallAnswers < DefinedBareCall
+  def respond_to?(name, include_private = false)
+    @asked = include_private
+    name == :answered
+  end
+  def bare_answered; defined?(answered); end
+end
+
+class DefinedBareCallGone < TestNotImplement
+  def bare_gone; defined?(gone); end
+end
+
+assert('defined? asks respond_to? about a call on self') do
+  o = DefinedBareCall.new
+  # a private method is reachable, and so is one `respond_to_missing?`
+  # claims, which is asked with include_private true
+  assert_equal 'method', o.bare_priv
+  assert_equal 'method', o.bare_ghost
+  assert_true o.asked
+  assert_nil o.bare_none
+  assert_equal 'method', o.bare_args
+
+  # a `respond_to?` the object defines is what gets asked, on the same terms
+  o = DefinedBareCallAnswers.new
+  assert_equal 'method', o.bare_answered
+  assert_true o.asked
+  assert_nil o.bare_priv
+  assert_nil o.bare_ghost
+
+  # a call with a receiver written is answered on the terms of that call
+  assert_nil defined?(o.answered)
+  assert_nil defined?(o.priv)
+
+  # a method standing for a feature the build does not have is not there
+  assert_nil DefinedBareCallGone.new.bare_gone
+  assert_nil defined?(TestNotImplement.gone)
+end
+
+class DefinedBareCallNoMissing
+  undef_method :respond_to_missing?
+  def bare_none; defined?(no_such_method_at_all); end
+end
+
+class DefinedBareCallNoRespondTo
+  undef_method :respond_to?
+  def bare_none; defined?(no_such_method_at_all); end
+  def bare_self; defined?(bare_self); end
+end
+
+class DefinedBareCallRaises
+  def respond_to_missing?(name, include_private = false)
+    raise 'defined? let respond_to_missing? raise'
+  end
+  def bare_none; defined?(no_such_method_at_all); end
+end
+
+assert('defined? on self answers nil where respond_to_missing? or respond_to? is undefined') do
+  # a name with no method behind it is nil, not an error about the hook
+  # that has been undefined; the same asked with a receiver is nil as well
+  o = DefinedBareCallNoMissing.new
+  assert_nil o.bare_none
+  assert_nil defined?(o.no_such_method_at_all)
+
+  # an undefined `respond_to?` is not a redefinition either, so the answer
+  # is the one `respond_to?` would give
+  o = DefinedBareCallNoRespondTo.new
+  assert_nil o.bare_none
+  assert_equal 'method', o.bare_self
+  assert_nil defined?(o.no_such_method_at_all)
+
+  # what a `respond_to_missing?` the object defines raises is not caught
+  # for a call on self, which is why an undefined one has to be told apart
+  assert_raise(RuntimeError) { DefinedBareCallRaises.new.bare_none }
 end
 
 assert('defined? answers nil where evaluating a receiver raises') do
@@ -2016,6 +2498,44 @@ assert('defined? on control flow, jumps and definitions') do
   assert_false Object.const_defined?(:DefinedNeverClass)
   assert_false Object.const_defined?(:DefinedNeverModule)
   assert_equal 'expression', defined?(class << self; end)
+
+  # a rescue modifier, a named-capture match, and the statements that only a
+  # bare begin can hold in an operand
+  assert_equal 'expression', defined?(begin; no_such_method_at_all rescue 1; end)
+  assert_equal 'expression', defined?(/(?<defined_never_bound>.)/ =~ 'x')
+  assert_nil defined_never_bound
+  assert_equal 'expression', defined?(begin; alias defined_never_alias defined_never_defined; end)
+  assert_false respond_to?(:defined_never_alias, true)
+  assert_equal 'expression', defined?(begin; undef assert; end)
+  assert_equal 'expression', defined?(begin; END { }; end)
+end
+
+assert('defined? answers with a frozen string') do
+  lv = 1
+  assert_true defined?(1).frozen?
+  assert_true defined?(nil).frozen?
+  assert_true defined?(lv).frozen?
+  assert_true defined?(lv = 2).frozen?
+  assert_true defined?(Object).frozen?
+  assert_true defined?(assert).frozen?
+  assert_true defined?(1.to_s).frozen?
+  assert_true defined?(Object::String).frozen?
+  assert_raise(FrozenError) { defined?(self).upcase! }
+end
+
+assert('defined? on a back reference reads it') do
+  # `$~` holds nothing here, so every name that reads from it is nil
+  assert_nil defined?($&)
+  assert_nil defined?($`)
+  assert_nil defined?($1)
+  assert_nil defined?($1.to_s)
+  assert_nil defined?(assert($1))
+end
+
+assert('defined? names it a local variable') do
+  assert_equal ['local-variable'], [1].map { defined?(it) }
+  assert_equal ['method'], [1].map { defined?(it.to_s) }
+  assert_equal [nil], [1].map { defined?(it.no_such_method_at_all) }
 end
 
 assert('defined? sees through parentheses around one expression') do
@@ -2132,4 +2652,571 @@ assert('local variable operator-assignment with a non-numeric receiver') do
   # propagates rather than being swallowed
   obj3 = Class.new { def +(n); raise ArgumentError, n.to_s; end }.new
   assert_raise_with_message(ArgumentError, "7") { obj3 += 7 }
+end
+
+assert('pattern matching - the case value survives a failed clause') do
+  # The move that puts the case value in a register of its own is not the
+  # last read of the value: every `in` clause reads that register again.
+  # Folding the move into the first clause's own move left the register the
+  # later clauses read never written.
+  f = ->(x) {
+    case x
+    in {zz: 1} then :zz
+    in {a: 1} then :a
+    else :none
+    end
+  }
+  assert_equal :a, f.call({a: 1})
+  assert_equal :zz, f.call({zz: 1})
+  assert_equal :none, f.call({b: 1})
+
+  g = ->(x) {
+    case x
+    in [1, 2] then :two
+    in [1] then :one
+    else :none
+    end
+  }
+  assert_equal :two, g.call([1, 2])
+  assert_equal :one, g.call([1])
+  assert_equal :none, g.call([3])
+
+  # a third clause reads it as well
+  h = ->(x) {
+    case x
+    in {zz: 1} then :zz
+    in {yy: 1} then :yy
+    in {a: 1} then :a
+    else :none
+    end
+  }
+  assert_equal :a, h.call({a: 1})
+  assert_equal :none, h.call({b: 1})
+
+  # the one-line forms read it again for a later alternative
+  i = ->(x) { x in {a: 1} | {b: 2} }
+  assert_true i.call({b: 2})
+  assert_true i.call({a: 1})
+  assert_false i.call({c: 3})
+
+  j = ->(x) { x => {a: 1} | {b: 2}; :ok }
+  assert_equal :ok, j.call({b: 2})
+  assert_raise(NoMatchingPatternError) { j.call({c: 3}) }
+end
+
+assert('pattern matching - the constant of a constant pattern is a test of its own') do
+  # `Const[...]` and `Const(...)` reach the rest of the pattern only when the
+  # constant answers `===` for the subject.
+  assert_true(([1, 2] in Array[1, 2]))
+  assert_false(([1, 2] in String[1, 2]))
+  assert_true(({a: 1} in Hash(a: 1)))
+  assert_false(({a: 1} in String(a: 1)))
+  assert_true(([1, 2] in Array[*, 1, *]))
+  assert_false(([1, 2] in String[*, 1, *]))
+
+  assert_true(([] in Array[]))
+  assert_false(([] in Hash[]))
+  assert_true(([[1]] in Array[Array[1]]))
+  assert_false(([[1]] in Array[Hash[1]]))
+
+  [1, 2, 3] in Array[1, *rest]
+  assert_equal [2, 3], rest
+
+  # it is `===` that the constant is asked, not a class check of its own
+  EqqAlways = Class.new do
+    def self.===(_o); :truthy; end
+  end
+  assert_true(([1] in EqqAlways[1]))
+  assert_false(([1] in Comparable[1]))
+
+  # the next clause is reached when the constant refuses
+  got = case [1, 2]
+        in Hash[1, 2] then :hash
+        in Array[1, 2] then :array
+        else :none
+        end
+  assert_equal :array, got
+end
+
+assert('pattern matching - what a pin may name') do
+  # A pin reads what it names the way any other expression is read, so it
+  # reaches beyond a local of the pattern's own scope.
+  outer = 5
+  reader = ->(v) { v in [^outer] }
+  assert_true reader.call([5])
+  assert_false reader.call([6])
+
+  # an expression
+  assert_true(([3] in [^(1 + 2)]))
+  assert_false(([4] in [^(1 + 2)]))
+  assert_true(([5] in [^(1..9)]))
+  assert_true(([1] in [^(Integer)]))
+  assert_true((["ab"] in [^("a" + "b")]))
+
+  # the expression is evaluated where the pin sits, once
+  counter = [0]
+  bump = ->{ counter[0] += 1; 3 }
+  assert_true(([3] in [^(bump.call)]))
+  assert_equal 1, counter[0]
+
+  # an instance variable
+  holder = Class.new do
+    def initialize; @iv = 1; end
+    def pinned(v); v in [^@iv]; end
+  end.new
+  assert_true holder.pinned([1])
+  assert_false holder.pinned([2])
+
+  # a class variable
+  class PinCvarHolder
+    @@cv = 7
+    def pinned(v); v in [^@@cv]; end
+  end
+  assert_true PinCvarHolder.new.pinned([7])
+  assert_false PinCvarHolder.new.pinned([8])
+
+  # a global variable
+  $syntax_pin_gvar = 3
+  assert_true(([3] in [^$syntax_pin_gvar]))
+  assert_false(([4] in [^$syntax_pin_gvar]))
+
+  # every pattern shape a pin can sit in
+  z = 2
+  assert_true(({a: 2} in {a: ^z}))
+  assert_true(([1, 2, 3] in [*, ^z, *]))
+  assert_true(([[1, 2]] in [[1, ^z]]))
+  assert_true(([2] in [1] | [^z]))
+  assert_equal :two, (case [2]
+                      in [1] then :one
+                      in [^z] then :two
+                      else :none
+                      end)
+  [2] => [^z]
+
+  # a pin can name a variable the pattern bound to its left
+  assert_equal :ok, (case [1, 1]; in [a, ^a] then :ok; else :no; end)
+  assert_equal :no, (case [1, 2]; in [a, ^a] then :ok; else :no; end)
+end
+
+assert('pattern matching - the clauses of a case share one deconstruct') do
+  # Each array or find clause sent `respond_to?` and `deconstruct` to the
+  # subject afresh, so a subject with a costly hook paid for it once per
+  # clause.  CRuby keeps the first answer for the rest of the `case`.
+  counted = Class.new do
+    attr_reader :sent, :asked
+    def initialize(v); @v = v; @sent = 0; @asked = 0; end
+    def deconstruct; @sent += 1; @v; end
+    def respond_to?(m, priv = false); @asked += 1 if m == :deconstruct; super; end
+  end
+
+  d = counted.new([1, 2])
+  r = case d
+      in [3] then :no
+      in [1, 2, 3] then :no
+      in [1, *] then :yes
+      end
+  assert_equal [:yes, 1, 1], [r, d.sent, d.asked]
+
+  # a guard, a capture and an alternative read the same answer
+  d = counted.new([1, 2])
+  r = case d
+      in [3] | [4] then :no
+      in [1, x] => whole if x == 9 then :no
+      in [1, x] unless x == 2 then :no
+      in [1, 2] then :yes
+      end
+  assert_equal [:yes, 1, 1], [r, d.sent, d.asked]
+
+  # a find pattern shares with an array pattern
+  d = counted.new([0, 1, 2])
+  r = case d
+      in [*, 9, *] then :no
+      in [0, *] then :yes
+      end
+  assert_equal [:yes, 1], [r, d.sent]
+
+  # a subject with no hook is asked once and falls through to else
+  bare = Class.new do
+    attr_reader :asked
+    def initialize; @asked = 0; end
+    def respond_to?(m, priv = false); @asked += 1 if m == :deconstruct; super; end
+  end
+  b = bare.new
+  r = case b
+      in [1] then :no
+      in [*] then :no
+      in [*, 1, *] then :no
+      else :else
+      end
+  assert_equal [:else, 1], [r, b.asked]
+
+  # a nested pattern deconstructs its own subject in every clause
+  d = counted.new([1])
+  x = [d, d]
+  r = case x
+      in [[3], _] then :no
+      in [[1], _] then :yes
+      end
+  assert_equal [:yes, 2], [r, d.sent]
+
+  # a case that is the whole body of a method returns through the register
+  cls = Class.new do
+    def self.pick(d)
+      case d
+      in [3] then :a
+      in [1, *] then :b
+      end
+    end
+  end
+  assert_equal :b, cls.pick(counted.new([1, 2]))
+
+  # the value of the case and the subject are where the clauses left them
+  d = counted.new([7])
+  r = case d
+      in [8] then :no
+      in Integer then :no
+      in [q] then [q, d.sent]
+      end
+  assert_equal [7, 1], r
+  r = case counted.new([1])
+      in [2] then 1
+      else 2
+      end
+  assert_equal 2, r
+end
+
+assert('pattern matching - a subject with no deconstruction hook does not match') do
+  # The pattern asks whether the subject answers the hook before it sends one,
+  # as CRuby does, so a subject that has none fails the pattern rather than
+  # raising NoMethodError.
+  f = ->(x) {
+    case x
+    in [1] then :arr
+    in {a: 1} then :hash
+    in [*, 9, *] then :find
+    else :none
+    end
+  }
+  assert_equal :none, f.call(3)
+  assert_false((3 in [1]))
+  assert_false((3 in {a: 1}))
+
+  # a private hook is not one the pattern may call
+  priv = Class.new do
+    private def deconstruct; [1]; end
+    private def deconstruct_keys(keys); {a: 1}; end
+  end.new
+  assert_false((priv in [1]))
+  assert_false((priv in {a: 1}))
+
+  pub = Class.new do
+    def deconstruct; [1]; end
+    def deconstruct_keys(keys); {a: 1}; end
+  end.new
+  assert_true((pub in [1]))
+  assert_true((pub in {a: 1}))
+
+  # one hook does not stand in for the other
+  only_ary = Class.new do
+    def deconstruct; [1]; end
+  end.new
+  assert_true((only_ary in [1]))
+  assert_false((only_ary in {a: 1}))
+  assert_true((only_ary in [*, 1, *]))
+end
+
+assert('pattern matching - a deconstruction hook has to answer a Hash') do
+  # The key check a hash pattern makes reads what #deconstruct_keys answered
+  # through a method only Hash carries, so anything else raises where it used
+  # to leak the name of that method.
+  bad_hash = Class.new { def deconstruct_keys(keys); :nothash; end }.new
+  nil_hash = Class.new { def deconstruct_keys(keys); nil; end }.new
+  assert_raise_with_message(TypeError, "deconstruct_keys must return Hash") do
+    bad_hash in {a: 1}
+  end
+  assert_raise_with_message(TypeError, "deconstruct_keys must return Hash") do
+    nil_hash in {a: 1}
+  end
+  # a pattern with no keys of its own reads the answer too
+  assert_raise_with_message(TypeError, "deconstruct_keys must return Hash") do
+    bad_hash in {}
+  end
+  assert_raise_with_message(TypeError, "deconstruct_keys must return Hash") do
+    bad_hash in {**rest}
+  end
+  assert_raise_with_message(TypeError, "deconstruct_keys must return Hash") do
+    bad_hash in {**nil}
+  end
+
+  # a hook that answers a Hash still matches
+  good = Class.new do
+    def deconstruct_keys(keys); {a: 1}; end
+  end.new
+  assert_true((good in {a: 1}))
+end
+
+class SelfAttrWrite
+  def plain;    self.a = 1;             @a;       end
+  def value;    x = (self.a = 1);       [x, @a];  end
+  def opasgn;   @c = 1; self.c += 1;    @c;       end
+  def orasgn;   @c = nil; self.c ||= 5; @c;       end
+  def andasgn;  @c = 1; self.c &&= 6;   @c;       end
+  def multi;    self.a, self.b = 1, 2;  [@a, @b]; end
+  def safe;     self&.a = 3;            @a;       end
+  def safe_op;  @c = 1; self&.c += 3;   @c;       end
+  def index;    self[0] = 9;            @i;       end
+  def index3;   self[0, 1] = 7;         @i;       end
+  def aliased;  x = self; x.a = 1;      @a;       end
+
+  private
+  attr_writer :a, :b
+  attr_accessor :c
+  def []=(i, j = nil, v); @i = v; end
+end
+
+assert('a private setter is callable on a written self') do
+  o = SelfAttrWrite.new
+  # the forms CRuby exempts: an attribute write whose receiver is the
+  # literal `self`, as a statement or a value, in the op-assign,
+  # multiple, safe and index forms too
+  assert_equal 1, o.plain
+  assert_equal [1, 1], o.value
+  assert_equal 2, o.opasgn
+  assert_equal 5, o.orasgn
+  assert_equal 6, o.andasgn
+  assert_equal [1, 2], o.multi
+  assert_equal 3, o.safe
+  assert_equal 4, o.safe_op
+  assert_equal 9, o.index
+  assert_equal 7, o.index3
+
+  # only the literal `self` is exempt: a local holding self is not, and
+  # neither is a call from outside
+  assert_raise_with_message_pattern(NoMethodError, "private method 'a=' called for SelfAttrWrite") do
+    o.aliased
+  end
+  assert_raise_with_message_pattern(NoMethodError, "private method 'a=' called for SelfAttrWrite") do
+    o.a = 1
+  end
+  assert_raise_with_message_pattern(NoMethodError, "private method 'c' called for SelfAttrWrite") do
+    o.c
+  end
+end
+
+assert('pattern matching - a guard the compiler can answer for itself') do
+  # A guard whose condition is a literal needs no jump: the peephole answers
+  # it and emits none. The failure jumps of the pattern below it are still
+  # waiting to be told where the clause ends, and used to be dropped, which
+  # left each of them pointing at the start of the irep.
+  assert_equal :b, (case [1, 2]
+                    in [3] if true then :a
+                    in [1, 2] then :b
+                    end)
+  assert_equal :e, (case [1, 2]
+                    in [3] if true then :a
+                    else :e
+                    end)
+  assert_equal :e, (case [1, 2]
+                    in [3] unless false then :a
+                    else :e
+                    end)
+  assert_equal :a, (case [1, 2]
+                    in [1, 2] if true then :a
+                    end)
+  assert_equal :e, (case({a: 1})
+                    in {a: 2} if true then :a
+                    else :e
+                    end)
+  assert_equal :e, (case [1, 2, 3]
+                    in [*, 9, *] if true then :a
+                    else :e
+                    end)
+  assert_equal :c, (case [1, 2]
+                    in [3] if true then :a
+                    in [4] if true then :b
+                    in [1, 2] if true then :c
+                    end)
+end
+
+assert('pattern matching - a guard the compiler can answer for itself, on a hook') do
+  klass = Class.new
+  klass.define_method(:deconstruct) { [1, 2] }
+  assert_equal :b, (case klass.new
+                    in [3] if true then :a
+                    in [1, 2] then :b
+                    end)
+end
+
+class SelfIndexOpAssign
+  def opasgn;  @h = {0 => 1}; self[0] += 1;                 @h[0];     end
+  def orasgn;  @h = {};       self[0] ||= 5;                @h[0];     end
+  def andasgn; @h = {0 => 1}; self[0] &&= 6;                @h[0];     end
+  def value;   @h = {0 => 1}; x = (self[0] += 1);           [x, @h[0]]; end
+  def two;     @h = {0 => 1}; self[0, 1] += 1;              @h[0];     end
+  def splat;   @h = {0 => 1}; i = [0]; self[*i] += 1;       @h[0];     end
+
+  private
+  def [](i, j = nil); @h[i]; end
+  def []=(i, j = nil, v); @h[i] = v; end
+end
+
+assert('a private index accessor is callable in an op-assign on a written self') do
+  o = SelfIndexOpAssign.new
+  # the forms CRuby exempts: both the `[]` and the `[]=` of an op-assign
+  # whose receiver is the literal `self`
+  assert_equal 2, o.opasgn
+  assert_equal 5, o.orasgn
+  assert_equal 6, o.andasgn
+  assert_equal [2, 2], o.value
+  assert_equal 2, o.two
+  assert_equal 2, o.splat
+
+  # a call from outside is not
+  assert_raise_with_message(NoMethodError, "private method '[]' called for SelfIndexOpAssign") do
+    o[0] += 1
+  end
+end
+
+class PrivateOperator
+  def initialize; @h = {0 => 1, 1 => 3}; end
+
+  # a written `self` reaches them, in a block too; `[0]` and `[1]` are two
+  # instructions, as are `+ 1` and `+ o`
+  def own_aref;  self[0];                end
+  def own_aref1; self[1];                end
+  def own_aset;  self[0] = 2; @h[0];     end
+  def own_plus;  self + 1;               end
+  def own_add;   self + self;            end
+  def own_eq;    self == 1;              end
+  def own_lt;    self < 1;               end
+  def own_block; [1].map { self[0] }[0]; end
+
+  # another object does not, whichever instruction makes the call
+  def aref(o);  o[0];     end
+  def aref1(o); o[1];     end
+  def aset(o);  o[0] = 2; end
+  def plus(o);  o + 1;    end
+  def add(o);   o + o;    end
+  def eq(o);    o == 1;   end
+  def lt(o);    o < 1;    end
+
+  private
+  def [](i);     @h[i];     end
+  def []=(i, v); @h[i] = v; end
+  def +(o);      :plus;     end
+  def ==(o);     :eq;       end
+  def <(o);      :lt;       end
+end
+
+class ProtectedOperator
+  def eq(o);   o == 1; end
+  def aref(o); o[0];   end
+
+  protected
+  def ==(o); :eq;   end
+  def [](i); :aref; end
+end
+
+class ProtectedOperatorSub < ProtectedOperator
+end
+
+class ProtectedOperatorOther
+  def eq(o); o == 1; end
+end
+
+class SuperOperator
+  private
+  def [](i); :aref; end
+  def +(o);  :plus; end
+  protected
+  def ==(o); :eq;   end
+end
+
+class SuperOperatorSub < SuperOperator
+  def own_aref; self[0]; end
+  def own_plus; self + 1; end
+  def eq(o);    o == 1;  end
+
+  private
+  def [](i); super; end
+  def +(o);  super; end
+  protected
+  def ==(o); super; end
+end
+
+class PrivateArefArray < Array
+  private
+  def [](i); :sub; end
+end
+
+assert('an operator instruction checks visibility on the send it falls back to') do
+  o = PrivateOperator.new
+  assert_equal 1, o.own_aref
+  assert_equal 3, o.own_aref1
+  assert_equal 2, o.own_aset
+  assert_equal :plus, o.own_plus
+  assert_equal :plus, o.own_add
+  assert_equal :eq, o.own_eq
+  assert_equal :lt, o.own_lt
+  assert_equal 2, o.own_block
+
+  other = PrivateOperator.new
+  assert_raise_with_message(NoMethodError, "private method '[]' called for PrivateOperator") do
+    o.aref(other)
+  end
+  assert_raise_with_message(NoMethodError, "private method '[]' called for PrivateOperator") do
+    o.aref1(other)
+  end
+  assert_raise_with_message(NoMethodError, "private method '[]=' called for PrivateOperator") do
+    o.aset(other)
+  end
+  assert_raise_with_message(NoMethodError, "private method '+' called for PrivateOperator") do
+    o.plus(other)
+  end
+  assert_raise_with_message(NoMethodError, "private method '+' called for PrivateOperator") do
+    o.add(other)
+  end
+  assert_raise_with_message(NoMethodError, "private method '==' called for PrivateOperator") do
+    o.eq(other)
+  end
+  assert_raise_with_message(NoMethodError, "private method '<' called for PrivateOperator") do
+    o.lt(other)
+  end
+  assert_raise_with_message(NoMethodError, "private method '[]' called for PrivateOperator") do
+    o[0]
+  end
+  assert_raise_with_message(NoMethodError, "private method '[]=' called for PrivateOperator") do
+    o[0] = 2
+  end
+
+  # a protected operator is reachable while the caller's `self` is of the
+  # class that defines it, a subclass included
+  p = ProtectedOperator.new
+  assert_equal :eq, p.eq(ProtectedOperator.new)
+  assert_equal :aref, p.aref(ProtectedOperator.new)
+  assert_equal :eq, ProtectedOperatorSub.new.eq(p)
+  assert_raise_with_message(NoMethodError, "protected method '==' called for ProtectedOperator") do
+    ProtectedOperatorOther.new.eq(p)
+  end
+  assert_raise_with_message(NoMethodError, "protected method '==' called for ProtectedOperator") do
+    p == 1
+  end
+  assert_raise_with_message(NoMethodError, "protected method '[]' called for ProtectedOperator") do
+    p[0]
+  end
+
+  # the Array fast path leaves a subclass to the send, which is checked
+  assert_raise_with_message(NoMethodError, "private method '[]' called for PrivateArefArray") do
+    PrivateArefArray.new[0]
+  end
+end
+
+assert('super reaches a private or protected operator') do
+  o = SuperOperatorSub.new
+  assert_equal :aref, o.own_aref
+  assert_equal :plus, o.own_plus
+  assert_equal :eq, o.eq(SuperOperator.new)
+  assert_raise_with_message(NoMethodError, "protected method '==' called for SuperOperatorSub") do
+    o == 1
+  end
 end

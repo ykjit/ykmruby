@@ -412,9 +412,13 @@ shaped_iv_foreach(mrb_state *mrb, struct RObject *obj,
   mrb_shaped_iv *siv = (mrb_shaped_iv*)obj->iv;
   if (!siv) return;
   mrb_iv_shape *shape = siv->shape;
-  if (shape->count == 0) return;
+  int count = shape->count;
+  if (count == 0) return;
 
-  /* reconstruct keys from parent chain */
+  /* reconstruct keys from parent chain: the shape tree is never freed while
+     the VM is alive (mrb_free_shape() tears it all down at shutdown), and
+     nothing here calls back into Ruby, so this part cannot be invalidated
+     by what follows. */
   mrb_sym keys[MRB_SHAPE_MAX_IVS];
   mrb_iv_shape *s = shape;
   while (s->count > 0) {
@@ -422,9 +426,29 @@ shaped_iv_foreach(mrb_state *mrb, struct RObject *obj,
     s = s->parent;
   }
 
-  for (int i = 0; i < shape->count; i++) {
-    if (!mrb_undef_p(siv->values[i])) {
-      if ((*func)(mrb, keys[i], siv->values[i], p) != 0) return;
+  /* `func` can run arbitrary Ruby: mrb_obj_inspect() dispatches to a
+     user-defined #inspect on each value, which can add or remove an
+     instance variable on `obj` itself. Either one frees this `siv` out
+     from under the loop, growing it (shaped_iv_set(), a wider block, the
+     old one freed) or de-shaping it (shaped_to_iv_tbl(), called from
+     mrb_iv_remove(), to a plain iv_tbl). Reading `siv->values[i]` again
+     for the next key is then a use-after-free (GHSA-j6fq-xj4w-877x).
+     `obj->iv` names whichever block is current, so unchanged since the
+     loop started is exactly "nothing freed this one yet": the fast path
+     below stays in one comparison's reach of what the loop cost before
+     this fix, and only a key affected by a mutating callback pays for
+     mrb_obj_iv_get()/_defined() re-deriving it from the object's current
+     representation, shaped or not. */
+  const iv_tbl *orig = obj->iv;
+  for (int i = 0; i < count; i++) {
+    if (obj->iv == orig) {
+      if (!mrb_undef_p(siv->values[i])) {
+        if ((*func)(mrb, keys[i], siv->values[i], p) != 0) return;
+      }
+    }
+    else if (mrb_obj_iv_defined(mrb, obj, keys[i])) {
+      mrb_value v = mrb_obj_iv_get(mrb, obj, keys[i]);
+      if ((*func)(mrb, keys[i], v, p) != 0) return;
     }
   }
 }
@@ -1214,19 +1238,30 @@ mrb_cv_defined(mrb_state *mrb, mrb_value mod, mrb_sym sym)
   return mrb_mod_cv_defined(mrb, mrb_class_ptr(mod), sym);
 }
 
+/* The class a class variable written in the scope of `p` is read from: the
+   nearest cref on the `upper` chain, as mrb_vm_cref_class() finds it, with a
+   singleton class passed over.  A block is not a cref and carries the class
+   of the frame it was made in, which is the receiver's class where that
+   frame was given one to run under, as a `Class.new` or `class_eval` block
+   is; the variable is read from the scope the block was written in, as
+   under the cref CRuby skips.  A method written in such a block carries the
+   given class for a `def` and is passed over the same way.  Off the end of
+   the chain the variable is read from `Object`, as at the top level. */
+static struct RClass*
+cv_scope_class(mrb_state *mrb, const struct RProc *p)
+{
+  for (; p && !MRB_PROC_CFUNC_P(p); p = p->upper) {
+    if (!MRB_PROC_CREF_P(p) || MRB_PROC_GIVEN_P(p)) continue;
+    struct RClass *c = MRB_PROC_TARGET_CLASS(p);
+    if (c && c->tt != MRB_TT_SCLASS) return c;
+  }
+  return mrb->object_class;
+}
+
 mrb_value
 mrb_vm_cv_get(mrb_state *mrb, mrb_sym sym)
 {
-  struct RClass *c;
-
-  const struct RProc *p = mrb->c->ci->proc;
-
-  for (;;) {
-    c = MRB_PROC_TARGET_CLASS(p);
-    if (c && c->tt != MRB_TT_SCLASS) break;
-    p = p->upper;
-  }
-  return mrb_mod_cv_get(mrb, c, sym);
+  return mrb_mod_cv_get(mrb, cv_scope_class(mrb, mrb->c->ci->proc), sym);
 }
 
 /* Non-raising class-variable lookup for `defined?(@@v)`. Resolves the class
@@ -1235,29 +1270,13 @@ mrb_vm_cv_get(mrb_state *mrb, mrb_sym sym)
 mrb_bool
 mrb_vm_cv_defined_p(mrb_state *mrb, const struct RProc *proc, mrb_sym sym)
 {
-  struct RClass *c;
-
-  for (;;) {
-    c = MRB_PROC_TARGET_CLASS(proc);
-    if (c && c->tt != MRB_TT_SCLASS) break;
-    proc = proc->upper;
-    if (!proc) { c = mrb->object_class; break; }
-  }
-  return mrb_mod_cv_defined(mrb, c, sym);
+  return mrb_mod_cv_defined(mrb, cv_scope_class(mrb, proc), sym);
 }
 
 void
 mrb_vm_cv_set(mrb_state *mrb, mrb_sym sym, mrb_value v)
 {
-  struct RClass *c;
-  const struct RProc *p = mrb->c->ci->proc;
-
-  for (;;) {
-    c = MRB_PROC_TARGET_CLASS(p);
-    if (c && c->tt != MRB_TT_SCLASS) break;
-    p = p->upper;
-  }
-  mrb_mod_cv_set(mrb, c, sym, v);
+  mrb_mod_cv_set(mrb, cv_scope_class(mrb, mrb->c->ci->proc), sym, v);
 }
 
 static void
@@ -1356,32 +1375,6 @@ proc_class(mrb_state *mrb, const struct RProc *proc)
   return c ? c : mrb->object_class;
 }
 
-/* The class a proc looks constants up from, which is its target class except
-   for a method defined with `def self.name`.  That method runs with the
-   singleton class as its target, but CRuby does not push the singleton as a
-   cref there: the name is looked up from the class body around it, so
-   `def self.name; K; end` finds K in a superclass before the top level and
-   does not see a K set inside `class << self`.  `class << self` does push
-   one.  The two leave the same target class on the proc, and the difference
-   is in what opened the run of procs sharing it: walk up while the target
-   stays the singleton, and the topmost proc is either that method body (a
-   scope that is strict) or the `class << self` body (a scope that is not).
-   A block given a class of its own, instance_eval's, is neither and keeps
-   its class, as it did. */
-static struct RClass*
-cref_class(mrb_state *mrb, const struct RProc *proc)
-{
-  struct RClass *c = proc_class(mrb, proc);
-  const struct RProc *p = proc;
-
-  if (c->tt != MRB_TT_SCLASS) return c;
-  while (p->upper && proc_class(mrb, p->upper) == c) p = p->upper;
-  if (MRB_PROC_SCOPE_P(p) && MRB_PROC_STRICT_P(p) && p->upper) {
-    return proc_class(mrb, p->upper);
-  }
-  return c;
-}
-
 /* Whether a proc on the `upper` chain is a lexical scope of its own for
    the constant walk, the way a cref is in CRuby. A class or method body
    is one. A block is not: it runs in the class scope of the proc it was
@@ -1390,10 +1383,15 @@ cref_class(mrb_state *mrb, const struct RProc *proc)
    is a scope, as its cref is in CRuby. The caller leaves out the proc
    with no `upper`, the top level: it is not a scope of its own, and
    its class is reached through the ancestors after the lexical scopes,
-   so that a superclass wins over a top-level constant. */
+   so that a superclass wins over a top-level constant.  A method written
+   in a block given a class carries that class for a `def` in its body and
+   is not a scope for the walk, as the cref CRuby pushes for such a block
+   is skipped: the class the block was given is not where a constant in
+   the method is read from. */
 static mrb_bool
 lexical_scope_p(mrb_state *mrb, const struct RProc *proc)
 {
+  if (MRB_PROC_GIVEN_P(proc)) return FALSE;
   if (MRB_PROC_SCOPE_P(proc)) return TRUE;
   return proc_class(mrb, proc) != proc_class(mrb, proc->upper);
 }
@@ -1402,7 +1400,9 @@ mrb_value
 mrb_vm_const_get(mrb_state *mrb, mrb_sym sym)
 {
   const struct RProc *proc = mrb->c->ci->proc;
-  struct RClass *c = cref_class(mrb, proc), *c2;
+  struct RClass *c = mrb_vm_cref_class(mrb, mrb->c->ci), *c2;
+
+  if (!c) c = mrb->object_class;
   mrb_value v;
 
   if (iv_get(mrb, class_iv_ptr(c), sym, &v)) {
@@ -1410,7 +1410,7 @@ mrb_vm_const_get(mrb_state *mrb, mrb_sym sym)
   }
   for (proc = proc->upper; proc && proc->upper; proc = proc->upper) {
     if (!lexical_scope_p(mrb, proc)) continue;
-    c2 = cref_class(mrb, proc);
+    c2 = proc_class(mrb, proc);
     if (iv_get(mrb, class_iv_ptr(c2), sym, &v)) {
       return v;
     }
@@ -1438,15 +1438,18 @@ mrb_vm_const_get(mrb_state *mrb, mrb_sym sym)
    (the caller's, via ci[-1]) and returns the value or undef, without invoking
    const_missing or raising. */
 mrb_value
-mrb_vm_const_get_noraise(mrb_state *mrb, const struct RProc *proc, mrb_sym sym)
+mrb_vm_const_get_noraise(mrb_state *mrb, mrb_callinfo *ci, mrb_sym sym)
 {
-  struct RClass *c = cref_class(mrb, proc), *c2;
+  const struct RProc *proc = ci->proc;
+  struct RClass *c = mrb_vm_cref_class(mrb, ci), *c2;
+
+  if (!c) c = mrb->object_class;
   mrb_value v;
 
   if (iv_get(mrb, class_iv_ptr(c), sym, &v)) return v;
   for (proc = proc->upper; proc && proc->upper; proc = proc->upper) {
     if (!lexical_scope_p(mrb, proc)) continue;
-    c2 = cref_class(mrb, proc);
+    c2 = proc_class(mrb, proc);
     if (iv_get(mrb, class_iv_ptr(c2), sym, &v)) return v;
   }
   if (c->tt == MRB_TT_SCLASS) {
@@ -1466,9 +1469,19 @@ mrb_vm_const_get_noraise(mrb_state *mrb, const struct RProc *proc, mrb_sym sym)
 }
 
 mrb_bool
-mrb_vm_const_defined_p(mrb_state *mrb, const struct RProc *proc, mrb_sym sym)
+mrb_vm_const_defined_p(mrb_state *mrb, mrb_callinfo *ci, mrb_sym sym)
 {
-  return !mrb_undef_p(mrb_vm_const_get_noraise(mrb, proc, sym));
+  return !mrb_undef_p(mrb_vm_const_get_noraise(mrb, ci, sym));
+}
+
+/* The lookup a constant path read makes from a module, `Mod::NAME`, without
+   its hooks: the value, or undef where the name is missing, with no
+   const_missing call and nothing raised.  A constant Object holds is out of
+   reach from any other module here, as it is for the read. */
+mrb_value
+mrb_const_get_noraise(mrb_state *mrb, struct RClass *mod, mrb_sym sym)
+{
+  return const_get_nohook(mrb, mod, sym, FALSE);
 }
 
 /*
@@ -1497,6 +1510,19 @@ mrb_const_cache_clear(mrb_state *mrb)
 
   for (int i=0; i<MRB_CONST_CACHE_SIZE; cc++,i++) {
     cc->irep = NULL;
+  }
+}
+
+/* Forget the entries of one irep before its memory is freed. The cache is
+   keyed by the irep's address, so the next irep allocated at that address
+   would otherwise inherit answers resolved in another scope. */
+void
+mrb_const_cache_forget_irep(mrb_state *mrb, const mrb_irep *irep)
+{
+  struct mrb_const_cache_entry *cc = mrb->const_cache;
+
+  for (int i=0; i<MRB_CONST_CACHE_SIZE; cc++,i++) {
+    if (cc->irep == irep) cc->irep = NULL;
   }
 }
 #endif

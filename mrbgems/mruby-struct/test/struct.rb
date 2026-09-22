@@ -194,6 +194,15 @@ assert('Struct#to_h') do
   assert_equal({:white => 'ruuko', :red => 'yuzuki', :green => 'hitoe'}) { s.to_h }
 end
 
+assert('Struct#to_h with a block') do
+  s = Struct.new(:white, :red).new('ruuko', 'yuzuki')
+  assert_equal({'white' => 'ruuko', 'red' => 'yuzuki'}, s.to_h { |k, v| [k.to_s, v] })
+  assert_equal({:white => 'ruuko', :red => 'yuzuki'}, s.to_h(&->(k, v) { [k, v] }))
+  assert_equal :stopped, s.to_h { |k, v| break :stopped }
+  assert_raise(TypeError)     { s.to_h { |k, v| k } }
+  assert_raise(ArgumentError) { s.to_h { |k, v| [k, v, 1] } }
+end
+
 assert('Struct#values_at') do
   a = Struct.new(:blue, :purple).new('aki', 'io')
   assert_equal ['aki'], a.values_at(0)
@@ -501,4 +510,79 @@ assert "Struct subclass inherits :keyword_init" do
   assert_equal({foo: 1}, fsub.new(foo: 1).foo)
 
   assert_nil Class.new(Struct.new(:foo)).keyword_init?
+end
+
+assert "Struct#deconstruct" do
+  c = Struct.new(:a, :b, :c)
+  s = c.new(1, 2, 3)
+
+  assert_equal [1, 2, 3], s.deconstruct
+  assert_equal s.to_a, s.deconstruct
+
+  # the answer is a fresh array; writing to it leaves the struct alone
+  d = s.deconstruct
+  d[0] = 9
+  assert_equal 1, s.a
+
+  assert_equal [nil, nil, nil], c.new.deconstruct
+end
+
+assert "Struct#deconstruct_keys" do
+  c = Struct.new(:a, :b, :c)
+  s = c.new(1, 2, 3)
+
+  assert_equal({a: 1, b: 2, c: 3}, s.deconstruct_keys(nil))
+  assert_equal s.to_h, s.deconstruct_keys(nil)
+  assert_equal({}, s.deconstruct_keys([]))
+  assert_equal({a: 1}, s.deconstruct_keys([:a]))
+  assert_equal({c: 3, a: 1}, s.deconstruct_keys([:c, :a]))
+
+  # a member can also be named by a string or by its position
+  assert_equal({"a" => 1}, s.deconstruct_keys(["a"]))
+  assert_equal({0 => 1, -1 => 3}, s.deconstruct_keys([0, -1]))
+
+  # the hash ends at the first key naming no member
+  assert_equal({a: 1}, s.deconstruct_keys([:a, :zz, :b]))
+  assert_equal({}, s.deconstruct_keys([:zz]))
+  assert_equal({}, s.deconstruct_keys(["zz"]))
+  assert_equal({}, s.deconstruct_keys([3]))
+  assert_equal({}, s.deconstruct_keys([-4]))
+
+  # more keys than members: no pattern over them can match
+  assert_equal({}, s.deconstruct_keys([:a, :b, :c, :a]))
+
+  assert_raise(TypeError) { s.deconstruct_keys({a: 1}) }
+  assert_raise_with_message(TypeError, "wrong argument type Symbol (expected Array or nil)") do
+    s.deconstruct_keys(:a)
+  end
+
+  # a key of no member-naming type is refused, as Struct#[] refuses it
+  assert_raise(TypeError) { s.deconstruct_keys([[]]) }
+end
+
+assert "Struct in a pattern" do
+  c = Struct.new(:a, :b)
+  s = c.new(1, 2)
+
+  matched = case s
+            in [1, x] then x
+            end
+  assert_equal 2, matched
+
+  matched = case s
+            in {b: 2, a: x} then x
+            end
+  assert_equal 1, matched
+
+  matched = case s
+            in {zz: 1} then :no
+            in {a: 1} then :yes
+            end
+  assert_equal :yes, matched
+
+  assert_equal :none, (case s
+                       in [1] then :one
+                       in {a: 2} then :two
+                       else :none
+                       end)
 end

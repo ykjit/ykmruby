@@ -31,6 +31,18 @@ MRuby::Gem::Specification.new('mruby-compiler') do |spec|
   elsif !cc.defines.include?('MRB_NO_GEMS')
     cc.defines << 'MRC_TARGET_MRUBY'
   end
+  # Prism allocates the tree it parses, and the walk that gives the tree back
+  # costs a C frame per level of it; a tree deep enough to run that off the
+  # stack is written in ordinary source, so the tree is taken from an arena
+  # and given back in one piece instead (see include/prism_xallocator.h).
+  #
+  # A C++ ABI build takes the arena's blocks from libc.  Prism is compiled as
+  # C there, so it reaches the arena through the C linkage the header gives
+  # it; what it must not reach is mrb_malloc(), which raises on failure and
+  # would throw through Prism's frames.  Nothing is lost by it: that build
+  # already had every Prism allocation outside mrb_malloc().
+  cc.defines << 'MRC_PRISM_ARENA'
+  cc.defines << 'MRC_PRISM_ARENA_LIBC' if build.cxx_abi_enabled?
   cc.defines << 'MRC_DEBUG' if cc.has_define?('MRB_DEBUG')
   cc.defines << 'PRISM_BUILD_MINIMAL' unless cc.defines.include?('MRC_DEBUG')
   # PRISM_BUILD_MINIMAL stubs out pm_prettyprint(), so `mruby -v` can only dump
@@ -72,6 +84,18 @@ MRuby::Gem::Specification.new('mruby-compiler') do |spec|
   task :prism_submodule do
     next if File.exist?("#{prism_dir}/templates/template.rb")
 
+    # A source archive (GitHub's "Download ZIP", `git archive`) carries the
+    # empty submodule directory and no .git to fill it from; say so rather
+    # than let `git submodule` fail on a tree that is not a checkout.
+    unless File.exist?("#{MRUBY_ROOT}/.git")
+      abort <<~MSG
+        mruby-compiler: #{prism_dir} is empty, and this source tree is not a git
+        checkout, so the Prism parser it comes from cannot be fetched. A source
+        archive of the repository leaves the submodule out: clone the repository
+        instead (`git clone --recursive https://github.com/mruby/mruby.git`), or
+        put the Prism sources the submodule pins (see .gitmodules) there.
+      MSG
+    end
     FileUtils.cd dir do
       sh 'git submodule update --init lib/prism'
     end
@@ -89,24 +113,16 @@ MRuby::Gem::Specification.new('mruby-compiler') do |spec|
 
     # The templates write #line directives that name themselves against the
     # root of the prism repository ("prism/templates/..."), a path that
-    # resolves to nothing from MRUBY_ROOT, where mruby compiles: diagnostics
-    # point at a file the editor cannot open, and ccache drops its direct mode
-    # over the missing dependency. Rewrite the prefix to the gem's location in
-    # the tree. When the gem sits outside the tree no name from the tree
-    # reaches it, so there is nothing to write; on Windows a gem on another
-    # drive is outside with no relative path at all, which Pathname reports
-    # by raising instead of returning a ".."-prefixed path.
-    prism_rel_dir = begin
-      prism_dir.relative_path_from(MRUBY_ROOT)
-    rescue ArgumentError
-      nil
-    end
-    unless prism_rel_dir.nil? || prism_rel_dir.start_with?('..')
-      prism_generated_files.each do |path|
-        source = File.binread(path)
-        rewritten = source.gsub(/^(#line \d+ ")prism\//) { "#{$1}#{prism_rel_dir}/" }
-        File.binwrite(path, rewritten) unless rewritten == source
-      end
+    # resolves to nothing from where mruby compiles: diagnostics point at a
+    # file the editor cannot open, and ccache drops its direct mode over the
+    # missing dependency. Rewrite the prefix to the name the compile is given
+    # for the gem's location, which is the one every other source is named
+    # by, and the gem's path where the build compiles by paths.
+    prism_compile_dir = build.compile_path(prism_dir)
+    prism_generated_files.each do |path|
+      source = File.binread(path)
+      rewritten = source.gsub(/^(#line \d+ ")prism\//) { "#{$1}#{prism_compile_dir}/" }
+      File.binwrite(path, rewritten) unless rewritten == source
     end
   end
 
@@ -123,11 +139,14 @@ MRuby::Gem::Specification.new('mruby-compiler') do |spec|
   # generated diagnostic table uses non-trivial designated initializers) nor
   # clang++ (its implicit void* conversions) can build it as C++. In an
   # MRB_USE_CXX_ABI build the rest of mruby compiles as C++, so strip the C++
-  # compile flag here to keep these sources on the C compiler; mrc_common.h
+  # compile flag here to keep these sources on the C compiler, along with any
+  # C++ standard a build config added to cc.flags (-std=c++23, /std:c++20),
+  # which a C compile refuses, and give back the flags the toolchain keeps
+  # for C alone, which enable_cxx_abi took out; mrc_common.h
   # wraps the Prism header in extern "C" so the C++ glue links against them.
-  # Route Prism's allocator to libc there too: the C++ core exports mrb_malloc
-  # with C++ linkage, which the C-compiled Prism objects could not resolve, and
-  # Prism's parse memory is transient and freed through the same libc path.
+  # Prism's allocator is the arena, which the header declares with C linkage
+  # so that these C objects resolve it; its blocks come from libc there, so
+  # nothing here reaches a C++-linkage symbol (see MRC_PRISM_ARENA_LIBC).
   # The compiler is derived when a rule is first resolved (not here) so cc is
   # already fully populated with the build's generated-header include flags.
   #
@@ -136,27 +155,22 @@ MRuby::Gem::Specification.new('mruby-compiler') do |spec|
   prism_src_dir = "#{prism_dir}/src"
   prism_obj_dir = "#{build_dir}/lib"
   prism_cc = nil
-  cc.define_rules(prism_obj_dir, prism_src_dir) do
+  prism_compiler = lambda do
     prism_cc ||= if build.cxx_abi_enabled?
       cc.clone.tap do |c|
-        c.flags = cc.flags.flatten - [cc.cxx_compile_flag].flatten
-        c.defines = cc.defines + %w(MRC_ALLOC_LIBC)
+        cxx_std = /(?:\A|\s)(?:-std=(?:c|gnu)\+\+|\/std:c\+\+)\S*/
+        flags = cc.flags.flatten - [cc.cxx_compile_flag].flatten
+        flags = flags.map { |f| f.gsub(cxx_std, '') }.reject { |f| f.strip.empty? }
+        c.flags = cc.cxx_invalid_flags.flatten + flags
+        c.defines = cc.defines
       end
     else
       cc
     end
   end
+  cc.define_rules(prism_obj_dir, prism_src_dir, &prism_compiler)
   prism_gen_src_dir = "#{prism_gen_dir}/src"
-  cc.define_rules(prism_obj_dir, prism_gen_src_dir) do
-    prism_cc ||= if build.cxx_abi_enabled?
-      cc.clone.tap do |c|
-        c.flags = cc.flags.flatten - [cc.cxx_compile_flag].flatten
-        c.defines = cc.defines + %w(MRC_ALLOC_LIBC)
-      end
-    else
-      cc
-    end
-  end
+  cc.define_rules(prism_obj_dir, prism_gen_src_dir, &prism_compiler)
   Dir.glob("#{prism_src_dir}/**/*.c").each do |src|
     objs << objfile(src.relative_path_from(prism_src_dir).pathmap("#{prism_obj_dir}/%X"))
   end

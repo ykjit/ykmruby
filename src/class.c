@@ -380,6 +380,7 @@ prepare_singleton_class(mrb_state *mrb, struct RBasic *o)
     sc->super = o->c;
     prepare_singleton_class(mrb, (struct RBasic*)sc);
   }
+  sc->flags |= sc->super->flags & MRB_FL_CLASS_EQ_DEFINED;
   o->c = sc;
   mrb_field_write_barrier(mrb, (struct RBasic*)o, (struct RBasic*)sc);
   mrb_obj_iv_set(mrb, (struct RObject*)sc, MRB_SYM(__attached__), mrb_obj_value(o));
@@ -952,6 +953,21 @@ check_visibility_break(const struct RProc *p, const struct RClass *c, mrb_callin
   return mrb_vm_ci_target_class(ci) != c || MRB_CI_VISIBILITY_BREAK_P(ci);
 }
 
+/* The env a scope wrote its visibility to, following p->upper from a proc
+   that has already passed check_visibility_break(): the first step that
+   breaks leaves the env of the level below it, which is the scope's own. */
+static struct REnv*
+find_visibility_env(const struct RProc *p, const struct RClass *c)
+{
+  for (;;) {
+    struct REnv *env = p->e.env;
+    p = p->upper;
+    if (check_visibility_break(p, c, NULL, env)) {
+      return env;
+    }
+  }
+}
+
 static void
 find_visibility_scope(mrb_state *mrb, const struct RClass *c, int n, mrb_callinfo **cp, struct REnv **ep)
 {
@@ -967,14 +983,83 @@ find_visibility_scope(mrb_state *mrb, const struct RClass *c, int n, mrb_callinf
     return;
   }
 
-  for (;;) {
-    struct REnv *env = p->e.env;
-    p = p->upper;
-    if (check_visibility_break(p, c, ci, env)) {
-      *ep = env;
-      *cp = NULL;
-      return;
-    }
+  *ep = find_visibility_env(p, c);
+  *cp = NULL;
+}
+
+/* The visibility a method made by a call from Ruby takes, read from the
+   frame the C function was called from.  A call written in the body of the
+   class it defines on takes the visibility written there, as a `def` in
+   that body would; a call on another class, or from inside a method, makes
+   a public method.  The receiver has to be both the self and the class of
+   that frame, the way CRuby's `rb_vm_cref_in_context()` answers for
+   `define_method` and `rb_attr()`.  The body of a `class << self` is such
+   a body for its singleton class. */
+static int
+caller_scope_visibility(mrb_state *mrb, struct RClass *c, mrb_bool *modfunc)
+{
+  const struct mrb_context *ec = mrb->c;
+  mrb_callinfo *ci = ec->ci - 1;
+
+  *modfunc = FALSE;
+  if (ci < ec->cibase) return MRB_METHOD_PUBLIC_FL;
+  if (mrb_vm_ci_target_class(ci) != c) return MRB_METHOD_PUBLIC_FL;
+  mrb_value self = ci->stack[0];
+  if (!(mrb_class_p(self) || mrb_module_p(self) || mrb_sclass_p(self)) || mrb_class_ptr(self) != c) {
+    return MRB_METHOD_PUBLIC_FL;
+  }
+
+  struct REnv *e;
+  find_visibility_scope(mrb, c, 1, &ci, &e);
+  mrb_assert(ci || e);
+  *modfunc = e ? MRB_ENV_MODFUNC_P(e) : MRB_CI_MODFUNC_P(ci);
+  return (int)((e ? MRB_ENV_VISIBILITY(e) : MRB_CI_VISIBILITY(ci)) << 25);
+}
+
+/* Gives the current frame the visibility of the scope `p` was compiled
+   against. `eval` on a string wants this: the string runs in that scope, so a
+   `def` in it takes the visibility written there, while the frame goes on
+   breaking the scope so that a `private` written inside the string stops at
+   the end of it, the way CRuby's copy of the caller's cref does. A proc that
+   captured no env was compiled against no Ruby scope and has none to lend. */
+/* The scope an eval string starts at.  find_visibility_env() answers the env
+   of the frame the string runs in, which is the class body itself where the
+   `eval` was written there.  Called from inside a method it is the method's
+   frame, whose visibility is the default: a `def` keeps a scope for what is
+   written in it but no env to write a visibility to, so the scope the string
+   starts at is the body the `def` was written in, one step further up.  The
+   env found is the body's own and is read now rather than copied at `def`,
+   which is what makes a `private` written after the `def` reach it, as
+   CRuby's cref does. */
+static struct REnv*
+find_eval_visibility_env(const struct RProc *p, const struct RClass *c)
+{
+  struct REnv *env = MRB_PROC_ENV(p);
+
+  for (const struct RProc *up = p->upper; up; up = up->upper) {
+    struct REnv *e = MRB_PROC_ENV(up);
+    if (e == NULL) continue;            /* a `def`, which keeps none */
+    if (e->c != c) break;               /* another class's scope */
+    env = e;
+    if (MRB_PROC_SCOPE_P(up)) break;    /* the body the `def` was written in */
+    if (MRB_ENV_VISIBILITY_BREAK_P(e)) break;
+  }
+  return env;
+}
+
+void
+mrb_vm_ci_inherit_visibility(mrb_state *mrb, const struct RProc *p)
+{
+  mrb_callinfo *ci = mrb->c->ci;
+
+  if (MRB_PROC_ENV(p) == NULL) return;
+  struct REnv *e = find_eval_visibility_env(p, mrb_vm_ci_target_class(ci));
+  MRB_CI_SET_VISIBILITY(ci, MRB_ENV_VISIBILITY(e));
+  if (MRB_ENV_MODFUNC_P(e)) {
+    MRB_CI_SET_MODFUNC(ci);
+  }
+  else {
+    MRB_CI_CLEAR_MODFUNC(ci);
   }
 }
 
@@ -1030,6 +1115,60 @@ mt_writable(mrb_state *mrb, struct RClass *frozen, struct RClass *table)
   return h;
 }
 
+static int
+eq_defined_walk(mrb_state *mrb, struct RBasic *obj, void *data)
+{
+  switch (obj->tt) {
+  case MRB_TT_CLASS: case MRB_TT_SCLASS: case MRB_TT_MODULE: {
+    struct RClass *k = (struct RClass*)obj;
+    if (k->flags & MRB_FL_CLASS_EQ_DEFINED) break;
+    for (struct RClass *s = k->super; s; s = s->super) {
+      struct RClass *r = (s->tt == MRB_TT_ICLASS) ? s->c : s;
+      if (r->flags & MRB_FL_CLASS_EQ_DEFINED) {
+        k->flags |= MRB_FL_CLASS_EQ_DEFINED;
+        break;
+      }
+    }
+    break;
+  }
+  default:
+    break;
+  }
+  return MRB_EACH_OBJ_OK;
+}
+
+/* `c` answers `==` by a method of its own from now on, so every class that
+   has `c` among its ancestors loses the identity answer of `OP_EQ`. A class
+   or singleton class made later copies the flag from its superclass and an
+   includer takes it from the module, so the heap is walked only for a class
+   that already has subclasses or a module that may already be included.
+   `nil`, `true` and `false` are immediate, so `OP_EQ` has no class of theirs
+   to read the flag from; the flag of the three is mirrored into a bit of
+   `bop_redefined`, which the opcode tests for every receiver anyway. */
+static void
+eq_defined_mark(mrb_state *mrb, struct RClass *c)
+{
+  if (c->flags & MRB_FL_CLASS_EQ_DEFINED) return;
+  c->flags |= MRB_FL_CLASS_EQ_DEFINED;
+  if ((c->flags & MRB_FL_CLASS_IS_INHERITED) || c->tt == MRB_TT_MODULE) {
+    mrb_gc_each_live_object(mrb, eq_defined_walk, NULL);
+  }
+  if ((mrb->nil_class->flags | mrb->true_class->flags |
+       mrb->false_class->flags) & MRB_FL_CLASS_EQ_DEFINED) {
+    mrb->bop_redefined |= MRB_BOP_NIL_TRUE_FALSE_EQ;
+  }
+}
+
+/* module_function scope: also define a public method on the singleton
+   class, so the module method (M.foo) mirrors the private instance one */
+static void
+define_modfunc_copy(mrb_state *mrb, struct RClass *c, mrb_sym mid, mrb_method_t m)
+{
+  MRB_SET_VISIBILITY_FLAGS(m.flags, MRB_METHOD_PUBLIC_FL);
+  prepare_singleton_class(mrb, (struct RBasic*)c);
+  mrb_define_method_raw(mrb, c->c, mid, m);
+}
+
 MRB_API void
 mrb_define_method_raw(mrb_state *mrb, struct RClass *c, mrb_sym mid, mrb_method_t m)
 {
@@ -1051,7 +1190,10 @@ mrb_define_method_raw(mrb_state *mrb, struct RClass *c, mrb_sym mid, mrb_method_
         p->flags |= MRB_PROC_SCOPE;
         p->c = NULL;
         mrb_field_write_barrier(mrb, (struct RBasic*)c, (struct RBasic*)p);
-        if (!MRB_PROC_ENV_P(p)) {
+        /* A proc made in a scope carries that scope's cref, which is what
+           a `def` in its body adds to.  Only one made outside any scope,
+           from C, has none to keep. */
+        if (!MRB_PROC_ENV_P(p) && p->e.target_class == NULL) {
           MRB_PROC_SET_TARGET_CLASS(p, c);
         }
       }
@@ -1073,31 +1215,29 @@ mrb_define_method_raw(mrb_state *mrb, struct RClass *c, mrb_sym mid, mrb_method_
     MRB_SET_VISIBILITY_FLAGS(flags, MRB_METHOD_PRIVATE_FL);
   }
   else if ((flags & MT_VMASK) == MT_VDEFAULT) {
-    /* singleton methods are always public */
-    if (c->tt == MRB_TT_SCLASS) {
-      MRB_SET_VISIBILITY_FLAGS(flags, MRB_METHOD_PUBLIC_FL);
-    }
-    else {
-      mrb_callinfo *ci;
-      struct REnv *e;
-      find_visibility_scope(mrb, c, 0, &ci, &e);
-      mrb_assert(ci || e);
-      MRB_SET_VISIBILITY_FLAGS(flags, (uint32_t)(e ? MRB_ENV_VISIBILITY(e) : MRB_CI_VISIBILITY(ci)) << 25);
-      modfunc = e ? MRB_ENV_MODFUNC_P(e) : MRB_CI_MODFUNC_P(ci);
-    }
+    /* The visibility written in the scope the `def` stands in.  The body of
+       a `class << self` is such a scope too: a `private` written there
+       reaches the `def`s below it, the way CRuby's cref for that body does.
+       Only a `def self.x` is public whatever the scope says, and the VM
+       passes that as an explicit visibility instead of the default. */
+    mrb_callinfo *ci;
+    struct REnv *e;
+    find_visibility_scope(mrb, c, 0, &ci, &e);
+    mrb_assert(ci || e);
+    MRB_SET_VISIBILITY_FLAGS(flags, (uint32_t)(e ? MRB_ENV_VISIBILITY(e) : MRB_CI_VISIBILITY(ci)) << 25);
+    modfunc = e ? MRB_ENV_MODFUNC_P(e) : MRB_CI_MODFUNC_P(ci);
   }
   mt_put(mrb, h, mid, flags, ptr);
   if (!mrb->bootstrapping) {
     mc_clear_by_id(mrb, mid);
-    mrb_idx_op_update(mrb, mid);
+#ifdef MRB_USE_REFINEMENTS
+    if (MRB_CLASS_REFINEMENT_P(named)) mrb_refinement_method_added(mrb, named, mid);
+#endif
+    mrb_builtin_op_update(mrb, mid);
+    if (mid == MRB_OPSYM(eq)) eq_defined_mark(mrb, named);
   }
   if (modfunc) {
-    /* module_function scope: also define a public method on the singleton
-       class, so the module method (M.foo) mirrors the private instance one */
-    mrb_method_t sm = m;
-    MRB_SET_VISIBILITY_FLAGS(sm.flags, MRB_METHOD_PUBLIC_FL);
-    prepare_singleton_class(mrb, (struct RBasic*)c);
-    mrb_define_method_raw(mrb, c->c, mid, sm);
+    define_modfunc_copy(mrb, c, mid, m);
   }
 }
 
@@ -2053,6 +2193,7 @@ boot_defclass(mrb_state *mrb, struct RClass *super, enum mrb_vtype tt)
     c->super = super;
     mrb_field_write_barrier(mrb, (struct RBasic*)c, (struct RBasic*)super);
     c->flags |= MRB_FL_CLASS_IS_INHERITED;
+    c->flags |= super->flags & MRB_FL_CLASS_EQ_DEFINED;
   }
   else {
     // limited to cases where BasicObject class is defined during mruby initialization
@@ -2093,6 +2234,7 @@ static int
 include_module_at(mrb_state *mrb, struct RClass *c, struct RClass *ins_pos, struct RClass *m, int search_super)
 {
   struct RClass *ic;
+  struct RClass *m0 = m;
   void *klass_mt = find_origin(c)->mt;
 
   while (m) {
@@ -2135,7 +2277,10 @@ include_module_at(mrb_state *mrb, struct RClass *c, struct RClass *ins_pos, stru
     mrb_method_cache_clear(mrb);
     /* An included or prepended module can carry both operators, and it is not
        one method name that changed, so recheck every slot. */
-    mrb_idx_op_update(mrb, 0);
+    mrb_builtin_op_update(mrb, 0);
+    /* and it can carry a `==` of its own, or of a module it includes, which
+       marked it in turn */
+    if (m0->flags & MRB_FL_CLASS_EQ_DEFINED) eq_defined_mark(mrb, c);
   }
   return 0;
 }
@@ -2173,9 +2318,17 @@ MRB_API void
 mrb_include_module(mrb_state *mrb, struct RClass *c, struct RClass *m)
 {
   mrb_check_frozen(mrb, c);
+#ifdef MRB_USE_REFINEMENTS
+  if (MRB_CLASS_REFINEMENT_P(m)) {
+    mrb_raise(mrb, E_TYPE_ERROR, "Cannot include refinement");
+  }
+#endif
   if (include_module_at(mrb, c, find_origin(c), m, 1) < 0) {
     mrb_raise(mrb, E_ARGUMENT_ERROR, "cyclic include detected");
   }
+#ifdef MRB_USE_REFINEMENTS
+  mrb_refinement_ancestry_changed(mrb, c, m);
+#endif
   mrb_const_cache_clear(mrb);
   if (c->tt == MRB_TT_MODULE && (c->flags & MRB_FL_CLASS_IS_INHERITED)) {
     struct RClass *data[2];
@@ -2233,6 +2386,11 @@ MRB_API void
 mrb_prepend_module(mrb_state *mrb, struct RClass *c, struct RClass *m)
 {
   mrb_check_frozen(mrb, c);
+#ifdef MRB_USE_REFINEMENTS
+  if (MRB_CLASS_REFINEMENT_P(m)) {
+    mrb_raise(mrb, E_TYPE_ERROR, "Cannot prepend refinement");
+  }
+#endif
   if (!(c->flags & MRB_FL_CLASS_IS_PREPENDED)) {
     struct RClass *origin = MRB_OBJ_ALLOC(mrb, MRB_TT_ICLASS, c);
     origin->flags |= MRB_FL_CLASS_IS_ORIGIN | MRB_FL_CLASS_IS_INHERITED;
@@ -2246,6 +2404,9 @@ mrb_prepend_module(mrb_state *mrb, struct RClass *c, struct RClass *m)
   if (include_module_at(mrb, c, c, m, 0) < 0) {
     mrb_raise(mrb, E_ARGUMENT_ERROR, "cyclic prepend detected");
   }
+#ifdef MRB_USE_REFINEMENTS
+  mrb_refinement_ancestry_changed(mrb, c, m);
+#endif
   mrb_const_cache_clear(mrb);
   if (c->tt == MRB_TT_MODULE &&
       (c->flags & (MRB_FL_CLASS_IS_INHERITED|MRB_FL_CLASS_IS_PREPENDED))) {
@@ -2478,6 +2639,31 @@ mrb_mod_initialize(mrb_state *mrb, mrb_value mod)
   return mod;
 }
 
+/* A visibility written in a class body has to outlive the body: a `def` there
+   keeps no visibility of its own, and an eval string run inside such a method
+   reads the body's.  The body keeps it on its frame until something needs it
+   later, so the frame is given an env to keep it in.  Only a visibility that
+   is not the default is worth an env: a body that writes `public` where
+   `public` already stands would pay for saying nothing. */
+static void
+vis_scope_persist(mrb_state *mrb, mrb_callinfo **cp, struct REnv **ep, uint32_t vis)
+{
+  if (*ep || vis == (MRB_METHOD_PUBLIC_FL >> 25)) return;
+  struct REnv *e = mrb_vm_ci_env_reify(mrb, mrb->c, *cp);
+  if (e == NULL) return;
+  /* The frame keeps the env, and so does the proc running in it: the walk a
+     `def` inside this body makes later reads procs rather than frames, and
+     the frame will be gone by then. */
+  struct RProc *proc = (struct RProc*)(*cp)->proc;
+  if (proc && !MRB_PROC_ENV_P(proc)) {
+    proc->e.env = e;
+    proc->flags |= MRB_PROC_ENVSET;
+    mrb_field_write_barrier(mrb, (struct RBasic*)proc, (struct RBasic*)e);
+  }
+  *ep = e;
+  *cp = NULL;
+}
+
 static void
 mrb_mod_visibility(mrb_state *mrb, mrb_value mod, int vis)
 {
@@ -2491,6 +2677,7 @@ mrb_mod_visibility(mrb_state *mrb, mrb_value mod, int vis)
     mrb_callinfo *ci;
     struct REnv *e;
     find_visibility_scope(mrb, NULL, 1, &ci, &e);
+    vis_scope_persist(mrb, &ci, &e, (uint32_t)(vis >> 25));
     if (e) {
       MRB_ENV_SET_VISIBILITY(e, vis >> 25);
       MRB_ENV_CLEAR_MODFUNC(e);  /* an explicit visibility ends module_function scope */
@@ -2517,6 +2704,11 @@ mrb_mod_visibility(mrb_state *mrb, mrb_value mod, int vis)
     struct RClass *t = c;
     MRB_CLASS_ORIGIN(t);
     mrb_mt_tbl *h = mt_writable(mrb, c, t);
+    if (argc == 1 && mrb_array_p(argv[0])) {
+      /* the names `attr_accessor` and its kin answer with */
+      argc = RARRAY_LEN(argv[0]);
+      argv = RARRAY_PTR(argv[0]);
+    }
     for (int i=0; i<argc; i++) {
       mrb_check_type(mrb, argv[i], MRB_TT_SYMBOL);
       mrb_sym mid = mrb_symbol(argv[i]);
@@ -2539,7 +2731,7 @@ mrb_mod_visibility(mrb_state *mrb, mrb_value mod, int vis)
       }
       mt_put(mrb, h, mid, m.flags, ptr);
       mc_clear_by_id(mrb, mid);
-      mrb_idx_op_update(mrb, mid);
+      mrb_builtin_op_update(mrb, mid);
     }
   }
 }
@@ -2856,7 +3048,8 @@ mc_clear_by_id(mrb_state *mrb, mrb_sym id)
  * Guards for the inline index opcodes.
  *
  * `OP_GETIDX`, `OP_GETIDX0` and `OP_SETIDX` implement `[]` and `[]=` for an
- * Array, Hash or String receiver in C, without a method lookup.  They may only
+ * Array, Hash or String receiver in C, without a method lookup, and `OP_ADD`
+ * does the same for `+` on a String receiver.  They may only
  * do so while those classes still carry the builtin the opcode reimplements,
  * so each (class, operator) pair keeps a slot in `mrb->idx_class` that holds
  * the class while that is true and NULL once it is not.  The opcodes compare
@@ -2885,6 +3078,7 @@ idx_op_class(mrb_state *mrb, int slot)
 static mrb_sym
 idx_op_mid(int slot)
 {
+  if (slot == MRB_IDX_OP_STR_ADD) return MRB_OPSYM(add);
   return slot < MRB_IDX_OP_ARY_ASET ? MRB_OPSYM(aref) : MRB_OPSYM(aset);
 }
 
@@ -2894,6 +3088,14 @@ idx_op_refresh(mrb_state *mrb, int slot)
   /* A slot that startup never armed (the builtin was already gone, or the
      state failed to initialize) stays off; there is nothing to compare to. */
   if (mrb->idx_builtin[slot].as.func == NULL) return;
+#ifdef MRB_USE_REFINEMENTS
+  /* A refinement of the operator is invisible to the resolution below, and
+     may be active for any caller: the opcode may not answer for it. */
+  if (mrb->idx_refined & (1u << slot)) {
+    mrb->idx_class[slot] = NULL;
+    return;
+  }
+#endif
 
   struct RClass *c = idx_op_class(mrb, slot);
   struct RClass *base = c;
@@ -2916,17 +3118,15 @@ idx_op_arm(mrb_state *mrb, int slot)
 
   if (MRB_METHOD_UNDEF_P(m) || !MRB_METHOD_FUNC_P(m)) return;
   mrb->idx_builtin[slot] = m;
-  mrb->idx_class[slot] = base;
-}
-
-/* Records the builtin `[]` / `[]=` of each core class and arms its slot.
-   Called once, after core initialization has installed them. */
-void
-mrb_idx_op_init(mrb_state *mrb)
-{
-  for (int slot = 0; slot < MRB_IDX_OP_SLOT_COUNT; slot++) {
-    idx_op_arm(mrb, slot);
+#ifdef MRB_USE_REFINEMENTS
+  /* a refinement of the operator stays invisible to the resolution above;
+     see idx_op_refresh() */
+  if (mrb->idx_refined & (1u << slot)) {
+    mrb->idx_class[slot] = NULL;
+    return;
   }
+#endif
+  mrb->idx_class[slot] = base;
 }
 
 /* Arms `slot` for an implementation installed over the builtin.
@@ -2949,24 +3149,226 @@ mrb_idx_op_rearm(mrb_state *mrb, enum mrb_idx_op_slot slot)
   idx_op_arm(mrb, (int)slot);
 }
 
-/* Rechecks the slots that `mid` can affect.  Call after any change to a method
-   table that could change what `[]` or `[]=` resolves to; pass 0 for `mid` when
-   the change is not tied to one name, as module inclusion is not. */
-void
-mrb_idx_op_update(mrb_state *mrb, mrb_sym mid)
+/*
+ * Guards for the arithmetic and comparison opcodes.
+ *
+ * `OP_ADD`, `OP_LT`, `OP_EQ` and their kin answer an operator from C for an
+ * Integer, Float or Symbol receiver.  Those are immediate values whose type
+ * tag names the class, so there is no class pointer for a slot to disarm as
+ * `idx_class` does; each (class, operator) pair owns a bit of
+ * `mrb->bop_redefined` instead, clear while the operator still resolves to the
+ * builtin recorded in `mrb->bop_builtin` and set once it does not.  Validity
+ * is judged exactly as for the index slots above.
+ *
+ * `nil`, `true` and `false` are immediate too, but their classes are ordinary
+ * heap ones, so `eq_defined_mark()` above records a `==` of their own as it
+ * does for any other class and mirrors the flag into
+ * `MRB_BOP_NIL_TRUE_FALSE_EQ`, the one bit past the slots.  Nothing here
+ * arms or rechecks it.
+ */
+
+static const mrb_sym bop_mids[MRB_BOP_COUNT] = {
+  MRB_OPSYM(add), MRB_OPSYM(sub), MRB_OPSYM(mul), MRB_OPSYM(div),
+  MRB_OPSYM(eq), MRB_OPSYM(lt), MRB_OPSYM(le), MRB_OPSYM(gt), MRB_OPSYM(ge),
+};
+
+/* NULL for a slot the build has no class for. */
+static struct RClass*
+bop_class(mrb_state *mrb, int slot)
 {
-  if (mrb->bootstrapping) return;
-  if (mid == 0 || mid == MRB_OPSYM(aref)) {
-    idx_op_refresh(mrb, MRB_IDX_OP_ARY_AREF);
-    idx_op_refresh(mrb, MRB_IDX_OP_HASH_AREF);
-    idx_op_refresh(mrb, MRB_IDX_OP_STR_AREF);
+  if (slot < MRB_BOP_COUNT) return mrb->integer_class;
+  if (slot == MRB_BOP_SYMBOL_EQ_SLOT) return mrb->symbol_class;
+#ifdef MRB_NO_FLOAT
+  return NULL;
+#else
+  return mrb->float_class;
+#endif
+}
+
+static mrb_sym
+bop_mid(int slot)
+{
+  return slot == MRB_BOP_SYMBOL_EQ_SLOT ? MRB_OPSYM(eq) : bop_mids[slot % MRB_BOP_COUNT];
+}
+
+static void
+bop_refresh(mrb_state *mrb, int slot)
+{
+  const mrb_method_t *builtin = &mrb->bop_builtin[slot];
+
+  if (builtin->as.func == NULL) return;
+#ifdef MRB_USE_REFINEMENTS
+  if (mrb->bop_refined & (1u << slot)) {
+    mrb->bop_redefined |= 1u << slot;
+    return;
   }
-  if (mid == 0 || mid == MRB_OPSYM(aset)) {
-    idx_op_refresh(mrb, MRB_IDX_OP_ARY_ASET);
-    idx_op_refresh(mrb, MRB_IDX_OP_HASH_ASET);
-    idx_op_refresh(mrb, MRB_IDX_OP_STR_ASET);
+#endif
+
+  struct RClass *c = bop_class(mrb, slot);
+  mrb_method_t m = mrb_vm_find_method(mrb, c, &c, bop_mid(slot));
+  if (m.flags == builtin->flags && m.as.func == builtin->as.func) {
+    mrb->bop_redefined &= ~(1u << slot);
+  }
+  else {
+    mrb->bop_redefined |= 1u << slot;
   }
 }
+
+static void
+bop_arm(mrb_state *mrb, int slot)
+{
+  struct RClass *c = bop_class(mrb, slot);
+
+  /* A slot the build has no class for keeps its bit clear: nothing can
+     redefine what does not exist, and a bit set here would never let the
+     Integer and Float bits of an operator read clear as a pair. */
+  if (c == NULL) return;
+  mrb->bop_redefined |= 1u << slot;
+  mrb_method_t m = mrb_vm_find_method(mrb, c, &c, bop_mid(slot));
+  if (MRB_METHOD_UNDEF_P(m) || !MRB_METHOD_FUNC_P(m)) return;
+  mrb->bop_builtin[slot] = m;
+  mrb->bop_redefined &= ~(1u << slot);
+}
+
+/* Records the builtin operators of each core class and arms their slots.
+   Called once, after core initialization has installed them. */
+void
+mrb_builtin_op_init(mrb_state *mrb)
+{
+  for (int slot = 0; slot < MRB_IDX_OP_SLOT_COUNT; slot++) {
+    idx_op_arm(mrb, slot);
+  }
+  for (int slot = 0; slot < MRB_BOP_SLOT_COUNT; slot++) {
+    bop_arm(mrb, slot);
+  }
+}
+
+/* Rechecks the slots that `mid` can affect.  Call after any change to a method
+   table that could change what a guarded operator resolves to; pass 0 for
+   `mid` when the change is not tied to one name, as module inclusion is not. */
+void
+mrb_builtin_op_update(mrb_state *mrb, mrb_sym mid)
+{
+  if (mrb->bootstrapping) return;
+  for (int slot = 0; slot < MRB_IDX_OP_SLOT_COUNT; slot++) {
+    if (mid == 0 || mid == idx_op_mid(slot)) idx_op_refresh(mrb, slot);
+  }
+  for (int slot = 0; slot < MRB_BOP_SLOT_COUNT; slot++) {
+    if (mid == 0 || mid == bop_mid(slot)) bop_refresh(mrb, slot);
+  }
+}
+
+#ifdef MRB_USE_REFINEMENTS
+/* Whether `target` is `c` or stands in `c`'s ancestry. */
+static mrb_bool
+class_inherits_p(struct RClass *c, struct RClass *target)
+{
+  while (c) {
+    if (c == target) return TRUE;
+    if (c->tt == MRB_TT_ICLASS && c->c == target) return TRUE;
+    c = c->super;
+  }
+  return FALSE;
+}
+
+/* The bit of `mrb->refined_mids` a name maps to.  The id is folded first:
+   an inline symbol keeps its characters from bit 2 up and its low bits
+   clear, so read raw every short name would share one bit. */
+static inline uint32_t
+refined_mid_bit(mrb_sym mid)
+{
+  uint32_t h = (uint32_t)mid;
+  h ^= h >> 16;
+  h *= 0x45d9f3bu;
+  h ^= h >> 13;
+  return h & 255;
+}
+
+/* The slot mask a refined class keeps under `name`; none yet reads 0. */
+static uint32_t
+refined_slot_bits(mrb_state *mrb, mrb_value target, mrb_sym name)
+{
+  mrb_value v = mrb_iv_get(mrb, target, name);
+  return mrb_nil_p(v) ? 0 : (uint32_t)mrb_integer(v);
+}
+
+/* Marks as refined every guarded slot in `idx_bits`/`bop_bits` whose class
+   is `target` or inherits it; answers whether any mask changed. */
+static mrb_bool
+refined_slots_arm(mrb_state *mrb, struct RClass *target, uint32_t idx_bits, uint32_t bop_bits)
+{
+  uint32_t idx0 = mrb->idx_refined, bop0 = mrb->bop_refined;
+
+  for (int slot = 0; slot < MRB_IDX_OP_SLOT_COUNT; slot++) {
+    if ((idx_bits & (1u << slot)) && class_inherits_p(idx_op_class(mrb, slot), target)) {
+      mrb->idx_refined |= 1u << slot;
+    }
+  }
+  for (int slot = 0; slot < MRB_BOP_SLOT_COUNT; slot++) {
+    struct RClass *c = bop_class(mrb, slot);
+    if (c && (bop_bits & (1u << slot)) && class_inherits_p(c, target)) {
+      mrb->bop_refined |= 1u << slot;
+    }
+  }
+  return idx0 != mrb->idx_refined || bop0 != mrb->bop_refined;
+}
+
+/* Records that `mid` was defined (or undefined) into `refinement`.  A guarded
+   operator slot whose class the refinement's target sits over is disarmed
+   for good, since the slot cannot know which callers see the refinement;
+   CRuby disables its `opt_plus` and kin the same way. */
+void
+mrb_refinement_method_added(mrb_state *mrb, struct RClass *refinement, mrb_sym mid)
+{
+  struct RClass *target = refinement->super;
+
+  uint32_t bit = refined_mid_bit(mid);
+  mrb->refined_mids[bit >> 6] |= (uint64_t)1 << (bit & 63);
+  if (target == NULL) return;
+  /* The slots the name can stand for are kept on the target as well, since
+     a module refined now may be included into a guarded class later; see
+     mrb_refinement_ancestry_changed(). */
+  mrb_value tv = mrb_obj_value(target);
+  uint32_t idx_bits = refined_slot_bits(mrb, tv, MRB_SYM(__idx_refined__));
+  uint32_t bop_bits = refined_slot_bits(mrb, tv, MRB_SYM(__bop_refined__));
+  for (int slot = 0; slot < MRB_IDX_OP_SLOT_COUNT; slot++) {
+    if (mid == idx_op_mid(slot)) idx_bits |= 1u << slot;
+  }
+  for (int slot = 0; slot < MRB_BOP_SLOT_COUNT; slot++) {
+    if (mid == bop_mid(slot)) bop_bits |= 1u << slot;
+  }
+  mrb_iv_set(mrb, tv, MRB_SYM(__idx_refined__), mrb_int_value(mrb, idx_bits));
+  mrb_iv_set(mrb, tv, MRB_SYM(__bop_refined__), mrb_int_value(mrb, bop_bits));
+  refined_slots_arm(mrb, target, idx_bits, bop_bits);
+  if (mid == MRB_OPSYM(eq)) eq_defined_mark(mrb, target);
+}
+
+/* Called once `m` has been included into or prepended to `c`: a guarded
+   class that now inherits a refined module takes on the slots that
+   module's refinements redefine, which were recorded on the module. */
+void
+mrb_refinement_ancestry_changed(mrb_state *mrb, struct RClass *c, struct RClass *m)
+{
+  mrb_bool changed = FALSE;
+
+  for (; m; m = m->super) {
+    struct RClass *k = (m->tt == MRB_TT_ICLASS) ? m->c : m;
+    if (!(k->flags & MRB_FL_CLASS_IS_REFINED)) continue;
+    mrb_value kv = mrb_obj_value(k);
+    uint32_t idx_bits = refined_slot_bits(mrb, kv, MRB_SYM(__idx_refined__));
+    uint32_t bop_bits = refined_slot_bits(mrb, kv, MRB_SYM(__bop_refined__));
+    if (idx_bits || bop_bits) changed |= refined_slots_arm(mrb, c, idx_bits, bop_bits);
+  }
+  if (changed) mrb_builtin_op_update(mrb, 0);
+}
+
+mrb_bool
+mrb_refined_mid_p(mrb_state *mrb, mrb_sym mid)
+{
+  uint32_t bit = refined_mid_bit(mid);
+  return (mrb->refined_mids[bit >> 6] & ((uint64_t)1 << (bit & 63))) != 0;
+}
+#endif
 
 mrb_method_t
 mrb_vm_find_method(mrb_state *mrb, struct RClass *c, struct RClass **cp, mrb_sym mid)
@@ -3017,6 +3419,79 @@ mrb_vm_find_method(mrb_state *mrb, struct RClass *c, struct RClass **cp, mrb_sym
   MRB_METHOD_FROM_PROC(m, NULL);
   return m;                  /* no method */
 }
+
+#ifdef MRB_USE_REFINEMENTS
+/* The refinements in `scope` (an Array, most recently activated first) that
+   target `key`, asked in order for `mid`.  The refinement the caller is
+   already running in, `exclude`, is passed over: a `super` written in a
+   refined method reaches the method under it and not itself. */
+static mrb_bool
+refined_mt_get(mrb_state *mrb, struct RArray *scope, struct RClass *key, mrb_sym mid,
+               struct RClass *exclude, struct RClass **rp, union mrb_mt_ptr *ptr, uint32_t *flags)
+{
+  const mrb_value *e = ARY_PTR(scope);
+  mrb_int len = ARY_LEN(scope);
+
+  for (mrb_int i = 0; i < len; i++) {
+    struct RClass *r = mrb_class_ptr(e[i]);
+    if (r == exclude || r->super != key || r->mt == NULL) continue;
+    if (mt_get(mrb, r->mt, mid, ptr, flags)) {
+      *rp = r;
+      return TRUE;
+    }
+  }
+  return FALSE;
+}
+
+/* mrb_vm_find_method() as seen from a scope with refinements active.  Each
+   class on the chain is asked for its refinements in `scope` before its own
+   table, and the origin of a prepended class is passed over since the class
+   itself was asked already.  The method cache is neither read nor written:
+   what it holds is what the chain answers with no scope, and that stays
+   right for every send made outside one. */
+mrb_method_t
+mrb_vm_find_refined_method(mrb_state *mrb, struct RArray *scope, struct RClass *c, struct RClass **cp, mrb_sym mid, struct RClass *exclude)
+{
+  mrb_method_t m;
+  union mrb_mt_ptr ptr;
+  uint32_t flags;
+
+  while (c) {
+    struct RClass *key = c;
+    if (c->tt == MRB_TT_ICLASS) {
+      key = (c->flags & MRB_FL_CLASS_IS_ORIGIN) ? NULL : c->c;
+    }
+    if (key && (key->flags & MRB_FL_CLASS_IS_REFINED)) {
+      struct RClass *r;
+      if (refined_mt_get(mrb, scope, key, mid, exclude, &r, &ptr, &flags)) {
+        if (ptr.proc == 0) break;    /* undefined within the scope */
+        *cp = r;
+        return create_method_value(mrb, flags, ptr);
+      }
+    }
+    mrb_mt_tbl *h = c->mt;
+    if (h && mt_get(mrb, h, mid, &ptr, &flags)) {
+      if (ptr.proc == 0) break;
+      *cp = c;
+      return create_method_value(mrb, flags, ptr);
+    }
+    c = c->super;
+  }
+  MRB_METHOD_FROM_PROC(m, NULL);
+  return m;
+}
+
+/* The lookup a send from a frame carrying `scope` makes: the refined walk
+   when the scope may hold the name, the cached one otherwise. */
+mrb_method_t
+mrb_vm_find_method_in_scope(mrb_state *mrb, struct RArray *scope, struct RClass *c, struct RClass **cp, mrb_sym mid)
+{
+  if (scope && mrb_refined_mid_p(mrb, mid)) {
+    return mrb_vm_find_refined_method(mrb, scope, c, cp, mid, NULL);
+  }
+  return mrb_vm_find_method(mrb, c, cp, mid);
+}
+#endif
 
 /*
  * Searches for a method in the method table of a class and its ancestors
@@ -3110,8 +3585,11 @@ prepare_writer_name(mrb_state *mrb, mrb_sym sym)
   return prepare_name_common(mrb, sym, NULL, "=");
 }
 
+/* Defines the accessors named and answers their names, reader before
+   writer for each name, so that `private attr_accessor :a` can pass them on
+   the way CRuby's answer can. */
 static mrb_value
-mod_attr_define(mrb_state *mrb, mrb_value mod, mrb_int aargc, mrb_value (*accessor)(mrb_state*, mrb_value), mrb_sym (*access_name)(mrb_state*, mrb_sym))
+mod_attr_define(mrb_state *mrb, mrb_value mod, mrb_bool reader, mrb_bool writer)
 {
   struct RClass *c = mrb_class_ptr(mod);
   const mrb_value *argv;
@@ -3119,22 +3597,30 @@ mod_attr_define(mrb_state *mrb, mrb_value mod, mrb_int aargc, mrb_value (*access
 
   mrb_get_args(mrb, "*", &argv, &argc);
 
+  /* An accessor made in a module_function scope is private and gets no
+     module method copy, as CRuby's `rb_attr()` makes it. */
+  mrb_bool modfunc;
+  int vis = caller_scope_visibility(mrb, c, &modfunc);
+
+  mrb_value names = mrb_ary_new_capa(mrb, argc * (reader + writer));
   int ai = mrb_gc_arena_save(mrb);
   for (int i=0; i<argc; i++) {
-    mrb_sym method = to_sym(mrb, argv[i]);
-    mrb_value name = prepare_ivar_name(mrb, method);
-    if (access_name) {
-      method = access_name(mrb, method);
+    mrb_sym sym = to_sym(mrb, argv[i]);
+    mrb_value ivar = prepare_ivar_name(mrb, sym);
+    for (int w = 0; w < 2; w++) {
+      if (!(w ? writer : reader)) continue;
+      mrb_sym mid = w ? prepare_writer_name(mrb, sym) : sym;
+      struct RProc *p = mrb_proc_new_cfunc_with_env(mrb, w ? mrb_attr_writer : mrb_attr_reader, 1, &ivar);
+      if (!w) p->flags |= MRB_PROC_NOARG;
+      mrb_method_t m;
+      MRB_METHOD_FROM_PROC(m, p);
+      MRB_METHOD_SET_VISIBILITY(m, vis);
+      mrb_define_method_raw(mrb, c, mid, m);
+      mrb_ary_push(mrb, names, mrb_symbol_value(mid));
     }
-
-    struct RProc *p = mrb_proc_new_cfunc_with_env(mrb, accessor, 1, &name);
-    p->flags |= aargc == 0 ? MRB_PROC_NOARG : 0;
-    mrb_method_t m;
-    MRB_METHOD_FROM_PROC(m, p);
-    mrb_define_method_raw(mrb, c, method, m);
     mrb_gc_arena_restore(mrb, ai);
   }
-  return mrb_nil_value();
+  return names;
 }
 
 mrb_value
@@ -3147,7 +3633,7 @@ mrb_attr_reader(mrb_state *mrb, mrb_value obj)
 static mrb_value
 mrb_mod_attr_reader(mrb_state *mrb, mrb_value mod)
 {
-  return mod_attr_define(mrb, mod, 0, mrb_attr_reader, NULL);
+  return mod_attr_define(mrb, mod, TRUE, FALSE);
 }
 
 mrb_value
@@ -3163,14 +3649,13 @@ mrb_attr_writer(mrb_state *mrb, mrb_value obj)
 static mrb_value
 mrb_mod_attr_writer(mrb_state *mrb, mrb_value mod)
 {
-  return mod_attr_define(mrb, mod, 1, mrb_attr_writer, prepare_writer_name);
+  return mod_attr_define(mrb, mod, FALSE, TRUE);
 }
 
 static mrb_value
 mrb_mod_attr_accessor(mrb_state *mrb, mrb_value mod)
 {
-  mrb_mod_attr_reader(mrb, mod);
-  return mrb_mod_attr_writer(mrb, mod);
+  return mod_attr_define(mrb, mod, TRUE, TRUE);
 }
 
 static mrb_value
@@ -3759,6 +4244,18 @@ mrb_mod_to_s(mrb_state *mrb, mrb_value klass)
     }
     return mrb_str_cat_lit(mrb, str, ">");
   }
+#ifdef MRB_USE_REFINEMENTS
+  else if (MRB_CLASS_REFINEMENT_P(mrb_class_ptr(klass))) {
+    struct RClass *r = mrb_class_ptr(klass);
+    mrb_value str = mrb_str_new_lit(mrb, "#<refinement:");
+    mrb_value owner = mrb_iv_get(mrb, klass, MRB_SYM(__defined_at__));
+
+    mrb_str_cat_str(mrb, str, mrb_inspect(mrb, mrb_obj_value(r->super)));
+    mrb_str_cat_lit(mrb, str, "@");
+    mrb_str_cat_str(mrb, str, mrb_inspect(mrb, owner));
+    return mrb_str_cat_lit(mrb, str, ">");
+  }
+#endif
   else {
     return class_name_str(mrb, mrb_class_ptr(klass));
   }
@@ -3954,7 +4451,7 @@ mrb_remove_method(mrb_state *mrb, struct RClass *c0, mrb_sym mid)
     mrb_name_error(mrb, mid, "method '%n' not defined in %C", mid, c);
   }
   mc_clear_by_id(mrb, mid);
-  mrb_idx_op_update(mrb, mid);
+  mrb_builtin_op_update(mrb, mid);
   if (c0->tt == MRB_TT_SCLASS) {
     mrb_sym cb = MRB_SYM(singleton_method_removed);
     mrb_value recv = mrb_iv_get(mrb, mrb_obj_value(c0), MRB_SYM(__attached__));
@@ -4104,14 +4601,38 @@ mrb_mod_const_missing(mrb_state *mrb, mrb_value mod)
   return mrb_const_missing(mrb, mod, sym);
 }
 
+/* The visibility of the method `mod` answers `name` with, or -1 when there is
+   none to answer with.  `mrb_obj_respond_to` answers for any method it finds,
+   so the search is made here to weigh the visibility the listing reports on.
+   With `inherit` false the method has to be `mod`'s own: the walk starts at
+   the origin, past the modules prepended in front of it, and a method found
+   further up is not counted.  The arguments are read here so that the four
+   methods built on this (`method_defined?` and the three in mruby-metaprog)
+   read them the same way. */
+int
+mrb_mod_method_visibility(mrb_state *mrb, mrb_value mod)
+{
+  mrb_sym id;
+  mrb_bool inherit = TRUE;
+
+  mrb_get_args(mrb, "n|b", &id, &inherit);
+  struct RClass *c = mrb_class_ptr(mod);
+  if (!inherit) MRB_CLASS_ORIGIN(c);
+  struct RClass *found = c;
+  mrb_method_t m = mrb_method_search_vm(mrb, &found, id);
+  if (MRB_METHOD_UNDEF_P(m) || MRB_METHOD_NOTIMPL_P(m)) return -1;
+  if (!inherit && found != c) return -1;
+  return MRB_METHOD_VISIBILITY(m);
+}
+
 /* 15.2.2.4.34 */
 /*
  *  call-seq:
- *     mod.method_defined?(symbol)    -> true or false
+ *     mod.method_defined?(symbol, inherit=true)    -> true or false
  *
  *  Returns `true` if the named method is defined by
- *  _mod_ (or its included modules and, if _mod_ is a class,
- *  its ancestors). Public and protected methods are matched.
+ *  _mod_.  If _inherit_ is set, the lookup will also search _mod_'s
+ *  ancestors. Public and protected methods are matched.
  *
  *     module A
  *       def method1()  end
@@ -4124,20 +4645,20 @@ mrb_mod_const_missing(mrb_state *mrb, mrb_value mod)
  *       def method3()  end
  *     end
  *
- *     A.method_defined? :method1    #=> true
- *     C.method_defined? "method1"   #=> true
- *     C.method_defined? "method2"   #=> true
- *     C.method_defined? "method3"   #=> true
- *     C.method_defined? "method4"   #=> false
+ *     A.method_defined? :method1           #=> true
+ *     C.method_defined? "method1"          #=> true
+ *     C.method_defined? "method2"          #=> true
+ *     C.method_defined? "method2", true    #=> true
+ *     C.method_defined? "method2", false   #=> false
+ *     C.method_defined? "method3"          #=> true
+ *     C.method_defined? "method4"          #=> false
  */
 
 static mrb_value
 mrb_mod_method_defined(mrb_state *mrb, mrb_value mod)
 {
-  mrb_sym id;
-
-  mrb_get_args(mrb, "n", &id);
-  return mrb_bool_value(mrb_obj_respond_to(mrb, mrb_class_ptr(mod), id));
+  int vis = mrb_mod_method_visibility(mrb, mod);
+  return mrb_bool_value(vis == MRB_METHOD_PUBLIC_FL || vis == MRB_METHOD_PROTECTED_FL);
 }
 
 void
@@ -4181,6 +4702,14 @@ define_method_m(mrb_state *mrb, struct RClass *c, int vis)
   if (mrb_nil_p(blk)) {
     mrb_raise(mrb, E_ARGUMENT_ERROR, "no block given");
   }
+#ifdef MRB_USE_REFINEMENTS
+  /* refused as CRuby refuses it, where a method made from such a proc would
+     drop its refinements; the copy below would keep them, but the two agree
+     on what a program may write */
+  if (mrb_proc_refined_p(mrb, mrb_proc_ptr(blk))) {
+    mrb_raise(mrb, E_ARGUMENT_ERROR, "can't define a method from a Proc with refinements");
+  }
+#endif
   struct RProc *p = MRB_OBJ_ALLOC(mrb, MRB_TT_PROC, mrb->proc_class);
   mrb_proc_copy(mrb, p, mrb_proc_ptr(blk));
   p->flags |= MRB_PROC_STRICT;
@@ -4196,7 +4725,16 @@ define_method_m(mrb_state *mrb, struct RClass *c, int vis)
 mrb_value
 mrb_mod_define_method_m(mrb_state *mrb, struct RClass *c)
 {
-  return define_method_m(mrb, c, MRB_METHOD_PUBLIC_FL);
+  mrb_bool modfunc;
+  int vis = caller_scope_visibility(mrb, c, &modfunc);
+  mrb_value name = define_method_m(mrb, c, vis);
+  if (modfunc) {
+    /* the copy is made of what the name now resolves to, as the copy
+       `module_function :name` makes is */
+    mrb_sym mid = mrb_symbol(name);
+    define_modfunc_copy(mrb, c, mid, mrb_method_search(mrb, c, mid));
+  }
+  return name;
 }
 
 static mrb_value
@@ -4243,6 +4781,7 @@ mrb_mod_module_function(mrb_state *mrb, mrb_value mod)
     mrb_callinfo *ci;
     struct REnv *e;
     find_visibility_scope(mrb, NULL, 1, &ci, &e);
+    vis_scope_persist(mrb, &ci, &e, MRB_METHOD_PRIVATE_FL >> 25);
     if (e) {
       MRB_ENV_SET_VISIBILITY(e, MRB_METHOD_PRIVATE_FL >> 25);
       MRB_ENV_SET_MODFUNC(e);
@@ -4697,7 +5236,7 @@ static const mrb_mt_entry mod_rom_entries[] = {
   MRB_MT_ENTRY(mrb_mod_to_s,            MRB_SYM(inspect),          MRB_ARGS_NONE()),
   MRB_MT_ENTRY(mrb_do_nothing,          MRB_SYM(method_added),     MRB_ARGS_REQ(1) | MRB_MT_PRIVATE),
   MRB_MT_ENTRY(mrb_do_nothing,          MRB_SYM(method_removed),   MRB_ARGS_REQ(1) | MRB_MT_PRIVATE),
-  MRB_MT_ENTRY(mrb_mod_method_defined,  MRB_SYM_Q(method_defined), MRB_ARGS_REQ(1)),                   /* 15.2.2.4.34 */
+  MRB_MT_ENTRY(mrb_mod_method_defined,  MRB_SYM_Q(method_defined), MRB_ARGS_ARG(1,1)),                 /* 15.2.2.4.34 */
   MRB_MT_ENTRY(mrb_do_nothing,          MRB_SYM(method_undefined), MRB_ARGS_REQ(1) | MRB_MT_PRIVATE),
   MRB_MT_ENTRY(mrb_mod_module_eval,     MRB_SYM(module_eval),      MRB_ARGS_ANY()),                    /* 15.2.2.4.35 */
   MRB_MT_ENTRY(mrb_mod_module_function, MRB_SYM(module_function),  MRB_ARGS_ANY() | MRB_MT_PRIVATE),
@@ -4734,6 +5273,7 @@ mrb_init_class(mrb_state *mrb)
 
   /* name basic classes */
   mrb_define_const_id(mrb, bob, MRB_SYM(BasicObject), mrb_obj_value(bob));
+  mrb_define_const_id(mrb, obj, MRB_SYM(BasicObject), mrb_obj_value(bob));
   mrb_define_const_id(mrb, obj, MRB_SYM(Object),      mrb_obj_value(obj));
   mrb_define_const_id(mrb, obj, MRB_SYM(Module),      mrb_obj_value(mod));
   mrb_define_const_id(mrb, obj, MRB_SYM(Class),       mrb_obj_value(cls));

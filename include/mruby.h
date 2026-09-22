@@ -175,7 +175,7 @@ typedef struct {
   uint8_t n:4;                  /* number of positional arguments; 15 means packed arguments */
   uint8_t kw:1;                 /* has keyword arguments (TRUE or FALSE) */
   uint8_t cci;                  /* called from C function */
-  uint8_t vis;                  /* 4(ZERO):1(module_function):1(separate module):2(method visibility) */
+  uint8_t vis;                  /* 3(ZERO):1(given class):1(module_function):1(separate module):2(method visibility) */
                                 /* under 3-bit flags are copied to env, and after that, env takes precedence */
   mrb_sym mid;
   const struct RProc *proc;
@@ -311,7 +311,8 @@ typedef void (*mrb_atexit_func)(mrb_state*);
 
 /**
  * Slots of `mrb_state.idx_class`, one per builtin the inline index opcodes
- * (`OP_GETIDX`, `OP_GETIDX0`, `OP_SETIDX`) reimplement in C.
+ * (`OP_GETIDX`, `OP_GETIDX0`, `OP_SETIDX`) reimplement in C, plus one for
+ * `String#+`, which `OP_ADD` guards the same way.
  */
 enum mrb_idx_op_slot {
   MRB_IDX_OP_ARY_AREF,          /* Array#[]  */
@@ -320,8 +321,42 @@ enum mrb_idx_op_slot {
   MRB_IDX_OP_ARY_ASET,          /* Array#[]= */
   MRB_IDX_OP_HASH_ASET,         /* Hash#[]=  */
   MRB_IDX_OP_STR_ASET,          /* String#[]= */
+  MRB_IDX_OP_STR_ADD,           /* String#+  */
   MRB_IDX_OP_SLOT_COUNT
 };
+
+/**
+ * Operators the arithmetic and comparison opcodes (`OP_ADD`, `OP_LT`, `OP_EQ`
+ * and their kin) answer in C for an Integer, Float or Symbol receiver.  Each
+ * (receiver class, operator) pair owns a bit of `mrb_state.bop_redefined`,
+ * numbered by the macros below.
+ */
+enum mrb_bop {
+  MRB_BOP_ADD,                  /* +  */
+  MRB_BOP_SUB,                  /* -  */
+  MRB_BOP_MUL,                  /* *  */
+  MRB_BOP_DIV,                  /* /  */
+  MRB_BOP_EQ,                   /* == */
+  MRB_BOP_LT,                   /* <  */
+  MRB_BOP_LE,                   /* <= */
+  MRB_BOP_GT,                   /* >  */
+  MRB_BOP_GE,                   /* >= */
+  MRB_BOP_COUNT
+};
+
+#define MRB_BOP_INTEGER(op) (1u << (op))                  /* Integer#op */
+#define MRB_BOP_FLOAT(op)   (1u << (MRB_BOP_COUNT + (op))) /* Float#op   */
+#define MRB_BOP_NUMERIC(op) (MRB_BOP_INTEGER(op) | MRB_BOP_FLOAT(op))
+#define MRB_BOP_SYMBOL_EQ_SLOT (2 * MRB_BOP_COUNT)         /* Symbol#==  */
+#define MRB_BOP_SYMBOL_EQ   (1u << MRB_BOP_SYMBOL_EQ_SLOT)
+#define MRB_BOP_SLOT_COUNT  (MRB_BOP_SYMBOL_EQ_SLOT + 1)
+/* `nil`, `true` and `false` are immediate as well, so `OP_EQ` reads no class
+   of theirs, but their classes are ordinary heap ones whose own `==` is
+   recorded by `MRB_FL_CLASS_EQ_DEFINED`.  This bit carries that flag of the
+   three into the mask the opcode already tests.  It is not a slot: nothing
+   records a builtin for it and nothing rechecks it, since nothing clears the
+   flag it mirrors. */
+#define MRB_BOP_NIL_TRUE_FALSE_EQ (1u << MRB_BOP_SLOT_COUNT)
 
 #ifdef MRB_USE_TASK_SCHEDULER
 struct mrb_task;
@@ -375,6 +410,23 @@ struct mrb_state {
      mrb_ci_svar() are not made: a build with a gem that registers a virtual
      global still pays nothing until a program actually writes through it. */
   mrb_bool svar_used;
+
+#ifdef MRB_USE_REFINEMENTS
+  struct RClass *refinement_class;
+  /* Weak table of the refinement scopes procs carry by index (see
+     MRB_PROC_REFSCOPE in mruby/proc.h).  An entry is an Array of Refinement
+     modules; the GC clears an entry no proc marks any more. */
+  struct RArray **refscopes;
+  uint32_t refscopes_len;
+  uint32_t refscopes_capa;
+  /* Operator slots a refinement has redefined: the opcode may not answer
+     for them, whatever the core class resolves to. */
+  uint32_t bop_refined;
+  uint32_t idx_refined;
+  /* Bloom filter of the method names ever defined into a refinement; a send
+     whose name is not in it is dispatched without any refinement lookup. */
+  uint64_t refined_mids[4];
+#endif
 
   mrb_gc gc;
 
@@ -452,16 +504,29 @@ struct mrb_state {
   uint16_t atexit_stack_len;
 
   /* The inline index opcodes answer `[]` and `[]=` from C for a receiver whose
-     class is exactly Array, Hash or String, which would bypass a redefinition
+     class is exactly Array, Hash or String, and `OP_ADD` answers `+` for one
+     whose class is exactly String, which would bypass a redefinition
      installed on those classes themselves.  Each slot holds the core class
      while the name still resolves to the builtin recorded in `idx_builtin`,
      and NULL once it does not, so the class-pointer test the opcodes already
      perform rejects a redefined operator at no extra cost.  NULL is safe as
      the disabled value because no live object has a NULL class pointer.
-     Armed by mrb_idx_op_init(), rechecked by mrb_idx_op_update().  Placed at
+     Armed by mrb_builtin_op_init(), rechecked by mrb_builtin_op_update().  Placed at
      the end of the struct so that adding them moves no existing field. */
   struct RClass *idx_class[MRB_IDX_OP_SLOT_COUNT];
   mrb_method_t idx_builtin[MRB_IDX_OP_SLOT_COUNT];
+
+  /* The arithmetic and comparison opcodes answer `+`, `<`, `==` and their kin
+     from C for an Integer, Float or Symbol receiver.  Those are immediate
+     values whose type tag names the class, so there is no class pointer for a
+     slot to disarm; each (class, operator) pair owns a bit here instead, clear
+     while the operator still resolves to the builtin recorded in
+     `bop_builtin` and set once it does not.  Bit numbers are the `MRB_BOP_*`
+     macros, which also index `bop_builtin`; the one bit above them,
+     `MRB_BOP_NIL_TRUE_FALSE_EQ`, mirrors a class flag instead of a builtin
+     and indexes nothing. */
+  uint32_t bop_redefined;
+  mrb_method_t bop_builtin[MRB_BOP_SLOT_COUNT];
 
 #ifdef MRB_USE_TASK_SCHEDULER
   mrb_task_state task;                    /* Task scheduler state */
@@ -957,7 +1022,12 @@ MRB_API mrb_value mrb_obj_dup(mrb_state *mrb, mrb_value obj);
 
 /**
  * Returns true if obj responds to the given method. If the method was defined for that
- * class it returns true, it returns false otherwise.
+ * class, and this build implements it, it returns true; it returns false otherwise.
+ *
+ * Visibility is not weighed: a private or protected method answers true here,
+ * where `Kernel#respond_to?` asked without `include_private` answers false. A
+ * method that stands for a feature this build does not have answers false, as
+ * it does there.
  *
  *      Example:
  *      # Ruby style

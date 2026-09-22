@@ -2073,6 +2073,21 @@ mrb_ary_svalue(mrb_state *mrb, mrb_value ary)
   }
 }
 
+/* internal method: whether the value `__svalue` reads off this array is equal
+   to `other`, as `mrb_equal_in_c()` answers it: `true`, `false`, or `:send`
+   when the element's `==` is written in Ruby, for the caller, which is Ruby,
+   to send in the VM it is already in. The Enumerable methods written in Ruby
+   compare an element through it, so they take it for equal to itself before
+   its `==` is asked, as CRuby's `rb_equal()` does and as `Array#count` does
+   in C, and nest no VM for a `==` a class defines. */
+static mrb_value
+mrb_ary_svalue_eq(mrb_state *mrb, mrb_value ary)
+{
+  int r = mrb_equal_in_c(mrb, mrb_ary_svalue(mrb, ary), mrb_get_arg1(mrb));
+  if (r < 0) return mrb_symbol_value(MRB_SYM(send));
+  return mrb_bool_value(r);
+}
+
 /*
  * call-seq:
  *   array.delete(obj) -> deleted_object
@@ -2487,6 +2502,25 @@ insertion_sort(mrb_state *mrb, mrb_value ary, mrb_value *a, mrb_int size, mrb_va
  *
  *  Sort all elements and replace `self` with these
  *  elements.
+ *
+ *  With no block, each pair of elements is ordered by `<=>`, and a pair
+ *  that `<=>` cannot order raises `ArgumentError`.
+ *
+ *  With a block, the block is called with two elements and its answer
+ *  orders them: negative when `a` is to come before `b`, zero when the
+ *  two are tied, positive when `a` is to come after `b`. An Integer is
+ *  read for its sign. `nil` means the pair has no order and raises
+ *  `ArgumentError`. Any other object is asked `> 0` and then `< 0`, and
+ *  is a tie when neither holds.
+ *
+ *  `Array#sort`, `Enumerable#sort`, `Enumerable#max`, `Enumerable#min`
+ *  and `Enumerable#minmax` read their block the same way. Each asks only
+ *  the operator it needs, so an object that answers one of `>` and `<`
+ *  but not the other is outside the contract and may pass one of these
+ *  methods and raise in another.
+ *
+ *     [3, 1, 2].sort!                    #=> [1, 2, 3]
+ *     [3, 1, 2].sort! {|a, b| b <=> a }  #=> [3, 2, 1]
  */
 static mrb_value
 mrb_ary_sort_bang(mrb_state *mrb, mrb_value ary)
@@ -2622,6 +2656,7 @@ static const mrb_mt_entry array_rom_entries[] = {
   MRB_MT_ENTRY(mrb_ary_to_s,         MRB_SYM(inspect),         MRB_ARGS_NONE()),
   MRB_MT_ENTRY(mrb_ary_sort_bang,    MRB_SYM_B(sort),          MRB_ARGS_NONE()),
   MRB_MT_ENTRY(mrb_ary_svalue,       MRB_SYM(__svalue),        MRB_ARGS_NONE()),
+  MRB_MT_ENTRY(mrb_ary_svalue_eq,    MRB_SYM(__svalue_eq),     MRB_ARGS_REQ(1)),
 };
 
 void

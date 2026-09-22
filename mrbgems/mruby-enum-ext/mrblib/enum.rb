@@ -249,7 +249,10 @@ module Enumerable
       end
     else
       self.each do |*val|
-        count += 1 if val.__svalue == v
+        if r = val.__svalue_eq(v)
+          r = val.__svalue == v if :send == r
+          count += 1 if r
+        end
       end
     end
     count
@@ -371,8 +374,9 @@ module Enumerable
   #
   #  Returns two elements array which contains the minimum and the
   #  maximum value in the enumerable. The first form assumes all
-  #  objects implement `Comparable`; the second uses the
-  #  block to return <em>a <=> b</em>.
+  #  objects implement `Comparable`; the second orders each pair
+  #  of elements by the block, read as the block of `Array#sort!`
+  #  is, which states what the block is to return.
   #
   #     a = %w(albatross dog horse)
   #     a.minmax                                  #=> ["albatross", "horse"]
@@ -752,7 +756,10 @@ module Enumerable
       end
     else
       self.each do |*e|
-        return idx if e.__svalue == val
+        if r = e.__svalue_eq(val)
+          r = e.__svalue == val if :send == r
+          return idx if r
+        end
         idx += 1
       end
     end
@@ -828,8 +835,8 @@ module Enumerable
   def to_h(&blk)
     h = {}
     if blk
-      self.each do |v|
-        v = blk.call(v)
+      self.each do |*v|
+        v = blk.call(*v)
         raise TypeError, "wrong element type #{v.class} (expected Array)" unless Array === v
         raise ArgumentError, "element has wrong array length (expected 2, was #{v.size})" if v.size != 2
         h[v[0]] = v[1]

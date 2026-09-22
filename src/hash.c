@@ -175,10 +175,23 @@ DEFINE_SWITCHER(ht, HT)                                         /* h_ht_on  h_ht
        entry_var < ea_end__;                                                  \
        entry_var++)
 
-#define EA_EACH(ea, size, entry_var)                                          \
+/* Visit the live count of entries, skipping deleted slots, with the skip
+   bounded by the end of the entry allocation (ea + ea_capa).  The live count
+   is read once, and a callback reached from the loop body can delete entries
+   ahead of the cursor: `size` and the slot's key are all a delete touches, so
+   H_CHECK_MODIFIED, which watches the capacity and the pointers, does not see
+   it and the count is left too high.  The bound is what keeps the iterator
+   inside the allocation then (GHSA-jfmr-44fc-gfhg and GHSA-2778-fvwg-5m8w,
+   CWE-125).  ea_capa is used rather than ea_n_used because the latter is
+   transiently inconsistent with the entry positions while a rehash that
+   raised mid-way is being observed; ea_capa always spans every entry. */
+#define EA_EACH(ea, ea_capa, size, entry_var)                                 \
   for (uint32_t ea_size__ = (size); ea_size__; ea_size__ = 0)                 \
-    for (hash_entry *entry_var = (ea);                                        \
-         ea_size__ && (entry_var = entry_skip_deleted(entry_var), TRUE);      \
+    for (hash_entry *entry_var = (ea),                                        \
+                    *ea_end__ = (entry_var) + (ea_capa);                      \
+         ea_size__ &&                                                         \
+           (entry_var = entry_skip_deleted_bounded(entry_var, ea_end__))      \
+             < ea_end__;                                                      \
          entry_var++, ea_size__--)
 
 #define IB_CYCLE_BY_KEY(mrb, h, key, it_var)                                  \
@@ -297,6 +310,12 @@ struct h_check_modified {
   void *tbl;
   uint32_t ht_ea_capa;
   hash_entry *ht_ea;
+  /* A delete touches the count and the slot's key and nothing else: it
+     reallocates nothing, so every field above it is the same afterwards
+     (GHSA-2778-fvwg-5m8w). The count is what tells such a change apart, and
+     an iteration that has read it once is left walking a hash that no longer
+     holds that many. */
+  uint32_t size;
 };
 
 #define H_CHECK_MODIFIED_FLAGS_MASK  (MRB_HASH_HT | MRB_HASH_IB_BIT_MASK | MRB_HASH_AR_EA_CAPA_MASK)
@@ -311,6 +330,7 @@ h_check_modified_init(mrb_state *mrb, struct RHash *h)
   checker.tbl = h->hsh.ht;
   checker.ht_ea_capa = (H_CHECK_MODIFIED_USE_HT_EA_CAPA_FOR_AR || h_ht_p(h)) ? ht_ea_capa(h) : 0;
   checker.ht_ea = (H_CHECK_MODIFIED_USE_HT_EA_FOR_AR || h_ht_p(h)) ? ht_ea(h) : NULL;
+  checker.size = h_size(h);
   return checker;
 }
 
@@ -322,7 +342,8 @@ h_check_modified_validate(mrb_state *mrb, struct h_check_modified *checker, stru
       ((H_CHECK_MODIFIED_USE_HT_EA_CAPA_FOR_AR || h_ht_p(h)) &&
        checker->ht_ea_capa != ht_ea_capa(h)) ||
       ((H_CHECK_MODIFIED_USE_HT_EA_FOR_AR || h_ht_p(h)) &&
-       checker->ht_ea != ht_ea(h))) {
+       checker->ht_ea != ht_ea(h)) ||
+      checker->size != h_size(h)) {
     mrb_raise(mrb, E_RUNTIME_ERROR, "hash modified");
   }
 }
@@ -436,6 +457,37 @@ obj_eql(mrb_state *mrb, mrb_value a, mrb_value b, struct RHash *h)
   }
 }
 
+/*
+ * The comparison every keyed lookup makes against the entry it is standing on.
+ * A key that is not a String, Symbol, Integer or Float answers `eql?` itself,
+ * and that call can delete this very entry and insert another: a delete and an
+ * insert that put the size back move no pointer and no capacity, so
+ * H_CHECK_MODIFIED (which watches those and the size) does not report it, and
+ * the entry the search matched has been vacated all the same. Reading its
+ * value or deleting it a second time then works from an entry the table no
+ * longer holds, and once its value has been collected, from freed memory
+ * (CWE-416). So the entry is read again once the comparison says yes, and a
+ * match is answered only while it still holds the key that was compared; a
+ * reallocation that would leave `entry` dangling has already been reported by
+ * the comparison above (it moves the pointer H_CHECK_MODIFIED watches).
+ */
+static void
+entry_check_vacated(mrb_state *mrb, const hash_entry *entry, mrb_value stored)
+{
+  if (!mrb_obj_eq(mrb, entry->key, stored)) {
+    mrb_raise(mrb, E_RUNTIME_ERROR, "hash modified");
+  }
+}
+
+static mrb_bool
+entry_key_eql(mrb_state *mrb, struct RHash *h, hash_entry *entry, mrb_value key)
+{
+  mrb_value stored = entry->key;
+  if (!obj_eql(mrb, key, stored, h)) return FALSE;
+  entry_check_vacated(mrb, entry, stored);
+  return TRUE;
+}
+
 static inline mrb_bool
 entry_deleted_p(const hash_entry* entry)
 {
@@ -448,18 +500,10 @@ entry_delete(hash_entry* entry)
   entry->key = mrb_undef_value();
 }
 
-static hash_entry*
-entry_skip_deleted(hash_entry *e)
-{
-  for (; entry_deleted_p(e); e++)
-    ;
-  return e;
-}
-
-/* Like entry_skip_deleted, but never advances past `end` (one past the last
-   allocated entry slot). H_EACH uses this so that a callback which deletes
-   entries ahead of the cursor mid-iteration cannot walk the iterator off the
-   end of the allocation (GHSA-jfmr-44fc-gfhg, CWE-125). A realloc-causing
+/* Skip deleted slots without ever advancing past `end`, one past the last
+   allocated entry slot, so that a callback which deletes entries ahead of the
+   cursor mid-iteration cannot walk the iterator off the end of the allocation
+   (GHSA-jfmr-44fc-gfhg and GHSA-2778-fvwg-5m8w, CWE-125). A realloc-causing
    mutation is still caught separately by H_CHECK_MODIFIED in the loop body. */
 static hash_entry*
 entry_skip_deleted_bounded(hash_entry *e, const hash_entry *end)
@@ -542,11 +586,11 @@ ea_dup(mrb_state *mrb, const hash_entry *ea, uint32_t capa)
 }
 
 static hash_entry*
-ea_get_by_key(mrb_state *mrb, hash_entry *ea, uint32_t size, mrb_value key,
-              struct RHash *h)
+ea_get_by_key(mrb_state *mrb, hash_entry *ea, uint32_t ea_capa, uint32_t size,
+              mrb_value key, struct RHash *h)
 {
-  EA_EACH(ea, size, entry) {
-    if (obj_eql(mrb, key, entry->key, h)) return entry;
+  EA_EACH(ea, ea_capa, size, entry) {
+    if (entry_key_eql(mrb, h, entry, key)) return entry;
   }
   return NULL;
 }
@@ -602,8 +646,8 @@ ar_compress(mrb_state *mrb, struct RHash *h)
 static mrb_bool
 ar_get(mrb_state *mrb, struct RHash *h, mrb_value key, mrb_value *valp)
 {
-  EA_EACH(ar_ea(h), ar_size(h), entry) {
-    if (!obj_eql(mrb, key, entry->key, h)) continue;
+  EA_EACH(ar_ea(h), ar_ea_capa(h), ar_size(h), entry) {
+    if (!entry_key_eql(mrb, h, entry, key)) continue;
     *valp = entry->val;
     return TRUE;
   }
@@ -615,7 +659,7 @@ ar_set(mrb_state *mrb, struct RHash *h, mrb_value key, mrb_value val)
 {
   uint32_t size = ar_size(h);
   hash_entry *entry;
-  if ((entry = ea_get_by_key(mrb, ar_ea(h), size, key, h))) {
+  if ((entry = ea_get_by_key(mrb, ar_ea(h), ar_ea_capa(h), size, key, h))) {
     entry->val = val;
   }
   else {
@@ -646,7 +690,7 @@ ar_set(mrb_state *mrb, struct RHash *h, mrb_value key, mrb_value val)
 static mrb_bool
 ar_delete(mrb_state *mrb, struct RHash *h, mrb_value key, mrb_value *valp)
 {
-  hash_entry *entry = ea_get_by_key(mrb, ar_ea(h), ar_size(h), key, h);
+  hash_entry *entry = ea_get_by_key(mrb, ar_ea(h), ar_ea_capa(h), ar_size(h), key, h);
   if (!entry) return FALSE;
   *valp = entry->val;
   entry_delete(entry);
@@ -658,9 +702,16 @@ static void
 ar_shift(mrb_state *mrb, struct RHash *h, mrb_value *keyp, mrb_value *valp)
 {
   uint32_t size = ar_size(h);
-  EA_EACH(ar_ea(h), size, entry) {
+  EA_EACH(ar_ea(h), ar_ea_capa(h), size, entry) {
     *keyp = entry->key;
     *valp = entry->val;
+    /* On the arena before the entry goes: once it is deleted the pair is
+       owned by the caller's C locals alone, which the GC does not scan, and
+       mrb_gc_protect() can collect before it protects, since it grows the
+       arena through mrb_realloc() whose failure path runs a full GC
+       (GHSA-f3mm-x76x-jmcv). */
+    mrb_gc_protect(mrb, *keyp);
+    mrb_gc_protect(mrb, *valp);
     entry_delete(entry);
     ar_set_size(h, --size);
     return;
@@ -673,15 +724,21 @@ ar_rehash(mrb_state *mrb, struct RHash *h)
   /* see comments in `h_rehash` */
   uint32_t size = ar_size(h), w_size = 0, ea_capa = ar_ea_capa(h);
   hash_entry *ea = ar_ea(h), *w_entry;
-  EA_EACH(ea, size, r_entry) {
-    if ((w_entry = ea_get_by_key(mrb, ea, w_size, r_entry->key, h))) {
+  EA_EACH(ea, ea_capa, size, r_entry) {
+    /* the search carries this entry's own key, and the keys already written
+       answer #eql?: Ruby there can vacate the slot the pair is still to be
+       read from */
+    mrb_value key = r_entry->key;
+    w_entry = ea_get_by_key(mrb, ea, ea_capa, w_size, key, h);
+    entry_check_vacated(mrb, r_entry, key);
+    if (w_entry) {
       w_entry->val = r_entry->val;
       ar_set_size(h, --size);
       entry_delete(r_entry);
     }
     else {
       if (w_size != U32(r_entry - ea)) {
-        ea_set(ea, w_size, r_entry->key, r_entry->val);
+        ea_set(ea, w_size, key, r_entry->val);
         entry_delete(r_entry);
       }
       w_size++;
@@ -790,7 +847,7 @@ ib_it_find_by_key(mrb_state *mrb, index_buckets_iter *it, mrb_value key)
     ib_it_next(it);
     if (ib_it_empty_p(it)) return FALSE;
     if (!ib_it_deleted_p(it) &&
-        obj_eql(mrb, key, ib_it_entry(it)->key, it->h)) {
+        entry_key_eql(mrb, it->h, ib_it_entry(it), key)) {
       return TRUE;
     }
   }
@@ -986,7 +1043,7 @@ ht_set(mrb_state *mrb, struct RHash *h, mrb_value key, mrb_value val)
   mrb_assert(ht_size(h) < ib_bit_to_capa(ib_bit(h)));
   IB_CYCLE_BY_KEY(mrb, h, key, it) {
     if (ib_it_active_p(it)) {
-      if (!obj_eql(mrb, key, ib_it_entry(it)->key, h)) continue;
+      if (!entry_key_eql(mrb, h, ib_it_entry(it), key)) continue;
       ib_it_entry(it)->val = val;
     }
     else if (ib_it_deleted_p(it)) {
@@ -1027,11 +1084,14 @@ static void
 ht_shift(mrb_state *mrb, struct RHash *h, mrb_value *keyp, mrb_value *valp)
 {
   hash_entry *ea = ht_ea(h);
-  EA_EACH(ea, ht_size(h), entry) {
+  EA_EACH(ea, ht_ea_capa(h), ht_size(h), entry) {
     IB_CYCLE_BY_KEY(mrb, h, entry->key, it) {
       if (ib_it_get(it) != U32(entry - ea)) continue;
       *keyp = entry->key;
       *valp = entry->val;
+      /* see ar_shift */
+      mrb_gc_protect(mrb, *keyp);
+      mrb_gc_protect(mrb, *valp);
       ib_it_delete(it);
       entry_delete(entry);
       ht_dec_size(h);
@@ -1055,17 +1115,23 @@ ht_rehash(mrb_state *mrb, struct RHash *h)
   ht_init(mrb, h, 0, ea, ea_capa, h_ht(h), ib_bit_for(size));
   ht_set_size(h, size);
   ht_set_ea_n_used(h, ht_ea_n_used(h));
-  EA_EACH(ea, size, r_entry) {
-    IB_CYCLE_BY_KEY(mrb, h, r_entry->key, it) {
+  EA_EACH(ea, ea_capa, size, r_entry) {
+    /* the cycle asks this entry's own key for its hash code, and the key it
+       meets answers #eql?: Ruby in either can vacate the slot the pair is
+       still to be read from, or move the pair out of it with a compress */
+    mrb_value key = r_entry->key;
+    IB_CYCLE_BY_KEY(mrb, h, key, it) {
       if (ib_it_active_p(it)) {
-        if (!obj_eql(mrb, r_entry->key, ib_it_entry(it)->key, h)) continue;
+        if (!entry_key_eql(mrb, h, ib_it_entry(it), key)) continue;
+        entry_check_vacated(mrb, r_entry, key);
         ib_it_entry(it)->val = r_entry->val;
         ht_set_size(h, --size);
         entry_delete(r_entry);
       }
       else {
+        entry_check_vacated(mrb, r_entry, key);
         if (w_size != U32(r_entry - ea)) {
-          ea_set(ea, w_size, r_entry->key, r_entry->val);
+          ea_set(ea, w_size, key, r_entry->val);
           entry_delete(r_entry);
         }
         ib_it_set(it, w_size++);
@@ -1779,8 +1845,6 @@ mrb_hash_shift(mrb_state *mrb, mrb_value hash)
   else {
     mrb_value del_key, del_val;
     h_shift(mrb, h, &del_key, &del_val);
-    mrb_gc_protect(mrb, del_key);
-    mrb_gc_protect(mrb, del_val);
     return mrb_assoc_new(mrb, del_key, del_val);
   }
 }
@@ -2039,10 +2103,20 @@ mrb_hash_merge(mrb_state *mrb, mrb_value hash1, mrb_value hash2)
 
   if (h1 == h2) return;
   if (h_size(h2) == 0) return;
+  int ai = mrb_gc_arena_save(mrb);
   H_EACH(h2, entry) {
-    H_CHECK_MODIFIED(mrb, h2) {h_set(mrb, h1, entry->key, entry->val);}
-    mrb_field_write_barrier_value(mrb, (struct RBasic*)h1, entry->key);
-    mrb_field_write_barrier_value(mrb, (struct RBasic*)h1, entry->val);
+    mrb_value key = entry->key, val = entry->val;
+    /* On the arena before the set: it asks the key for its hash code and its
+       eql?, and Ruby there can delete this pair from `h2`, after which the
+       pair is owned by this frame's C locals alone, which the GC does not
+       scan (see `ar_shift`). The slot it came from is no place to read it
+       back from either, deleted or filled with another pair by then. */
+    mrb_gc_protect(mrb, key);
+    mrb_gc_protect(mrb, val);
+    H_CHECK_MODIFIED(mrb, h2) {h_set(mrb, h1, key, val);}
+    mrb_field_write_barrier_value(mrb, (struct RBasic*)h1, key);
+    mrb_field_write_barrier_value(mrb, (struct RBasic*)h1, val);
+    mrb_gc_arena_restore(mrb, ai);
   }
 }
 
@@ -2167,17 +2241,26 @@ mrb_hash_except_keys(mrb_state *mrb, mrb_value hash)
      afresh each time, and it can rehash `hash` out from under H_EACH, which
      is what H_CHECK_MODIFIED refuses. */
   H_EACH(h, entry) {
+    mrb_value stored = entry->key;
     mrb_bool found = FALSE;
     for (mrb_int i = 0; i < klen && i < RARRAY_LEN(keys); i++) {
       mrb_bool eq = FALSE;
-      H_CHECK_MODIFIED(mrb, h) {eq = mrb_equal(mrb, entry->key, RARRAY_PTR(keys)[i]);}
+      H_CHECK_MODIFIED(mrb, h) {eq = mrb_equal(mrb, stored, RARRAY_PTR(keys)[i]);}
+      /* the key answers #== here, and can vacate its own slot */
+      entry_check_vacated(mrb, entry, stored);
       if (eq) {
         found = TRUE;
         break;
       }
     }
     if (!found) {
-      H_CHECK_MODIFIED(mrb, h) {mrb_hash_set(mrb, result, entry->key, entry->val);}
+      /* On the arena for the same reason as in `mrb_hash_merge`: the set asks
+         the key for its hash code and its eql?, and Ruby there can delete the
+         pair from `hash`. */
+      mrb_value val = entry->val;
+      mrb_gc_protect(mrb, stored);
+      mrb_gc_protect(mrb, val);
+      H_CHECK_MODIFIED(mrb, h) {mrb_hash_set(mrb, result, stored, val);}
     }
     mrb_gc_arena_restore(mrb, ai);
   }
@@ -2205,16 +2288,20 @@ mrb_hash_to_s(mrb_state *mrb, mrb_value self)
   mrb_int i = 0;
   struct RHash *h = mrb_hash_ptr(self);
   H_EACH(h, entry) {
+    mrb_value stored = entry->key;
     if (i++ > 0) mrb_str_cat_lit(mrb, ret, ", ");
-    if (mrb_symbol_p(entry->key)) {
-      mrb_str_cat_str(mrb, ret, mrb_obj_as_string(mrb, entry->key));
+    if (mrb_symbol_p(stored)) {
+      mrb_str_cat_str(mrb, ret, mrb_obj_as_string(mrb, stored));
       mrb_gc_arena_restore(mrb, ai);
       mrb_str_cat_lit(mrb, ret, ": ");
     }
     else {
       H_CHECK_MODIFIED(mrb, h) {
-        mrb_str_cat_str(mrb, ret, mrb_inspect(mrb, entry->key));
+        mrb_str_cat_str(mrb, ret, mrb_inspect(mrb, stored));
       }
+      /* the key's own inspect can vacate this slot, and the value below is
+         read from it */
+      entry_check_vacated(mrb, entry, stored);
       mrb_gc_arena_restore(mrb, ai);
       mrb_str_cat_lit(mrb, ret, " => ");
     }
@@ -2258,8 +2345,11 @@ mrb_hash_assoc(mrb_state *mrb, mrb_value hash)
   mrb_value key = mrb_get_arg1(mrb);
   struct RHash *h = mrb_hash_ptr(hash);
   H_EACH(h, entry) {
-    if (obj_eql(mrb, entry->key, key, h)) {
-      return mrb_assoc_new(mrb, entry->key, entry->val);
+    /* the stored key answers eql? here, and can vacate its own slot */
+    mrb_value stored = entry->key;
+    if (obj_eql(mrb, stored, key, h)) {
+      entry_check_vacated(mrb, entry, stored);
+      return mrb_assoc_new(mrb, stored, entry->val);
     }
   }
   return mrb_nil_value();
@@ -2283,8 +2373,10 @@ mrb_hash_rassoc(mrb_state *mrb, mrb_value hash)
   mrb_value value = mrb_get_arg1(mrb);
   struct RHash *h = mrb_hash_ptr(hash);
   H_EACH(h, entry) {
+    mrb_value stored = entry->key;
     if (obj_eql(mrb, entry->val, value, h)) {
-      return mrb_assoc_new(mrb, entry->key, entry->val);
+      entry_check_vacated(mrb, entry, stored);
+      return mrb_assoc_new(mrb, stored, entry->val);
     }
   }
   return mrb_nil_value();
@@ -2315,14 +2407,17 @@ mrb_hash_equal(mrb_state *mrb, mrb_value hash)
 
   H_EACH(h1, entry) {
     mrb_value val2;
+    mrb_value stored = entry->key;
     mrb_bool found;
 
     H_CHECK_MODIFIED(mrb, h1) {
-      found = h_get(mrb, h2, entry->key, &val2);
+      found = h_get(mrb, h2, stored, &val2);
     }
     if (!found) {
       return mrb_false_value();
     }
+    /* the lookup's eql? can vacate this slot of h1 without moving its size */
+    entry_check_vacated(mrb, entry, stored);
     H_CHECK_MODIFIED(mrb, h1) {
       if (!mrb_equal(mrb, entry->val, val2)) {
         return mrb_false_value();
@@ -2364,14 +2459,17 @@ mrb_hash_eql(mrb_state *mrb, mrb_value hash)
 
   H_EACH(h1, entry) {
     mrb_value val2;
+    mrb_value stored = entry->key;
     mrb_bool found;
 
     H_CHECK_MODIFIED(mrb, h1) {
-      found = h_get(mrb, h2, entry->key, &val2);
+      found = h_get(mrb, h2, stored, &val2);
     }
     if (!found) {
       return mrb_false_value();
     }
+    /* the lookup's eql? can vacate this slot of h1 without moving its size */
+    entry_check_vacated(mrb, entry, stored);
     H_CHECK_MODIFIED(mrb, h1) {
       if (!mrb_eql(mrb, entry->val, val2)) {
         return mrb_false_value();

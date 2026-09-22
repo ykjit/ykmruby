@@ -379,16 +379,32 @@ mrb_vm_ci_env_clear(mrb_state *mrb, mrb_callinfo *ci)
 {
   struct REnv *e = ci->u.env;
   if (e && e->tt == MRB_TT_ENV) {
-    ci->u.target_class = e->c;
     /* The escaping env carries the container, so a proc from the earlier
-       top-level chunk keeps reading the scope it was written in. */
+       top-level chunk keeps reading the scope it was written in. The frame
+       keeps the env through the detach, as cipop() does, so the closing
+       allocation's collection finds it rooted. */
     mrb_env_detach(mrb, e, mrb_ci_svar(mrb->c, ci), FALSE);
+    ci->u.target_class = e->c;
   }
   /* The frame itself starts the next chunk in a fresh scope, the way each
      file `ruby -r` loads gets one of its own; a caller that wants a single
      scope across its chunks (mirb's interactive lines) does not call this,
      which is also how it keeps the top-level locals. */
   mrb_ci_svar_set(mrb, mrb->c, ci, NULL);
+}
+
+/* A proc that is a scope of its own: one the VM made for a `def` body or a
+ * class body, which captured no env. `mrb_define_method_raw()` marks a
+ * block installed by `define_method` a scope too, but that block keeps the
+ * env it was made in, and its special variables belong to the scope it was
+ * written in, the way its locals do (MRB_PROC_LVAR_BOUNDARY_P() in
+ * mruby/proc.h, the same condition read for the other walk). CRuby resolves
+ * the same way: the block's ep is unchanged by the install, so its svar is
+ * still its lep's. */
+static mrb_bool
+svar_own_scope_p(const struct RProc *p)
+{
+  return MRB_PROC_SCOPE_P(p) && !MRB_PROC_ENV_P(p);
 }
 
 /* The local scope of a block or lambda: following p->upper toward the
@@ -406,7 +422,7 @@ svar_scope_env(const struct RProc *p)
   if (!e) return NULL;
   for (;;) {
     const struct RProc *up = p->upper;
-    if (!up || MRB_PROC_CFUNC_P(up) || MRB_PROC_SCOPE_P(up)) return e;
+    if (!up || MRB_PROC_CFUNC_P(up) || svar_own_scope_p(up)) return e;
     struct REnv *upenv = MRB_PROC_ENV(up);
     if (!upenv) return e;
     p = up;
@@ -424,15 +440,17 @@ svar_scope_env(const struct RProc *p)
  * slot, a scopeless frame is as transparent to the special variables as
  * the C function that pushed it, the way CRuby's `rb_eval_string()` shares
  * the scope below; when its env escapes, the transparency outlives the
- * frame by adoption (svar_env_adopt_owner()). Blocks and lambdas always
+ * frame by adoption (svar_owner_adopt()). Blocks and lambdas always
  * capture, so they never answer TRUE. */
 static mrb_bool
 svar_scopeless_frame_p(const mrb_callinfo *ci)
 {
   const struct RProc *p = ci->proc;
 
+  /* `svar_scope_env()` answers NULL for exactly the procs that captured
+     nothing, so the walk it makes is not one this question needs. */
   return p && !MRB_PROC_CFUNC_P(p) &&
-         !MRB_PROC_SCOPE_P(p) && svar_scope_env(p) == NULL;
+         !MRB_PROC_SCOPE_P(p) && !MRB_PROC_ENV_P(p);
 }
 
 /* An escaped scope's slot (MRB_ENV_SVAR_SLOT in internal.h):
@@ -452,8 +470,9 @@ svar_scopeless_frame_p(const mrb_callinfo *ci)
  * VM's own stack. That test comes first because it is also what a swept
  * env looks like: mrb_env_unshare() answers TRUE without touching an env
  * the collection inside its allocation freed, and a freed cell's flags say
- * nothing, so the callers that close an env and then read its slot,
- * cipop() and mrb_env_detach(), still find such an env on the stack. */
+ * nothing. The callers that close an env keep it rooted through that
+ * allocation (cipop(), mrb_vm_ci_env_clear()), so none of them reads a
+ * slot off a swept env; the test stands for an env closed elsewhere. */
 static mrb_value*
 env_svar_slot(struct REnv *e)
 {
@@ -489,8 +508,8 @@ svar_slot_ensure(mrb_state *mrb, struct REnv *e)
 
 /* The owner of the frame-scoped special variables, resolved the way CRuby
  * resolves its svar: walking down from the top, a C frame has no slot of
- * its own, a scope frame owns its own slot, a frame with no
- * scope of its own is as transparent as a C frame (see
+ * its own, a scope frame owns its own slot (see `svar_own_scope_p()`), a
+ * frame with no scope of its own is as transparent as a C frame (see
  * `svar_scopeless_frame_p()`), and a block or lambda frame resolves to the
  * scope it was defined in, wherever that scope now is: a live frame on
  * this or on another context's stack, or the env the scope left behind. A
@@ -537,7 +556,7 @@ svar_owner_from(struct mrb_context *c, mrb_callinfo *top, mrb_callinfo **cip, st
     const struct RProc *p = ci->proc;
 
     if (p && !MRB_PROC_CFUNC_P(p)) {
-      if (MRB_PROC_SCOPE_P(p)) {
+      if (svar_own_scope_p(p)) {
         *cip = ci;
         *ocp = wc;
         return;
@@ -655,7 +674,7 @@ svar_owner_container(const struct mrb_context *c, mrb_callinfo *ci, struct REnv 
 /* Resolves the current owner and answers its container, making one on the
  * spot when the scope holds none yet: the first non-nil write does this
  * (mrb_vm_svar_set()), and so does a scopeless frame whose env escapes
- * (svar_env_adopt_owner()), so the adopted slot and the scope share one
+ * (svar_owner_adopt()), so the adopted slot and the scope share one
  * object before either side has written. NULL when resolution found no
  * scope that could hold one.
  * Installing a fresh container into a frame needs no barrier of its own
@@ -717,7 +736,7 @@ svar_owner_force(mrb_state *mrb)
  * representation an escaped scopeless env uses: neither caller may make a
  * container here, gc_mark_children() (gc.c) running mid-collection and
  * mrb_env_detach_all() mid-teardown, where cipop() materializes one
- * instead (svar_env_adopt_owner()). NULL where there is nothing to carry,
+ * instead (svar_owner_adopt()). NULL where there is nothing to carry,
  * and for an owner that is the context's own root frame, whose container
  * dies with the context the way the root frame's own does. */
 struct RBasic*
@@ -1036,7 +1055,7 @@ env_unshare_with_svar(mrb_state *mrb, struct REnv *e, struct RBasic *sv, mrb_boo
  * context down, and mrb_vm_ci_env_clear() below. Callers on a frame whose
  * container must die with its context, a fiber or task root, pass sv as
  * NULL; a scopeless frame owns none to pass, and its callers hand the
- * slot what the scope below has instead (svar_env_adopt_owner() on a
+ * slot what the scope below has instead (svar_owner_adopt() on a
  * return, mrb_svar_frame_container() on a teardown), which is that
  * scope's container or, where it holds none, its env as a forward.
  * The two arms close the env in exactly one allocation either way (see
@@ -1053,40 +1072,46 @@ mrb_env_detach(mrb_state *mrb, struct REnv *e, struct RBasic *sv, mrb_bool norai
 /* A scopeless frame is transparent while it runs: svar_owner() walks past
  * it to the scope below. When its env escapes, that relation would die
  * with the frame, the frame's own container being the NULL it never
- * needed, so the freshly closed env adopts the owner's container instead,
- * made on the spot when the owner holds none yet: a proc the load left
- * behind keeps reading and writing the scope below, and a match made on
- * either side after the return is seen on the other, the way CRuby's ep
- * chain crosses an eval frame after its escape. Runs after cipop()
- * decrements: resolution then starts at the scope below, and an
- * allocation failure raises out of a consistent stack, leaving the slot
- * empty. The env may already be garbage, nothing but an unreachable proc
- * holding it, and the allocation the owner may need can collect it, so
- * liveness is re-checked before the write. */
-static void
-svar_env_adopt_owner(mrb_state *mrb, struct REnv *e)
+ * needed, so the closing env adopts the owner's container instead, made
+ * on the spot when the owner holds none yet: a proc the load left behind
+ * keeps reading and writing the scope below, and a match made on either
+ * side after the return is seen on the other, the way CRuby's ep chain
+ * crosses an eval frame after its escape. Resolution walks past the
+ * scopeless frame whether or not it still stands, so this runs before
+ * cipop() touches the frame at all: the env is still the frame's, and
+ * the frame's registers, the return value among them, are still the
+ * stack's, so the collection the container allocation may run cannot
+ * sweep either from under it. The container then rides into the closing
+ * env inside mrb_env_detach()'s own allocation, the way a frame's own
+ * does, and no allocation touches a popped frame's env, which nothing
+ * but an escaped proc may keep alive by then.
+ * An allocation failure inside is caught rather than raised here: the
+ * frame is untouched at that point, so the raise would be handled inside
+ * the frame being returned from and its unwinding would come back to this
+ * cipop() to fail the same way (#3087), while a raise out of a consistent
+ * stack after the pop unwinds one frame per attempt. The exception comes
+ * back in *exc for the caller to raise once the frame is gone, and the
+ * slot stays empty, as it does for a load that never wrote one. */
+static struct RSvar*
+svar_owner_adopt(mrb_state *mrb, mrb_value *exc)
 {
-  /* MRB_ENV_ONSTACK_P(e) here is the same collected-out-from-under-unshare
-     case mrb_env_detach() skips: no closed env, nothing to grow. */
-  if (MRB_ENV_ONSTACK_P(e)) return;
-  struct RSvar *sv = svar_owner_force(mrb);
-  if (!sv) return;
-  /* Whether the container allocation ran a collection cannot be read off
-     mrb->gc.live (see svar_owner_force()), so re-check either way. The
-     collection may even have recycled the garbage env's own slot as the
-     new container: mrb_object_dead_p() would then inspect the live RSvar
-     and answer alive, so test the type tag first. Nothing else is
-     allocated in the window, so a reused slot can hold nothing but it. */
-  struct RBasic *b = (struct RBasic*)e;
-  if (b->tt != MRB_TT_ENV || mrb_object_dead_p(mrb, b)) return;
-  /* Grows a closed env sized without the slot into one (see internal.h).
-     No allocation has run since the dead-check just above passed, so the
-     resize's own allocation still finds the object that check vouched
-     for, the same one-allocation tolerance svar_owner_force()'s own
-     grow relies on, immediately after its own fresh resolution. */
-  mrb_value *slot = svar_slot_ensure(mrb, e);
-  *slot = mrb_obj_value(sv);
-  mrb_write_barrier(mrb, (struct RBasic*)e);
+  struct mrb_jmpbuf *prev_jmp = mrb->jmp;
+  struct mrb_jmpbuf c_jmp;
+  struct RSvar *sv = NULL;
+
+  MRB_TRY(&c_jmp) {
+    mrb->jmp = &c_jmp;
+    sv = svar_owner_force(mrb);
+    mrb->jmp = prev_jmp;
+  }
+  MRB_CATCH(&c_jmp) {
+    mrb->jmp = prev_jmp;
+    *exc = mrb_obj_value(mrb->exc);
+    mrb->exc = NULL;
+    sv = NULL;
+  }
+  MRB_END_EXC(&c_jmp);
+  return sv;
 }
 
 /* Detaches every live on-stack env of a context being torn down around it:
@@ -1163,25 +1188,35 @@ cipop(mrb_state *mrb)
   }
 
   struct REnv *env = CI_ENV(ci);
-  ci_env_set(ci, NULL); // make possible to free env by GC if not needed
   struct RProc *b = ci->blk;
   if (b && !MRB_PROC_STRICT_P(b) && MRB_PROC_ENV(b) == CI_ENV(&ci[-1])) {
     b->flags |= MRB_PROC_ORPHAN;
   }
   if (env) {
     /* The container escapes with the locals (see mrb_env_detach()); a
-       frame without an env leaves no proc behind that could look. */
+       frame without an env leaves no proc behind that could look. A
+       scopeless frame has none of its own and hands on its owner's
+       (svar_owner_adopt()), which is the one allocation here that runs
+       before the frame lets go of the env: the env stays the frame's
+       through the detach as well, so the collection that either
+       allocation may run finds it rooted, and the closed env is freed
+       later, by the collection after the last proc holding it goes, the
+       same as one nothing captured. */
     struct RBasic *sv = mrb_ci_svar(c, ci);
-    mrb_bool transparent = (sv == NULL && svar_scopeless_frame_p(ci));
-    if (!mrb_env_detach(mrb, env, sv, TRUE)) {
-      c->ci--; // exceptions are handled at the method caller; see #3087
+    mrb_value exc = mrb_nil_value();
+    if (sv == NULL && svar_scopeless_frame_p(ci)) {
+      sv = (struct RBasic*)svar_owner_adopt(mrb, &exc);
+    }
+    mrb_bool detached = mrb_env_detach(mrb, env, sv, TRUE);
+    ci_env_set(ci, NULL);
+    c->ci--; // exceptions are handled at the method caller; see #3087
+    if (!detached) {
       mrb_exc_raise(mrb, mrb_obj_value(mrb->nomem_err));
     }
-    if (transparent) {
-      c->ci--;
-      svar_env_adopt_owner(mrb, env);
-      return c->ci;
+    if (!mrb_nil_p(exc)) {
+      mrb_exc_raise(mrb, exc);
     }
+    return c->ci;
   }
   c->ci--;
   return c->ci;
@@ -1326,11 +1361,29 @@ mrb_funcall_id(mrb_state *mrb, mrb_value self, mrb_sym mid, mrb_int argc, ...)
   return mrb_funcall_argv(mrb, self, mid, argc, argv);
 }
 
+/* The register the caller left the keyword dictionary in.  A frame that has
+   run its `OP_ENTER` moved the dictionary elsewhere; `enter_kwpos()` answers
+   where. */
 static mrb_int
 mrb_ci_kidx(const mrb_callinfo *ci)
 {
   if (!ci->kw) return -1;
   return (ci->n == CALL_MAXARGS) ? 2 : ci->n + 1;
+}
+
+/* The register the frame's own `OP_ENTER` put the keyword dictionary in.
+   `ci->n` names it directly, except for a method that declares 15 or more
+   positional parameters: the field is 4 bits wide, so `vm_op_enter()` can
+   only saturate it there and the layout is read back off the `OP_ENTER`
+   operand instead, the way `mrb_proc_arity()` reads it. */
+static mrb_int
+enter_kwpos(const mrb_callinfo *ci, const mrb_irep *irep)
+{
+  if (mrb_likely(ci->n < CALL_MAXARGS)) return ci->n + 1;
+  mrb_assert(irep->ilen > 0 && irep->iseq[0] == OP_ENTER);
+  uint32_t aspec = PEEK_W(irep->iseq+1);
+  return MRB_ASPEC_REQ(aspec) + MRB_ASPEC_OPT(aspec)
+       + MRB_ASPEC_REST(aspec) + MRB_ASPEC_POST(aspec) + 1;
 }
 
 static inline mrb_int
@@ -1661,6 +1714,19 @@ mrb_exec_irep(mrb_state *mrb, mrb_value self, const struct RProc *p)
   }
 }
 
+#ifdef MRB_USE_REFINEMENTS
+/* The refinements active for the Ruby code that called the running C
+   function, or NULL when it was called from C. */
+struct RArray*
+mrb_vm_caller_refinements(mrb_state *mrb)
+{
+  mrb_callinfo *ci = mrb->c->ci;
+
+  if (mrb->refscopes_len == 0 || ci->cci != CINFO_NONE || ci == mrb->c->cibase) return NULL;
+  return mrb_vm_refinements(mrb, ci - 1);
+}
+#endif
+
 mrb_value
 mrb_object_exec(mrb_state *mrb, mrb_value self, struct RClass *target_class)
 {
@@ -1675,6 +1741,12 @@ mrb_object_exec(mrb_state *mrb, mrb_value self, struct RClass *target_class)
   mrb_gc_protect(mrb, blk);
   ci->stack[bidx] = mrb_nil_value();
   mrb_vm_ci_target_class_set(ci, target_class);
+  /* The block was given the class to run under, as one given to
+     `eval_under()` is: a `def` in it, or in a block made in it, adds to that
+     class rather than to the block's cref, and a visibility written in it
+     starts at the default and ends with the block. */
+  MRB_CI_SET_VISIBILITY_BREAK(ci);
+  MRB_CI_SET_GIVEN_CLASS(ci);
   return mrb_exec_irep(mrb, self, mrb_proc_ptr(blk));
 }
 
@@ -1692,7 +1764,9 @@ send_method(mrb_state *mrb, mrb_value self, mrb_bool pub)
   mrb_sym name;
 
   if (ci->cci > CINFO_NONE) {
+#ifndef MRB_USE_REFINEMENTS
   funcall:;
+#endif
     const mrb_value *argv;
     mrb_int argc;
     mrb_value block;
@@ -1716,10 +1790,25 @@ send_method(mrb_state *mrb, mrb_value self, mrb_bool pub)
   }
 
   struct RClass *c = mrb_class(mrb, self);
+#ifdef MRB_USE_REFINEMENTS
+  m = mrb_vm_find_method_in_scope(mrb, mrb_vm_caller_refinements(mrb), c, &c, name);
+  if (MRB_METHOD_UNDEF_P(m)) {
+    /* `method_missing` is sent by name: a funcall of the name itself would
+       look it up with no scope and reach a method the scope undefines */
+    const mrb_value *argv;
+    mrb_int argc;
+    mrb_value block;
+    mrb_get_args(mrb, "n*&", &name, &argv, &argc, &block);
+    mrb_value args = mrb_ary_new_from_values(mrb, argc, argv);
+    mrb_ary_unshift(mrb, args, mrb_symbol_value(name));
+    return mrb_funcall_with_block(mrb, self, MRB_SYM(method_missing), RARRAY_LEN(args), RARRAY_PTR(args), block);
+  }
+#else
   m = mrb_vm_find_method(mrb, c, &c, name);
   if (MRB_METHOD_UNDEF_P(m)) {            /* call method_missing */
     goto funcall;
   }
+#endif
 
   if (pub) {
     mrb_bool priv = TRUE;
@@ -1845,6 +1934,7 @@ eval_under(mrb_state *mrb, mrb_value self, mrb_value blk, struct RClass *c)
   ci->kw = FALSE;
   ci->mid = ci[-1].mid;
   MRB_CI_SET_VISIBILITY_BREAK(ci);
+  MRB_CI_SET_GIVEN_CLASS(ci);
   if (MRB_PROC_CFUNC_P(p)) {
     stack_extend(mrb, 4);
     mrb->c->ci->stack[0] = self;
@@ -1916,9 +2006,13 @@ mrb_obj_instance_eval(mrb_state *mrb, mrb_value self)
   return eval_under(mrb, self, b, mrb_singleton_class_ptr(mrb, self));
 }
 
+/* `given_class` says the caller named the class the block runs under, the
+   way `class_eval` and `Class.new` do, rather than taking the one the block
+   already carries.  A `def` written in the block adds to that class, and the
+   visibility written in it is the block's own. */
 static mrb_value
 yield_with_attr(mrb_state *mrb, mrb_value b, mrb_int argc, const mrb_value *argv, mrb_value self, struct RClass *c,
-                mrb_bool vis_break)
+                mrb_bool given_class)
 {
   check_block(mrb, b);
 
@@ -1937,8 +2031,9 @@ yield_with_attr(mrb_state *mrb, mrb_value b, mrb_int argc, const mrb_value *argv
   funcall_args_capture(mrb, 0, argc, argv, mrb_nil_value(), ci);
   ci->u.target_class = c;
   ci->proc = p;
-  if (vis_break) {
+  if (given_class) {
     MRB_CI_SET_VISIBILITY_BREAK(ci);
+    MRB_CI_SET_GIVEN_CLASS(ci);
   }
 
   mrb_value val;
@@ -1964,7 +2059,7 @@ yield_with_attr(mrb_state *mrb, mrb_value b, mrb_int argc, const mrb_value *argv
  * This function executes a given block (`b`) with the provided arguments (`argv`).
  * The `self` object within the block will be `self`, and the class context
  * will be `c`. This allows for more control over the execution environment of
- * the block. The `vis_break` flag is set to TRUE, meaning visibility checks
+ * the block. The `given_class` flag is set to TRUE, meaning visibility checks
  * (public/private/protected) are enforced.
  *
  * @param mrb The mruby state.
@@ -1991,7 +2086,7 @@ mrb_yield_with_class(mrb_state *mrb, mrb_value b, mrb_int argc, const mrb_value 
  * The `self` object and class context for the block execution are determined
  * from the block itself (its captured environment).
  * Visibility checks (public/private/protected) are not strictly enforced
- * in the same way as `mrb_yield_with_class` (vis_break is FALSE).
+ * in the same way as `mrb_yield_with_class` (given_class is FALSE).
  *
  * @param mrb The mruby state.
  * @param b The block (proc) to yield to.
@@ -2019,7 +2114,7 @@ mrb_yield_argv(mrb_state *mrb, mrb_value b, mrb_int argc, const mrb_value *argv)
  * It's a convenience function for the common case of yielding with one argument.
  * The `self` object and class context for the block execution are determined
  * from the block itself.
- * Visibility checks are not strictly enforced (vis_break is FALSE).
+ * Visibility checks are not strictly enforced (given_class is FALSE).
  *
  * @param mrb The mruby state.
  * @param b The block (proc) to yield to.
@@ -2435,7 +2530,9 @@ mrb_vm_run(mrb_state *mrb, const struct RProc *proc, mrb_value self, mrb_int sta
 static struct RClass*
 check_target_class(mrb_state *mrb)
 {
-  struct RClass *target = CI_TARGET_CLASS(mrb->c->ci);
+  mrb_callinfo *ci = mrb->c->ci;
+  struct RClass *target = mrb_vm_definee_class(mrb, ci);
+  if (!target) target = CI_TARGET_CLASS(ci);
   if (!target) {
     mrb_raise(mrb, E_TYPE_ERROR, "no class/module to add method");
   }
@@ -2522,7 +2619,7 @@ vm_op_argary(mrb_state *mrb, uint32_t a, uint16_t b)
   else {
     struct REnv *e = uvenv(mrb, lv-1);
     if (!e) goto L_NOSUPER;
-    if (MRB_ENV_LEN(e) <= m1+r+m2+1)
+    if (MRB_ENV_LEN(e) <= m1+r+m2+kd+1)
       goto L_NOSUPER;
     stack = e->stack + 1;
   }
@@ -2680,6 +2777,9 @@ vm_op_enter(mrb_state *mrb, uint32_t a)
     }
     /* initialize rest arguments with empty Array */
     if (r) {
+      /* the post arguments may have been moved over the register the block
+         arrived in, which was its only reference from the stack */
+      mrb_gc_protect(mrb, blk);
       rest = mrb_ary_new_capa(mrb, 0);
       regs[m1+o+1] = rest;
     }
@@ -2716,8 +2816,12 @@ vm_op_enter(mrb_state *mrb, uint32_t a)
     ci->kw = TRUE;
   }
 
-  /* format arguments for generated code */
-  ci->n = (uint8_t)len;
+  /* format arguments for generated code.  The field is 4 bits wide, so 15 or
+     more positional parameters saturate it rather than wrap around into a
+     count the frame does not have; `enter_kwpos()` reads the layout of such a
+     frame back off this `OP_ENTER`, and `mrb_ci_nregs()` answers the irep's
+     own register count for it. */
+  ci->n = (uint8_t)(len < CALL_MAXARGS ? len : CALL_MAXARGS);
 
   /* clear local (but non-argument) variables */
   if (irep->nlocals-blk_pos-1 > 0) {
@@ -2928,7 +3032,13 @@ vm_op_div(mrb_state *mrb, uint32_t a, mrb_sym *midp)
   mrb_float x, y, f;
 #endif
 
-  /* need to check if op is overridden */
+  /* While `Integer#/` or `Float#/` is redefined every pair is sent, the
+     redefined class's for the answer and the other's for the simplicity of
+     one test; see `bop_redefined` in `struct mrb_state`. */
+  if (mrb_unlikely(mrb->bop_redefined & MRB_BOP_NUMERIC(MRB_BOP_DIV))) {
+    *midp = MRB_OPSYM(div);
+    return VM_SEND_SYM;
+  }
   switch (TYPES2(mrb_type(regs[a]),mrb_type(regs[a+1]))) {
   case TYPES2(MRB_TT_INTEGER,MRB_TT_INTEGER):
     {
@@ -2976,16 +3086,21 @@ vm_op_div(mrb_state *mrb, uint32_t a, mrb_sym *midp)
   return VM_NEXT;
 }
 
+/* `vis` is the visibility the method takes: the default, which is what the
+   scope it is written in says, or public for a singleton definition.  A
+   `def self.x` in a `private` section, or in the body of a `class << self`,
+   is public as CRuby makes it, while a plain `def` in a `class << self`
+   body takes the visibility written there like any other body's `def`. */
 static mrb_sym
-vm_define_method(mrb_state *mrb, struct RClass *tc, const mrb_irep *irep, uint16_t b, uint16_t c)
+vm_define_method(mrb_state *mrb, struct RClass *tc, const mrb_irep *irep, uint16_t b, uint16_t c, uint32_t vis)
 {
-  struct RProc *p = mrb_proc_new(mrb, irep->reps[c]);
+  struct RProc *p = mrb_method_proc_new(mrb, irep->reps[c]);
   mrb_sym mid = irep->syms[b];
   mrb_method_t m;
 
-  p->flags |= MRB_PROC_SCOPE | MRB_PROC_STRICT;
+  p->flags |= MRB_PROC_STRICT;
   MRB_METHOD_FROM_PROC(m, p);
-  MRB_METHOD_SET_VISIBILITY(m, MRB_METHOD_VDEFAULT_FL);
+  MRB_METHOD_SET_VISIBILITY(m, vis);
   mrb_define_method_raw(mrb, tc, mid, m);
   mrb_method_added(mrb, tc, mid);
   return mid;
@@ -3069,6 +3184,12 @@ vm_call_proc(mrb_state *mrb, const struct RProc *p, mrb_int nargs,
 #define VM_SET_FLOAT_VALUE(r,f) SET_FLOAT_VALUE(mrb,r,f)
 #endif
 
+MRB_API void
+mrb_vm_interrupt(mrb_state *mrb)
+{
+  mrb->vm_interrupt = TRUE;
+}
+
 /**
  * @brief Executes a sequence of mruby bytecode instructions.
  *
@@ -3096,13 +3217,7 @@ vm_call_proc(mrb_state *mrb, const struct RProc *p, mrb_int nargs,
  *       when not using switch-based dispatch. It also manages the callinfo
  *       stack (`ci`) for tracking method/block calls.
  */
-MRB_FLATTEN MRB_API void
-mrb_vm_interrupt(mrb_state *mrb)
-{
-  mrb->vm_interrupt = TRUE;
-}
-
-MRB_API mrb_value
+MRB_FLATTEN MRB_API mrb_value
 mrb_vm_exec(mrb_state *mrb, const struct RProc *begin_proc, const mrb_code *iseq)
 {
   /* mrb_assert(MRB_PROC_CFUNC_P(begin_proc)) */
@@ -3401,7 +3516,7 @@ RETRY_TRY_BLOCK:
 
     CASE(OP_SETCONST, BB) {
       ci = mrb->c->ci;
-      struct RClass *c = MRB_PROC_TARGET_CLASS(ci->proc);
+      struct RClass *c = mrb_vm_cref_class(mrb, ci);
       if (!c) c = mrb->object_class;
       mrb_const_set(mrb, mrb_obj_value(c), irep->syms[b], regs[a]);
       ci = mrb->c->ci;
@@ -3535,7 +3650,8 @@ RETRY_TRY_BLOCK:
         RAISE_LIT(mrb, E_TYPE_ERROR, "class or module required for rescue clause");
       }
       ec = mrb_class_ptr(e);
-      regs[b] = mrb_bool_value(mrb_obj_is_kind_of(mrb, exc, ec));
+      /* A break unwinding through an ensure has no class to ask. */
+      regs[b] = mrb_bool_value(!mrb_break_p(exc) && mrb_obj_is_kind_of(mrb, exc, ec));
       NEXT;
     }
 
@@ -3688,6 +3804,25 @@ RETRY_TRY_BLOCK:
       ci = cipush(mrb, a, CINFO_DIRECT, NULL, NULL, BLK_PTR(blk), 0, c);
       recv = regs[0];
       ci->u.target_class = (insn == OP_SUPER) ? CI_TARGET_CLASS(ci - 1)->super : mrb_class(mrb, recv);
+#ifdef MRB_USE_REFINEMENTS
+      /* A refined name is looked up as the calling frame's scope sees it.
+         `super` in a refined method passes over the refinement it is in. */
+      if (mrb->refscopes_len && mrb_refined_mid_p(mrb, mid)) {
+        struct RArray *scope = mrb_vm_refinements(mrb, ci - 1);
+        if (scope) {
+          struct RClass *exclude = NULL;
+          if (insn == OP_SUPER) {
+            struct RClass *cur = CI_TARGET_CLASS(ci - 1);
+            if (MRB_CLASS_REFINEMENT_P(cur)) exclude = cur;
+          }
+          m = mrb_vm_find_refined_method(mrb, scope, ci->u.target_class, &ci->u.target_class, mid, exclude);
+        }
+        else {
+          m = mrb_vm_find_method(mrb, ci->u.target_class, &ci->u.target_class, mid);
+        }
+      }
+      else
+#endif
       m = mrb_vm_find_method(mrb, ci->u.target_class, &ci->u.target_class, mid);
       if (mrb_unlikely(MRB_METHOD_UNDEF_P(m))) {
         m = prepare_missing(mrb, ci, recv, mid, (insn == OP_SUPER));
@@ -3696,20 +3831,43 @@ RETRY_TRY_BLOCK:
         ci->mid = mid;
         /* visibility is checked only when the method is actually found;
            the `method_missing` fallback dispatches regardless of its own
-           visibility, as in CRuby */
-        if (insn == OP_SEND || insn == OP_SEND0 || insn == OP_SENDB) {
-          mrb_bool priv = TRUE;
-          if (m.flags & MRB_METHOD_PRIVATE_FL) {
-          vis_err:;
-            mrb_value args = (ci->n == 15) ? regs[1] : mrb_ary_new_from_values(mrb, ci->n, regs+1);
-            vis_error(mrb, mid, args, recv, priv);
+           visibility, as in CRuby. A call on a written `self` is exempt,
+           which OP_SSEND says of a named call. The send an operator
+           instruction falls back to has no operand that says how its
+           receiver was written, so it is exempt while the receiver is the
+           caller's own `self`: that admits `x = self; x[0] = 1`, which CRuby
+           rejects, and no other receiver. */
+        if (mrb_unlikely(m.flags & (MRB_METHOD_PRIVATE_FL | MRB_METHOD_PROTECTED_FL))) {
+          mrb_bool exempt;
+          if (insn == OP_SEND || insn == OP_SEND0 || insn == OP_SENDB) {
+            exempt = FALSE;
           }
-          /* protected methods are callable when the caller's `self` belongs
-             to the class (or module) where the method is defined */
-          else if ((m.flags & MRB_METHOD_PROTECTED_FL) &&
-                   !mrb_obj_is_kind_of(mrb, ci[-1].stack[0], ci->u.target_class)) {
-            priv = FALSE;
-            goto vis_err;
+          else if (insn == OP_SSEND || insn == OP_SSEND0 || insn == OP_SSENDB || insn == OP_SUPER) {
+            exempt = TRUE;
+          }
+          else {
+            exempt = mrb_obj_eq(mrb, recv, ci[-1].stack[0]);
+          }
+          if (!exempt) {
+            mrb_bool priv = TRUE;
+            if (m.flags & MRB_METHOD_PRIVATE_FL) {
+            vis_err:;
+              mrb_value args = (ci->n == 15) ? regs[1] : mrb_ary_new_from_values(mrb, ci->n, regs+1);
+              vis_error(mrb, mid, args, recv, priv);
+            }
+            /* protected methods are callable when the caller's `self` belongs
+               to the class (or module) where the method is defined; one a
+               refinement holds belongs to the refined class */
+            else {
+              struct RClass *owner = ci->u.target_class;
+#ifdef MRB_USE_REFINEMENTS
+              if (MRB_CLASS_REFINEMENT_P(owner)) owner = owner->super;
+#endif
+              if (!mrb_obj_is_kind_of(mrb, ci[-1].stack[0], owner)) {
+                priv = FALSE;
+                goto vis_err;
+              }
+            }
           }
         }
       }
@@ -3787,6 +3945,17 @@ RETRY_TRY_BLOCK:
     }
 
     CASE(OP_CALL, Z) {
+      /* The receiver is whatever the frame was entered with, and this reads
+         it as a proc. No compiled program contains OP_CALL: the compiler never
+         emits it, and the only iseq that holds one is `call_iseq` in
+         src/proc.c, entered where a proc has just been put in place. The check
+         therefore answers for an irep that arrived by another road, whose
+         bytes would otherwise be used as an RProc* (an immediate becomes a
+         misaligned pointer, a heap object lends its own contents). OP_BLKCALL
+         below asks the same of the same kind of value. */
+      if (mrb_unlikely(!mrb_proc_p(ci->stack[0]))) {
+        mrb_raisef(mrb, E_TYPE_ERROR, "wrong type %T (expected Proc)", ci->stack[0]);
+      }
       const struct RProc *p = mrb_proc_ptr(ci->stack[0]);
       int r = vm_call_proc(mrb, p, ci_bidx(ci)+1, &irep, ai);
       ci = mrb->c->ci;
@@ -3821,10 +3990,28 @@ RETRY_TRY_BLOCK:
       if (mid == 0 || !target_class) {
         RAISE_LIT(mrb, E_NOMETHOD_ERROR, "super called outside of method");
       }
-      if ((target_class->flags & MRB_FL_CLASS_IS_PREPENDED) || target_class->tt == MRB_TT_MODULE) {
+      if (target_class->flags & MRB_FL_CLASS_IS_PREPENDED) {
         goto super_typeerror;
       }
       recv = regs[0];
+      if (target_class->tt == MRB_TT_MODULE) {
+#ifdef MRB_USE_REFINEMENTS
+        /* a refined method runs under its refinement, whose `super` is the
+           class it refines; `self` is checked against that class */
+        if (MRB_CLASS_REFINEMENT_P(target_class) && target_class->super) {
+          target_class = target_class->super;
+        }
+        /* The method of a refined module, reached by a `super` from the
+           refinement: it runs under the module itself and not under the
+           ICLASS its includer holds, so there is no chain to go on up.
+           CRuby refuses the same way (Bug #22071). */
+        else if (mrb_obj_is_kind_of(mrb, recv, target_class)) {
+          RAISE_LIT(mrb, E_NOMETHOD_ERROR, "super in a method in a module that has been refined and that is called via super from a refinement method is not supported.");
+        }
+        else
+#endif
+        goto super_typeerror;
+      }
       if (!mrb_obj_is_kind_of(mrb, recv, target_class)) {
       super_typeerror:
         RAISE_LIT(mrb, E_TYPE_ERROR, "self has wrong type to call super in this context");
@@ -3850,10 +4037,10 @@ RETRY_TRY_BLOCK:
 
     CASE(OP_KARG, BB) {
       mrb_value k = mrb_symbol_value(irep->syms[b]);
-      mrb_int kidx = mrb_ci_kidx(ci);
+      mrb_int kidx = enter_kwpos(ci, irep);
       mrb_value kdict, v;
 
-      if (kidx < 0 || !mrb_hash_p(kdict=regs[kidx]) || !mrb_hash_key_p(mrb, kdict, k)) {
+      if (!mrb_hash_p(kdict=regs[kidx]) || !mrb_hash_key_p(mrb, kdict, k)) {
         RAISE_FORMAT(mrb, E_ARGUMENT_ERROR, "missing keyword: %v", k);
       }
 
@@ -3865,11 +4052,11 @@ RETRY_TRY_BLOCK:
 
     CASE(OP_KEY_P, BB) {
       mrb_value k = mrb_symbol_value(irep->syms[b]);
-      mrb_int kidx = mrb_ci_kidx(ci);
+      mrb_int kidx = enter_kwpos(ci, irep);
       mrb_value kdict;
       mrb_bool key_p = FALSE;
 
-      if (kidx >= 0 && mrb_hash_p(kdict=regs[kidx])) {
+      if (mrb_hash_p(kdict=regs[kidx])) {
         key_p = mrb_hash_key_p(mrb, kdict, k);
         ci = mrb->c->ci;
       }
@@ -3878,10 +4065,10 @@ RETRY_TRY_BLOCK:
     }
 
     CASE(OP_KEYEND, Z) {
-      mrb_int kidx = mrb_ci_kidx(ci);
+      mrb_int kidx = enter_kwpos(ci, irep);
       mrb_value kdict;
 
-      if (kidx >= 0 && mrb_hash_p(kdict=regs[kidx]) && !mrb_hash_empty_p(mrb, kdict)) {
+      if (mrb_hash_p(kdict=regs[kidx]) && !mrb_hash_empty_p(mrb, kdict)) {
         mrb_value key1 = mrb_hash_first_key(mrb, kdict);
         RAISE_FORMAT(mrb, E_ARGUMENT_ERROR, "unknown keyword: %v", key1);
       }
@@ -4054,15 +4241,19 @@ RETRY_TRY_BLOCK:
 #endif
 
 #define OP_MATH(op_name) do {                                               \
-  /* need to check if op is overridden */                                   \
   uint16_t tt = TYPES2(mrb_type(regs[a]),mrb_type(regs[a+1]));              \
-  if (mrb_likely(tt == TYPES2(MRB_TT_INTEGER, MRB_TT_INTEGER))) {           \
+  if (mrb_likely(tt == TYPES2(MRB_TT_INTEGER, MRB_TT_INTEGER) &&            \
+                 !(mrb->bop_redefined & MRB_BOP_INTEGER(OP_MATH_BOP_##op_name)))) { \
     mrb_int x = mrb_integer(regs[a]), y = mrb_integer(regs[a+1]), z;        \
     if (mrb_int_##op_name##_overflow(x, y, &z)) {                           \
       OP_MATH_OVERFLOW_INT(op_name,x,y);                                    \
     }                                                                       \
     else                                                                    \
       VM_SET_INT_VALUE(regs[a], z);                                         \
+  }                                                                         \
+  else if (mrb_unlikely(mrb->bop_redefined & MRB_BOP_NUMERIC(OP_MATH_BOP_##op_name))) { \
+    mid = MRB_OPSYM(op_name);                                               \
+    goto L_SEND_SYM;                                                        \
   }                                                                         \
   else switch (tt) {                                                        \
     OP_MATH_CASE_FLOAT(op_name, integer, float);                            \
@@ -4096,6 +4287,13 @@ RETRY_TRY_BLOCK:
 #endif
 #define OP_MATH_CASE_STRING_add()                                           \
   case TYPES2(MRB_TT_STRING, MRB_TT_STRING):                                \
+    /* only for String itself: a subclass or singleton may override `+`,    \
+       and the slot is NULL while `String#+` is redefined, so one compare   \
+       rejects all three */                                                 \
+    if (mrb_unlikely(mrb_str_ptr(regs[a])->c != mrb->idx_class[MRB_IDX_OP_STR_ADD])) { \
+      mid = MRB_OPSYM(add);                                                 \
+      goto L_SEND_SYM;                                                      \
+    }                                                                       \
     regs[a] = mrb_str_plus(mrb, regs[a], regs[a+1]);                        \
     mrb_gc_arena_restore(mrb, ai);                                          \
     break
@@ -4104,6 +4302,9 @@ RETRY_TRY_BLOCK:
 #define OP_MATH_OP_add +
 #define OP_MATH_OP_sub -
 #define OP_MATH_OP_mul *
+#define OP_MATH_BOP_add MRB_BOP_ADD
+#define OP_MATH_BOP_sub MRB_BOP_SUB
+#define OP_MATH_BOP_mul MRB_BOP_MUL
 #define OP_MATH_TT_integer MRB_TT_INTEGER
 #define OP_MATH_TT_float   MRB_TT_FLOAT
 
@@ -4127,8 +4328,8 @@ RETRY_TRY_BLOCK:
     }
 
 #define OP_MATHI(op_name) do {                                              \
-  /* need to check if op is overridden */                                   \
-  if (mrb_likely(mrb_integer_p(regs[a]))) {                                 \
+  if (mrb_likely(mrb_integer_p(regs[a]) &&                                  \
+                 !(mrb->bop_redefined & MRB_BOP_INTEGER(OP_MATH_BOP_##op_name)))) { \
     mrb_int x = mrb_integer(regs[a]), y = (mrb_int)b, z;                    \
     if (mrb_int_##op_name##_overflow(x, y, &z)) {                           \
       OP_MATH_OVERFLOW_INT(op_name,x,y);                                    \
@@ -4136,25 +4337,23 @@ RETRY_TRY_BLOCK:
     else                                                                    \
       VM_SET_INT_VALUE(regs[a], z);                                         \
   }                                                                         \
-  else switch (mrb_type(regs[a])) {                                         \
-    OP_MATHI_CASE_FLOAT(op_name);                                           \
-    default:                                                                \
-      SET_INT_VALUE(mrb,regs[a+1], b);                                      \
-      mid = MRB_OPSYM(op_name);                                             \
-      goto L_SEND_SYM;                                                      \
+  OP_MATHI_ELSE_FLOAT(op_name)                                              \
+  else {                                                                    \
+    SET_INT_VALUE(mrb,regs[a+1], b);                                        \
+    mid = MRB_OPSYM(op_name);                                               \
+    goto L_SEND_SYM;                                                        \
   }                                                                         \
 } while(0);                                                                 \
   NEXT;
 #ifdef MRB_NO_FLOAT
-#define OP_MATHI_CASE_FLOAT(op_name) (void)0
+#define OP_MATHI_ELSE_FLOAT(op_name)
 #else
-#define OP_MATHI_CASE_FLOAT(op_name)                                        \
-  case MRB_TT_FLOAT:                                                        \
-    {                                                                       \
-      mrb_float z = mrb_float(regs[a]) OP_MATH_OP_##op_name b;              \
-      VM_SET_FLOAT_VALUE(regs[a], z);                                       \
-    }                                                                       \
-    break
+#define OP_MATHI_ELSE_FLOAT(op_name)                                        \
+  else if (mrb_float_p(regs[a]) &&                                          \
+           !(mrb->bop_redefined & MRB_BOP_FLOAT(OP_MATH_BOP_##op_name))) {  \
+    mrb_float z = mrb_float(regs[a]) OP_MATH_OP_##op_name b;                \
+    VM_SET_FLOAT_VALUE(regs[a], z);                                         \
+  }
 #endif
 
     CASE(OP_ADDI, BB) {
@@ -4166,50 +4365,44 @@ RETRY_TRY_BLOCK:
     }
 
 #ifdef MRB_NO_FLOAT
-#define OP_MATHILV_CASE_FLOAT(op_name) (void)0
+#define OP_MATHILV_ELSE_FLOAT(op_name)
 #else
-#define OP_MATHILV_CASE_FLOAT(op_name)                                      \
-  case MRB_TT_FLOAT:                                                        \
-    {                                                                       \
-      mrb_float z = mrb_float(regs[a]) OP_MATH_OP_##op_name c;              \
-      VM_SET_FLOAT_VALUE(regs[a], z);                                       \
-    }                                                                       \
-    break
+#define OP_MATHILV_ELSE_FLOAT(op_name)                                      \
+  else if (mrb_float_p(regs[a]) &&                                          \
+           !(mrb->bop_redefined & MRB_BOP_FLOAT(OP_MATH_BOP_##op_name))) {  \
+    mrb_float z = mrb_float(regs[a]) OP_MATH_OP_##op_name c;                \
+    VM_SET_FLOAT_VALUE(regs[a], z);                                         \
+  }
 #endif
 #define OP_MATHILV(op_name)                                                 \
   /* a=local, b=working space, c=immediate */                               \
-  switch (mrb_type(regs[a])) {                                              \
-    case MRB_TT_INTEGER:                                                    \
-      {                                                                     \
-        mrb_int x = mrb_integer(regs[a]), y = (mrb_int)c, z;                \
-        if (mrb_int_##op_name##_overflow(x, y, &z)) {                       \
-          OP_MATH_OVERFLOW_INT(op_name,x,y);                                \
-        }                                                                   \
-        else {                                                              \
-          VM_SET_INT_VALUE(regs[a], z);                                     \
-        }                                                                   \
-      }                                                                     \
-      break;                                                                \
-    OP_MATHILV_CASE_FLOAT(op_name);                                         \
-    default:                                                                \
-      /* `a` is a local variable slot, not a temporary, so the L_SEND_SYM   \
-         path the other OP_MATH opcodes take cannot be used: it writes the  \
-         argument into regs[a+1] and lays the callee frame over the locals  \
-         from regs[a] on. `b` is the working space reserved for the call,   \
-         but a send set up there leaves its result in regs[b] and the       \
-         `MOVE local, temp` that used to copy it back is what the fusion    \
-         removed, so the call is made from C. It can move the stack, hence  \
-         the `ci` refresh before storing through `regs`. */                 \
-      {                                                                     \
-        int ai_ = mrb_gc_arena_save(mrb);                                   \
-        mrb_value arg_ = mrb_int_value(mrb, c);                             \
-        mrb_value v_ = mrb_funcall_argv(mrb, regs[a],                       \
-                                        MRB_OPSYM(op_name), 1, &arg_);      \
-        ci = mrb->c->ci;                                                    \
-        regs[a] = v_;                                                       \
-        mrb_gc_arena_restore(mrb, ai_);                                     \
-      }                                                                     \
-      break;                                                                \
+  if (mrb_likely(mrb_integer_p(regs[a]) &&                                  \
+                 !(mrb->bop_redefined & MRB_BOP_INTEGER(OP_MATH_BOP_##op_name)))) { \
+    mrb_int x = mrb_integer(regs[a]), y = (mrb_int)c, z;                    \
+    if (mrb_int_##op_name##_overflow(x, y, &z)) {                           \
+      OP_MATH_OVERFLOW_INT(op_name,x,y);                                    \
+    }                                                                       \
+    else {                                                                  \
+      VM_SET_INT_VALUE(regs[a], z);                                         \
+    }                                                                       \
+  }                                                                         \
+  OP_MATHILV_ELSE_FLOAT(op_name)                                            \
+  else {                                                                    \
+    /* `a` is a local variable slot, not a temporary, so the L_SEND_SYM     \
+       path the other OP_MATH opcodes take cannot be used: it writes the    \
+       argument into regs[a+1] and lays the callee frame over the locals    \
+       from regs[a] on. `b` is the working space reserved for the call,     \
+       but a send set up there leaves its result in regs[b] and the         \
+       `MOVE local, temp` that used to copy it back is what the fusion      \
+       removed, so the call is made from C. It can move the stack, hence    \
+       the `ci` refresh before storing through `regs`. */                   \
+    int ai_ = mrb_gc_arena_save(mrb);                                       \
+    mrb_value arg_ = mrb_int_value(mrb, c);                                 \
+    mrb_value v_ = mrb_funcall_argv(mrb, regs[a],                           \
+                                    MRB_OPSYM(op_name), 1, &arg_);          \
+    ci = mrb->c->ci;                                                        \
+    regs[a] = v_;                                                           \
+    mrb_gc_arena_restore(mrb, ai_);                                         \
   }                                                                         \
   NEXT
 
@@ -4222,14 +4415,19 @@ RETRY_TRY_BLOCK:
     }
 
 #define OP_CMP_BODY(op,v1,v2) (v1(regs[a]) op v2(regs[a+1]))
+#define OP_CMP_BOP_eq MRB_BOP_EQ
+#define OP_CMP_BOP_lt MRB_BOP_LT
+#define OP_CMP_BOP_le MRB_BOP_LE
+#define OP_CMP_BOP_gt MRB_BOP_GT
+#define OP_CMP_BOP_ge MRB_BOP_GE
 
 #ifdef MRB_NO_FLOAT
 #define value_nan_p(v) FALSE
 #define OP_CMP(op,sym) do {\
   int result;\
-  /* need to check if op is overridden */\
   if (mrb_likely(TYPES2(mrb_type(regs[a]),mrb_type(regs[a+1])) == \
-                 TYPES2(MRB_TT_INTEGER,MRB_TT_INTEGER))) {\
+                 TYPES2(MRB_TT_INTEGER,MRB_TT_INTEGER) &&\
+                 !(mrb->bop_redefined & MRB_BOP_INTEGER(OP_CMP_BOP_##sym)))) {\
     result = OP_CMP_BODY(op,mrb_integer,mrb_integer);\
   }\
   else {\
@@ -4260,10 +4458,14 @@ RETRY_TRY_BLOCK:
 } while (0)
 #define OP_CMP(op, sym) do {\
   int result;\
-  /* need to check if op is overridden */\
   uint16_t tt = TYPES2(mrb_type(regs[a]),mrb_type(regs[a+1]));\
-  if (mrb_likely(tt == TYPES2(MRB_TT_INTEGER,MRB_TT_INTEGER))) {\
+  if (mrb_likely(tt == TYPES2(MRB_TT_INTEGER,MRB_TT_INTEGER) &&\
+                 !(mrb->bop_redefined & MRB_BOP_INTEGER(OP_CMP_BOP_##sym)))) {\
     result = OP_CMP_BODY(op,mrb_integer,mrb_integer);\
+  }\
+  else if (mrb_unlikely(mrb->bop_redefined & MRB_BOP_NUMERIC(OP_CMP_BOP_##sym))) {\
+    mid = MRB_OPSYM(sym);\
+    goto L_SEND_SYM;\
   }\
   else switch (tt) {\
   case TYPES2(MRB_TT_INTEGER,MRB_TT_FLOAT):\
@@ -4297,16 +4499,37 @@ RETRY_TRY_BLOCK:
          without the test below `Float::NAN == Float::NAN` answered true in a
          boxed build and false in `MRB_NO_BOXING`. The pair falls through to
          the comparison instead, which reads it as numbers and answers false
-         in either. */
-      if (mrb_obj_eq(mrb, regs[a], regs[a+1]) && !value_nan_p(regs[a])) {
-        SET_TRUE_VALUE(regs[a]);
+         in either. A Symbol is equal to nothing but itself, so it is answered
+         here in full.
+
+         Neither answer may stand in for a `==` that is not the builtin one.
+         Whether an Integer, Float or Symbol equals itself, or a Symbol
+         anything else, is a redefinition's to say: while any of the three is
+         redefined both shortcuts are skipped for every receiver, and the
+         comparison below sends `==` to whatever its type dispatch does not
+         answer. `nil`, `true` and `false` are read from the same mask, by the
+         bit `MRB_FL_CLASS_EQ_DEFINED` on their classes is mirrored into.
+         Whether a heap object equals itself is its own class's to say once a
+         class among its ancestors defines a `==`, which that flag on the
+         class records: the identity answer is withheld from that object
+         alone, and `obj == obj` sends `==` as CRuby's `opt_eq` calls it. The
+         usual state pays one mask test and, for a heap object, one flag
+         test. */
+      if (mrb_likely(!(mrb->bop_redefined &
+                       (MRB_BOP_NUMERIC(MRB_BOP_EQ) | MRB_BOP_SYMBOL_EQ |
+                        MRB_BOP_NIL_TRUE_FALSE_EQ)))) {
+        if (mrb_obj_eq(mrb, regs[a], regs[a+1]) && !value_nan_p(regs[a]) &&
+            (mrb_immediate_p(regs[a]) ||
+             !(mrb_obj_ptr(regs[a])->c->flags & MRB_FL_CLASS_EQ_DEFINED))) {
+          SET_TRUE_VALUE(regs[a]);
+          NEXT;
+        }
+        if (mrb_symbol_p(regs[a])) {
+          SET_FALSE_VALUE(regs[a]);
+          NEXT;
+        }
       }
-      else if (mrb_symbol_p(regs[a])) {
-        SET_FALSE_VALUE(regs[a]);
-      }
-      else {
-        OP_CMP(==,eq);
-      }
+      OP_CMP(==,eq);
       NEXT;
     }
 
@@ -4538,8 +4761,8 @@ RETRY_TRY_BLOCK:
         p = mrb_closure_new(mrb, nirep);
       }
       else {
-        p = mrb_proc_new(mrb, nirep);
-        p->flags |= MRB_PROC_SCOPE;
+        /* OP_METHOD is the only one here without OP_L_CAPTURE: a method body */
+        p = mrb_method_proc_new(mrb, nirep);
       }
       if (c & OP_L_STRICT) p->flags |= MRB_PROC_STRICT;
       regs[a] = mrb_obj_value(p);
@@ -4583,7 +4806,7 @@ RETRY_TRY_BLOCK:
       mrb_value super = regs[a+1];
 
       if (mrb_nil_p(base)) {
-        baseclass = MRB_PROC_TARGET_CLASS(ci->proc);
+        baseclass = mrb_vm_cref_class(mrb, ci);
         if (!baseclass) baseclass = mrb->object_class;
         base = mrb_obj_value(baseclass);
       }
@@ -4600,7 +4823,7 @@ RETRY_TRY_BLOCK:
       mrb_value base = regs[a];
 
       if (mrb_nil_p(base)) {
-        baseclass = MRB_PROC_TARGET_CLASS(ci->proc);
+        baseclass = mrb_vm_cref_class(mrb, ci);
         if (!baseclass) baseclass = mrb->object_class;
         base = mrb_obj_value(baseclass);
       }
@@ -4618,11 +4841,15 @@ RETRY_TRY_BLOCK:
       const mrb_irep *nirep = irep->reps[b];
 
       /* prepare closure */
+#ifdef MRB_USE_REFINEMENTS
+      struct RProc *p = mrb_scope_proc_new(mrb, nirep);
+#else
       struct RProc *p = mrb_proc_new(mrb, nirep);
+#endif
       p->c = NULL;
       mrb_field_write_barrier(mrb, (struct RBasic*)p, (struct RBasic*)ci->proc);
       MRB_PROC_SET_TARGET_CLASS(p, c);
-      p->flags |= MRB_PROC_SCOPE;
+      p->flags |= MRB_PROC_SCOPE | MRB_PROC_CREF;
 
       /* prepare call stack */
       ci = cipush(mrb, a, 0, c, p, NULL, 0, 0);
@@ -4653,7 +4880,7 @@ RETRY_TRY_BLOCK:
     CASE(OP_TDEF, BBB) {
       struct RClass *tc = check_target_class(mrb);
       if (mrb_unlikely(!tc)) goto L_RAISE;
-      mid = vm_define_method(mrb, tc, irep, b, c);
+      mid = vm_define_method(mrb, tc, irep, b, c, MRB_METHOD_VDEFAULT_FL);
       ci = mrb->c->ci;
       mrb_gc_arena_restore(mrb, ai);
       regs[a] = mrb_symbol_value(mid);
@@ -4662,7 +4889,7 @@ RETRY_TRY_BLOCK:
 
     CASE(OP_SDEF, BBB) {
       struct RClass *tc = mrb_class_ptr(mrb_singleton_class(mrb, regs[a]));
-      mid = vm_define_method(mrb, tc, irep, b, c);
+      mid = vm_define_method(mrb, tc, irep, b, c, MRB_METHOD_PUBLIC_FL);
       ci = mrb->c->ci;
       mrb_gc_arena_restore(mrb, ai);
       regs[a] = mrb_symbol_value(mid);

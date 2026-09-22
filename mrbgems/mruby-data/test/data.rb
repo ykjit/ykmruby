@@ -49,6 +49,15 @@ assert('Data#to_h') do
   assert_equal({:white => 'ruuko', :red => 'yuzuki', :green => 'hitoe'}) { s.to_h }
 end
 
+assert('Data#to_h with a block') do
+  s = Data.define(:white, :red).new('ruuko', 'yuzuki')
+  assert_equal({'white' => 'ruuko', 'red' => 'yuzuki'}, s.to_h { |k, v| [k.to_s, v] })
+  assert_equal({:white => 'ruuko', :red => 'yuzuki'}, s.to_h(&->(k, v) { [k, v] }))
+  assert_equal :stopped, s.to_h { |k, v| break :stopped }
+  assert_raise(TypeError)     { s.to_h { |k, v| k } }
+  assert_raise(ArgumentError) { s.to_h { |k, v| [k, v, 1] } }
+end
+
 assert("Data.define does not allow array") do
   assert_raise(TypeError) do
     Data.define("Test", [:a])
@@ -140,4 +149,94 @@ assert 'Data with overridden initialize (keyword style)' do
   e = d.new(v: 3)             # initialize doubles -> 6
   assert_equal 6, e.v
   assert_equal 5, e.with(v: 5).v   # with bypasses initialize -> 5, not 10
+end
+
+assert 'Data with no members' do
+  # Data.define takes no members at all, and what it builds is not a broken
+  # object: everything that reads the members has to answer for it.
+  c = Data.define
+  d = c.new
+
+  assert_equal [], c.members
+  assert_equal [], d.members
+  assert_equal({}, d.to_h)
+  assert_equal "#<data >", d.inspect
+  assert_equal "#<data >", d.to_s
+  assert_equal "#<data >", d.with.inspect
+  assert_true d == c.new
+  assert_true d.frozen?
+end
+
+assert "Data#deconstruct" do
+  c = Data.define(:x, :y)
+  d = c.new(1, 2)
+
+  assert_equal [1, 2], d.deconstruct
+
+  # the answer is a fresh array; writing to it leaves the object alone
+  a = d.deconstruct
+  a[0] = 9
+  assert_equal 1, d.x
+
+end
+
+assert "Data#deconstruct_keys" do
+  c = Data.define(:x, :y, :z)
+  d = c.new(1, 2, 3)
+
+  assert_equal({x: 1, y: 2, z: 3}, d.deconstruct_keys(nil))
+  assert_equal d.to_h, d.deconstruct_keys(nil)
+  assert_equal({}, d.deconstruct_keys([]))
+  assert_equal({x: 1}, d.deconstruct_keys([:x]))
+  assert_equal({z: 3, x: 1}, d.deconstruct_keys([:z, :x]))
+
+  # a member can also be named by a string
+  assert_equal({"x" => 1}, d.deconstruct_keys(["x"]))
+
+  # the hash ends at the first key naming no member
+  assert_equal({x: 1}, d.deconstruct_keys([:x, :zz, :y]))
+  assert_equal({}, d.deconstruct_keys([:zz]))
+
+  # a Data with no members answers an empty hash rather than refusing
+  assert_equal({}, Data.define.new.deconstruct_keys(nil))
+  assert_equal [], Data.define.new.deconstruct
+  assert_equal({}, d.deconstruct_keys(["zz"]))
+
+  # more keys than members: no pattern over them can match
+  assert_equal({}, d.deconstruct_keys([:x, :y, :z, :x]))
+
+  assert_raise(TypeError) { d.deconstruct_keys({x: 1}) }
+  assert_raise_with_message(TypeError, "wrong argument type Symbol (expected Array or nil)") do
+    d.deconstruct_keys(:x)
+  end
+
+  # Data has no positional access, so a key names a member or nothing
+  assert_raise_with_message(TypeError, "0 is not a symbol nor a string") do
+    d.deconstruct_keys([0])
+  end
+  assert_raise_with_message(TypeError, "nil is not a symbol nor a string") do
+    d.deconstruct_keys([nil])
+  end
+  assert_raise(TypeError) { d.deconstruct_keys([[]]) }
+end
+
+assert "Data in a pattern" do
+  c = Data.define(:x, :y)
+  d = c.new(1, 2)
+
+  matched = case d
+            in [1, v] then v
+            end
+  assert_equal 2, matched
+
+  matched = case d
+            in {y: 2, x: v} then v
+            end
+  assert_equal 1, matched
+
+  assert_equal :none, (case d
+                       in [1] then :one
+                       in {x: 2} then :two
+                       else :none
+                       end)
 end

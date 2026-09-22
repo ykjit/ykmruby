@@ -41,6 +41,111 @@ static const struct RProc call_proc = {
   { &call_irep }, NULL, { NULL }
 };
 
+/* Whether the scope this proc closes over was given the class it runs
+   under.  A scope of its own is where the run ends: MRB_PROC_CREF answers
+   from its own cref and is asked first. */
+static mrb_bool
+given_class_env_p(const struct RProc *p)
+{
+  return MRB_PROC_ENV_P(p) && MRB_ENV_GIVEN_CLASS_P(MRB_PROC_ENV(p));
+}
+
+/* The class a constant written in the frame's scope is looked up from, which
+   is that scope's cref.  NULL where the chain holds no scope at all, a
+   method body written in C among them: the caller says what stands in.
+
+   A scope keeps its cref on its proc, so a method written `def self.name`
+   keeps the class around it rather than the singleton class it was
+   installed in.  A block is not a scope of its own and the walk passes over
+   it, up to the one it was written in.  A proc installed as a method is on
+   the chain and is read that way, which is what keeps a method found in a
+   subclass from answering with the subclass.
+
+   A class given to a block to run under does not enter here.  `class_eval`
+   and its kin name where a `def` goes, not where a constant is read from;
+   the block keeps looking constants up from the scope it was written in.
+   An eval string is the other case: it opens a scope of its own, and one
+   given a class carries that class as its cref, so it is on the chain and
+   this walk finds it.
+
+   A method written in a block given a class carries that class for a `def`
+   in its body and not as its cref, MRB_PROC_GIVEN says so, and the walk
+   passes over it to the scope the block was written in. */
+struct RClass*
+mrb_vm_cref_class(mrb_state *mrb, mrb_callinfo *ci)
+{
+  const struct RProc *p = ci->proc;
+
+  while (p && !MRB_PROC_CFUNC_P(p) && (!MRB_PROC_CREF_P(p) || MRB_PROC_GIVEN_P(p))) p = p->upper;
+  return (p && !MRB_PROC_CFUNC_P(p)) ? MRB_PROC_TARGET_CLASS(p) : NULL;
+}
+
+/* The class a `def`, an `alias` or an `undef` written in the frame's scope
+   adds to.  The cref, except where a class was given to the frame to run
+   under: `class_eval`, `instance_eval`, `Class.new` and `Module.new` leave
+   one there, and a `def` written in the block goes to it.
+
+   The given class is on the frame and nowhere on the `upper` chain, so the
+   env the giving scope leaves behind is marked instead: a block made there
+   closes over that env and answers with the class it holds, which is how a
+   `def` in a block inside the block reaches the same place, and how a string
+   evaluated over a binding taken there does.  A scope of its own ends the
+   run: a method written in such a block carries the given class itself,
+   marked MRB_PROC_GIVEN, and a `def` in its body, or in a block made
+   there, adds to that class as CRuby's does under the cref the block
+   pushed. */
+struct RClass*
+mrb_vm_definee_class(mrb_state *mrb, mrb_callinfo *ci)
+{
+  const struct RProc *p = ci->proc;
+
+  if (MRB_CI_GIVEN_CLASS_P(ci)) {
+    return mrb_vm_ci_target_class(ci);
+  }
+  while (p && !MRB_PROC_CFUNC_P(p)) {
+    if (MRB_PROC_CREF_P(p)) return MRB_PROC_TARGET_CLASS(p);
+    if (given_class_env_p(p)) return MRB_PROC_ENV(p)->c;
+    p = p->upper;
+  }
+  return NULL;
+}
+
+#ifdef MRB_USE_REFINEMENTS
+/* The refinements active for code running in the frame: the scope the
+   nearest proc on the chain carries.  A scope of its own (MRB_PROC_CREF)
+   ends the walk, so a method body sees what it copied at its definition and
+   no `using` written after it; a block carries none and reads on up to the
+   scope it was written in, so it sees a `using` written after the block, as
+   CRuby's does. */
+struct RArray*
+mrb_proc_refinements(mrb_state *mrb, const struct RProc *p)
+{
+  while (p && !MRB_PROC_CFUNC_P(p) && p->gc_color != MRB_GC_RED) {
+    uint32_t idx = MRB_PROC_REFSCOPE(p);
+    if (idx) return mrb_refscope_at(mrb, idx);
+    if (MRB_PROC_CREF_P(p)) break;
+    p = p->upper;
+  }
+  return NULL;
+}
+
+struct RArray*
+mrb_vm_refinements(mrb_state *mrb, const mrb_callinfo *ci)
+{
+  return mrb_proc_refinements(mrb, ci->proc);
+}
+
+/* Gives `p` the refinements active in the frame it is made in, as a method
+   body or class body copies its scope's at creation. */
+static void
+proc_copy_refscope(mrb_state *mrb, struct RProc *p, mrb_callinfo *ci)
+{
+  if (mrb->refscopes_len == 0) return;
+  struct RArray *scope = mrb_vm_refinements(mrb, ci);
+  if (scope) mrb_proc_set_refscope(mrb, p, scope);
+}
+#endif
+
 struct RProc*
 mrb_proc_new(mrb_state *mrb, const mrb_irep *irep)
 {
@@ -49,11 +154,8 @@ mrb_proc_new(mrb_state *mrb, const mrb_irep *irep)
 
   p = (struct RProc*)mrb_obj_alloc_core(mrb, MRB_TT_PROC, mrb->proc_class);
   if (ci) {
-    struct RClass *tc = NULL;
+    struct RClass *tc = mrb_vm_cref_class(mrb, ci);
 
-    if (ci->proc) {
-      tc = MRB_PROC_TARGET_CLASS(ci->proc);
-    }
     if (tc == NULL) {
       tc = mrb_vm_ci_target_class(ci);
     }
@@ -67,6 +169,44 @@ mrb_proc_new(mrb_state *mrb, const mrb_irep *irep)
 
   return p;
 }
+
+/* The proc for a method body written in the running frame.  Its class is
+   the frame's cref, the scope the body is written in, except where the
+   frame was given a class to run under, as a `Class.new`, `class_eval` or
+   `instance_eval` block is: a `def` in the body then adds to the given
+   class, as it does in the block, and the proc carries that class marked
+   MRB_PROC_GIVEN, so that the walks reading the cref pass over it to the
+   scope around the block.  A method written `def self.name` is included:
+   its body keeps the scope around it, which here is the given class. */
+struct RProc*
+mrb_method_proc_new(mrb_state *mrb, const mrb_irep *irep)
+{
+  struct RProc *p = mrb_proc_new(mrb, irep);
+  struct RClass *given = mrb_vm_definee_class(mrb, mrb->c->ci);
+
+  /* mrb_proc_new() left the cref in the proc, or the frame's class where
+     the chain holds no scope; the proc is new and white, so no barrier. */
+  p->flags |= MRB_PROC_SCOPE | MRB_PROC_CREF;
+  if (given && given != p->e.target_class) {
+    p->e.target_class = given;
+    p->flags |= MRB_PROC_GIVEN;
+  }
+#ifdef MRB_USE_REFINEMENTS
+  proc_copy_refscope(mrb, p, mrb->c->ci);
+#endif
+  return p;
+}
+
+#ifdef MRB_USE_REFINEMENTS
+/* The proc for a class or module body: it copies the scope around it. */
+struct RProc*
+mrb_scope_proc_new(mrb_state *mrb, const mrb_irep *irep)
+{
+  struct RProc *p = mrb_proc_new(mrb, irep);
+  proc_copy_refscope(mrb, p, mrb->c->ci);
+  return p;
+}
+#endif
 
 struct REnv*
 mrb_env_new(mrb_state *mrb, struct mrb_context *c, mrb_callinfo *ci, int nstacks, mrb_value *stack, struct RClass *tc)
@@ -91,6 +231,15 @@ mrb_env_new(mrb_state *mrb, struct mrb_context *c, mrb_callinfo *ci, int nstacks
   e->stack = stack;
   e->cxt = c;
   MRB_ENV_COPY_FLAGS_FROM_CI(e, ci);
+  /* The frame was given the class it runs under, or it took one from a
+     scope that was: either way a `def` written here adds to that class, and
+     so does one written in a block made here, which closes over this env.
+     A scope of its own does not pass it on; it has a cref to answer with. */
+  if (tc && ci->proc && !MRB_PROC_CFUNC_P(ci->proc) &&
+      (MRB_CI_GIVEN_CLASS_P(ci) ||
+       (!MRB_PROC_CREF_P(ci->proc) && given_class_env_p(ci->proc)))) {
+    MRB_ENV_SET_GIVEN_CLASS(e);
+  }
 
   return e;
 }
@@ -498,11 +647,28 @@ mrb_proc_local_variables(mrb_state *mrb, const struct RProc *proc)
         }
       }
     }
-    if (MRB_PROC_SCOPE_P(proc)) break;
+    if (MRB_PROC_LVAR_BOUNDARY_P(proc)) break;
     proc = proc->upper;
   }
 
   return mrb_hash_keys(mrb, vars);
+}
+
+/* The env of `ci`'s frame, made if the frame has none.  A frame keeps its
+   locals on the stack until something has to outlive it; an env is that
+   something, and this is where a caller that needs one asks for it. */
+struct REnv*
+mrb_vm_ci_env_reify(mrb_state *mrb, struct mrb_context *c, mrb_callinfo *ci)
+{
+  struct REnv *e = mrb_vm_ci_env(ci);
+  const struct RProc *proc = ci->proc;
+
+  if (e) return e;
+  if (!proc || MRB_PROC_CFUNC_P(proc)) return NULL;
+  e = mrb_env_new(mrb, c, ci, proc->body.irep->nlocals, ci->stack,
+                  mrb_vm_ci_target_class(ci));
+  ci->u.env = e;
+  return e;
 }
 
 const struct RProc *
@@ -516,14 +682,7 @@ mrb_proc_get_caller(mrb_state *mrb, struct REnv **envp)
     if (envp) *envp = NULL;
   }
   else {
-    struct REnv *e = mrb_vm_ci_env(ci);
-
-    if (e == NULL) {
-      int nstacks = proc->body.irep->nlocals;
-      e = mrb_env_new(mrb, c, ci, nstacks, ci->stack, mrb_vm_ci_target_class(ci));
-      ci->u.env = e;
-    }
-    if (envp) *envp = e;
+    if (envp) *envp = mrb_vm_ci_env_reify(mrb, c, ci);
   }
 
   return proc;

@@ -32,35 +32,6 @@ providing this feature is not linked in" rather than "mruby does not
 support it." Adding the relevant gem to the build configuration is
 usually enough.
 
-## `Kernel.raise` in rescue clause
-
-`Kernel.raise` without arguments does not raise the current exception within
-a rescue clause.
-
-```ruby
-begin
-  1 / 0
-rescue
-  raise
-end
-```
-
-#### CRuby
-
-`ZeroDivisionError` is raised.
-
-#### mruby
-
-`RuntimeError` is raised instead of `ZeroDivisionError`. To re-raise the exception, you have to do:
-
-```ruby
-begin
-  1 / 0
-rescue => e
-  raise e
-end
-```
-
 ## Fiber execution can't cross C function boundary
 
 mruby's `Fiber` is implemented similarly to Lua's co-routine. This
@@ -91,23 +62,29 @@ p Liste.new "foobar"
 
 ## `defined?`
 
-The `defined?` keyword is considered too complex to be fully
-implemented. It is recommended to use `const_defined?` and
-other reflection methods instead.
+The answer is not the same object each time, and a constant path of
+more than 32 names is answered `nil`. A name mruby does not have, such
+as `$PROGRAM_NAME` or `__dir__`, is answered `nil` as well, since it is
+absent rather than undefined differently.
 
 ```ruby
-defined?(Foo)
+defined?(self).equal?(defined?(self))
+defined?(A::B::C::D::E::F::G::H::I::J::K::L::M::N::O::P::Q::R::S::T::U::V::W::X::Y::Z::A::B::C::D::E::F::G)
 ```
 
 #### CRuby
 
 ```
-nil
+true
+"constant"
 ```
 
 #### mruby
 
-`NameError` is raised.
+```
+false
+nil
+```
 
 ## `alias` on global variables
 
@@ -125,30 +102,6 @@ alias $a $__a__
 #### mruby
 
 Syntax error
-
-## Operator modification
-
-Operators on some of the primitive classes cannot be overridden, as they are
-optimized in the VM.
-
-```ruby
-class String
-  def +
-  end
-end
-
-'a' + 'b'
-```
-
-#### CRuby
-
-`ArgumentError` is raised.
-The re-defined `+` operator does not accept any arguments.
-
-#### mruby
-
-`'ab'`
-Behavior of the operator wasn't changed.
 
 ## `nil?` redefinition in conditional expressions
 
@@ -197,53 +150,38 @@ For performance reasons, mruby avoids calling the `#hash` method on keys when a 
 
 ## Pattern Matching
 
-Pattern matching is only partially supported in mruby. Currently, only the rightward assignment operator (`=>`) with simple variable binding is implemented.
+`case/in` and the patterns it takes are answered here, and what a pattern
+answers is what CRuby answers, with one exception: a `#deconstruct` that
+gives back something other than an Array is passed over rather than
+refused, where CRuby raises `TypeError`.
 
 ```ruby
-expr => var  # Supported: assigns expr to var
+class Odd
+  def deconstruct = 42
+end
+case Odd.new
+in [x] then x
+else :no
+end
 ```
 
 #### CRuby
 
-Full pattern matching with `case/in` syntax and various pattern types:
-
-```ruby
-case [1, 2, 3]
-in [a, b, c]
-  puts "#{a}, #{b}, #{c}"  # => "1, 2, 3"
-end
-
-case {name: "Alice", age: 30}
-in {name:, age:}
-  puts "#{name} is #{age}"  # => "Alice is 30"
-end
-```
+`TypeError` is raised.
 
 #### mruby
 
-Only rightward assignment with simple variable binding:
+`:no`, the value falling through to the next clause.
 
-```ruby
-[1, 2, 3] => x
-puts x  # => [1, 2, 3]
-```
+`#deconstruct_keys` is held to the Hash it has to answer, and a value
+carrying neither hook falls through rather than raising, both as CRuby
+does.
 
-The following are **not supported**:
+## Refinements Are Opt-in
 
-- `case/in` syntax
-- Array patterns: `in [a, b, c]`
-- Hash patterns: `in {name:, age:}`
-- Guard clauses: `in pattern if condition`
-- Pin operator: `in ^variable`
-- Find patterns: `in [*, x, *]`
-- Alternative patterns: `in pattern1 | pattern2`
-- Boolean pattern check: `value in pattern`
-
-Note: mruby does provide `Array#deconstruct` and `Hash#deconstruct_keys` methods for future pattern matching compatibility.
-
-## No Refinements
-
-Module refinements (`refine`, `using`) are not supported in mruby.
+Module refinements (`refine`, `using`) are available only in a build with
+`MRB_USE_REFINEMENTS` defined; see `doc/guides/mrbconf.md` for the scope of
+what that build honors.
 
 ## No `Encoding` Class
 
@@ -320,41 +258,6 @@ the splat operator (`*obj`).
 This is a deliberate trade-off: implicit conversion forces every
 coercion site to go through method dispatch and can silently mask
 type-mismatch bugs.
-
-## Nested `def` in Singleton-Method Context
-
-`def` written inside a singleton method (`def self.foo`) is placed
-on a different class in mruby than in CRuby. CRuby registers the
-inner method as an instance method of the lexical enclosing class.
-mruby registers it as a method of the enclosing receiver's
-singleton class, which makes it visible as a class method of the
-enclosing class.
-
-```ruby
-class SomeClass
-  def self.class_method
-    def nested; 'nested!'; end
-  end
-end
-SomeClass.class_method
-```
-
-#### CRuby
-
-```
-SomeClass.nested        # NoMethodError
-SomeClass.new.nested    # => "nested!"   (instance method)
-```
-
-#### mruby
-
-```
-SomeClass.nested        # => "nested!"   (class method)
-SomeClass.new.nested    # NoMethodError
-```
-
-Writing nested `def` like this is unusual; this difference rarely
-surfaces in practical code.
 
 ## `Proc#dup` / `Proc#clone` is Always Orphan
 

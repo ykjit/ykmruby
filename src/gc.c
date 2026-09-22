@@ -504,7 +504,12 @@ mrb_gc_add_region(mrb_state *mrb, void *start, size_t size)
   /* align base to pointer size */
   uintptr_t align = sizeof(void*);
   uintptr_t offset = ((uintptr_t)base + align - 1) & ~(align - 1);
-  size -= (size_t)(offset - (uintptr_t)base);
+  size_t pad = (size_t)(offset - (uintptr_t)base);
+  /* A buffer smaller than the alignment padding leaves nothing behind: bail
+     out before the subtraction, which would otherwise wrap `size` and carve
+     pages out past the end of the region. */
+  if (size < pad) return 0;
+  size -= pad;
   base = (uint8_t*)offset;
 
   page_count = (uint16_t)(size / sizeof(mrb_heap_page));
@@ -993,6 +998,15 @@ gc_mark_children(mrb_state *mrb, mrb_gc *gc, struct RBasic *obj)
       mrb_gc_mark(mrb, (struct RBasic*)p->upper);
       mrb_gc_mark(mrb, (struct RBasic*)p->e.env);
       children+=2;
+#ifdef MRB_USE_REFINEMENTS
+      {
+        uint32_t idx = MRB_PROC_REFSCOPE(p);
+        if (idx) {
+          mrb_gc_mark(mrb, (struct RBasic*)mrb_refscope_at(mrb, idx));
+          children++;
+        }
+      }
+#endif
     }
     break;
 
@@ -1638,6 +1652,11 @@ incremental_gc(mrb_state *mrb, mrb_gc *gc, size_t limit)
       uint64_t fm0 = gc_prof_now_us();
 #endif
       final_marking_phase(mrb, gc);
+#ifdef MRB_USE_REFINEMENTS
+      /* marking is complete: a refinement scope no proc marked is dropped
+         from the weak table before the sweep frees it */
+      mrb_gc_clear_dead_refscopes(mrb);
+#endif
 #ifdef MRB_GC_PROFILE
       {
         uint64_t fmdt = gc_prof_now_us() - fm0;
@@ -2075,6 +2094,9 @@ gc_interval_ratio_set(mrb_state *mrb, mrb_value obj)
   mrb_int ratio;
 
   mrb_get_args(mrb, "i", &ratio);
+  if (ratio < 0 || ratio > INT_MAX) {
+    mrb_raise(mrb, E_ARGUMENT_ERROR, "interval_ratio out of range");
+  }
   mrb->gc.interval_ratio = (int)ratio;
   return mrb_nil_value();
 }
@@ -2109,7 +2131,7 @@ gc_step_ratio_set(mrb_state *mrb, mrb_value obj)
   mrb_int ratio;
 
   mrb_get_args(mrb, "i", &ratio);
-  if (ratio <= 0) {
+  if (ratio <= 0 || ratio > INT_MAX) {
     mrb_raise(mrb, E_ARGUMENT_ERROR, "step_ratio must be positive");
   }
   mrb->gc.step_ratio = (int)ratio;
@@ -2363,6 +2385,28 @@ gc_each_objects(mrb_state *mrb, mrb_gc *gc, mrb_each_object_callback *callback, 
   }
 }
 
+/* Walks the heap without collecting first and hands the callback the objects
+   the collector has not condemned. `mrb_objspace_each_objects()` runs a full
+   GC so that no dead object is handed out, which a caller that only reads
+   class headers and allocates nothing has no use for; a dead object the
+   sweep has not reached can hold a pointer into a page already freed, and
+   `is_dead()` is what tells it from a live one during the sweep. */
+void
+mrb_gc_each_live_object(mrb_state *mrb, mrb_each_object_callback *callback, void *data)
+{
+  mrb_gc *gc = &mrb->gc;
+
+  for (mrb_heap_page *page = gc->heaps; page != NULL; page = page->next) {
+    RVALUE *p = page->objects;
+    for (int i = 0; i < MRB_HEAP_PAGE_SIZE; i++) {
+      struct RBasic *obj = &p[i].as.basic;
+      if (is_dead(gc, obj)) continue;
+      if ((*callback)(mrb, obj, data) == MRB_EACH_OBJ_BREAK)
+        return;
+    }
+  }
+}
+
 void
 mrb_objspace_each_objects(mrb_state *mrb, mrb_each_object_callback *callback, void *data)
 {
@@ -2420,7 +2464,7 @@ gc_stat(mrb_state *mrb, mrb_value self)
   mrb_hash_set(mrb, hash, mrb_symbol_value(MRB_SYM(step_limit)), mrb_int_value(mrb, (mrb_int)gc->step_limit));
   mrb_hash_set(mrb, hash, mrb_symbol_value(MRB_SYM(malloc_increase)), mrb_int_value(mrb, (mrb_int)gc->malloc_increase));
   mrb_hash_set(mrb, hash, mrb_symbol_value(MRB_SYM(malloc_threshold)), mrb_int_value(mrb, (mrb_int)gc->malloc_threshold));
-  mrb_hash_set(mrb, hash, mrb_symbol_value(MRB_SYM(symbol_count)), mrb_int_value(mrb, (mrb_int)(MRB_PRESYM_MAX + mrb->symidx)));
+  mrb_hash_set(mrb, hash, mrb_symbol_value(MRB_SYM(symbol_count)), mrb_int_value(mrb, (mrb_int)(mrb_presym_max() + mrb->symidx)));
   mrb_hash_set(mrb, hash, mrb_symbol_value(MRB_SYM(dynamic_symbol_count)), mrb_int_value(mrb, (mrb_int)mrb->dynamic_sym_count));
 
 #ifdef MRB_GC_STATS

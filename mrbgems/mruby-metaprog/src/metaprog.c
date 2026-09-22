@@ -573,6 +573,45 @@ mrb_mod_protected_instance_methods(mrb_state *mrb, mrb_value mod)
   return mod_instance_methods(mrb, mod, MT_PROTECTED);
 }
 
+/*
+ *  call-seq:
+ *     mod.public_method_defined?(symbol, inherit=true)    -> true or false
+ *
+ *  Returns `true` if the named public method is defined by _mod_.  If
+ *  _inherit_ is set, the lookup will also search _mod_'s ancestors.
+ */
+static mrb_value
+mrb_mod_public_method_defined(mrb_state *mrb, mrb_value mod)
+{
+  return mrb_bool_value(mrb_mod_method_visibility(mrb, mod) == MRB_METHOD_PUBLIC_FL);
+}
+
+/*
+ *  call-seq:
+ *     mod.private_method_defined?(symbol, inherit=true)    -> true or false
+ *
+ *  Returns `true` if the named private method is defined by _mod_.  If
+ *  _inherit_ is set, the lookup will also search _mod_'s ancestors.
+ */
+static mrb_value
+mrb_mod_private_method_defined(mrb_state *mrb, mrb_value mod)
+{
+  return mrb_bool_value(mrb_mod_method_visibility(mrb, mod) == MRB_METHOD_PRIVATE_FL);
+}
+
+/*
+ *  call-seq:
+ *     mod.protected_method_defined?(symbol, inherit=true)    -> true or false
+ *
+ *  Returns `true` if the named protected method is defined by _mod_.  If
+ *  _inherit_ is set, the lookup will also search _mod_'s ancestors.
+ */
+static mrb_value
+mrb_mod_protected_method_defined(mrb_state *mrb, mrb_value mod)
+{
+  return mrb_bool_value(mrb_mod_method_visibility(mrb, mod) == MT_PROTECTED);
+}
+
 static int
 undefined_method_i(mrb_state *mrb, mrb_sym mid, mrb_method_t m, void *p)
 {
@@ -641,18 +680,19 @@ mrb_mod_s_constants(mrb_state *mrb, mrb_value mod)
   }
 
   const struct RProc *proc = mrb->c->ci[-1].proc;
-  struct RClass *c = MRB_PROC_TARGET_CLASS(proc);
+  struct RClass *c = NULL;
   mrb_value ary = mrb_ary_new(mrb);
 
-  if (!c) c = mrb->object_class;
-  mrb_mod_const_at(mrb, c, ary);
-  proc = proc->upper;
-  while (proc) {
+  /* A method given its class carries that class for a `def`, not as a scope
+     constants are read from: passed over, wherever it is on the chain. */
+  for (; proc; proc = proc->upper) {
+    if (MRB_PROC_GIVEN_P(proc)) continue;
     struct RClass *c2 = MRB_PROC_TARGET_CLASS(proc);
     if (!c2) c2 = mrb->object_class;
+    if (!c) c = c2;
     mrb_mod_const_at(mrb, c2, ary);
-    proc = proc->upper;
   }
+  if (!c) c = mrb->object_class;
   while (c) {
     mrb_mod_const_at(mrb, c, ary);
     c = c->super;
@@ -671,7 +711,9 @@ mrb_mod_s_nesting(mrb_state *mrb, mrb_value mod)
   ary = mrb_ary_new(mrb);
   proc = mrb->c->ci[-1].proc;   /* callee proc */
   while (proc && !MRB_PROC_CFUNC_P(proc)) {
-    if (MRB_PROC_SCOPE_P(proc)) {
+    /* A method given its class is not in the nesting: CRuby leaves out the
+       cref the giving block pushed. */
+    if (MRB_PROC_SCOPE_P(proc) && !MRB_PROC_GIVEN_P(proc)) {
       struct RClass *c2 = MRB_PROC_TARGET_CLASS(proc);
 
       if (c2 != c) {
@@ -721,6 +763,9 @@ static const mrb_mt_entry metaprog_mod_rom_entries[] = {
   MRB_MT_ENTRY(mrb_mod_public_instance_methods,  MRB_SYM(public_instance_methods), MRB_ARGS_OPT(1)),
   MRB_MT_ENTRY(mrb_mod_private_instance_methods, MRB_SYM(private_instance_methods), MRB_ARGS_OPT(1)),
   MRB_MT_ENTRY(mrb_mod_protected_instance_methods, MRB_SYM(protected_instance_methods), MRB_ARGS_OPT(1)),
+  MRB_MT_ENTRY(mrb_mod_public_method_defined,    MRB_SYM_Q(public_method_defined), MRB_ARGS_ARG(1,1)),
+  MRB_MT_ENTRY(mrb_mod_private_method_defined,   MRB_SYM_Q(private_method_defined), MRB_ARGS_ARG(1,1)),
+  MRB_MT_ENTRY(mrb_mod_protected_method_defined, MRB_SYM_Q(protected_method_defined), MRB_ARGS_ARG(1,1)),
   MRB_MT_ENTRY(mrb_mod_undefined_methods,        MRB_SYM(undefined_instance_methods), MRB_ARGS_NONE()),
   MRB_MT_ENTRY(mrb_mod_remove_method,            MRB_SYM(remove_method),  MRB_ARGS_ANY()),  /* 15.2.2.4.41 */
   MRB_MT_ENTRY(mrb_f_nil,                        MRB_SYM(method_removed), MRB_ARGS_REQ(1)),

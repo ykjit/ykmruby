@@ -208,13 +208,26 @@ class Hash
 
   ##
   #  call-seq:
-  #     hsh.to_h     -> hsh or new_hash
+  #     hsh.to_h                 -> hsh
+  #     hsh.to_h {|k, v| ... }   -> new_hash
   #
-  #  Returns `self`. If called on a subclass of Hash, converts
-  #  the receiver to a Hash object.
+  #  Returns `self`. If a block is given, it is called with each
+  #  key and value, and it should return a `[key, value]` pair to
+  #  construct a new hash.
   #
-  def to_h
-    self
+  #     {a: 1}.to_h{|k, v| [v, k]}
+  #       # => {1 => :a}
+  #
+  def to_h(&blk)
+    return self unless blk
+    h = {}
+    self.each do |k, v|
+      pair = blk.call(k, v)
+      raise TypeError, "wrong element type #{pair.class} (expected Array)" unless Array === pair
+      raise ArgumentError, "element has wrong array length (expected 2, was #{pair.size})" if pair.size != 2
+      h[pair[0]] = pair[1]
+    end
+    h
   end
 
   ##
@@ -233,7 +246,8 @@ class Hash
   def <(hash)
     raise TypeError, "can't convert #{hash.class} to Hash" unless Hash === hash
     size < hash.size and all? {|key, val|
-      hash.key?(key) and hash[key] == val
+      r = hash.__value_eq(key, val)
+      :send == r ? val == hash[key] : r
     }
   end
 
@@ -253,7 +267,8 @@ class Hash
   def <=(hash)
     raise TypeError, "can't convert #{hash.class} to Hash" unless Hash === hash
     size <= hash.size and all? {|key, val|
-      hash.key?(key) and hash[key] == val
+      r = hash.__value_eq(key, val)
+      :send == r ? val == hash[key] : r
     }
   end
 
@@ -273,7 +288,8 @@ class Hash
   def >(hash)
     raise TypeError, "can't convert #{hash.class} to Hash" unless Hash === hash
     size > hash.size and hash.all? {|key, val|
-      key?(key) and self[key] == val
+      r = __value_eq(key, val)
+      :send == r ? val == self[key] : r
     }
   end
 
@@ -293,7 +309,8 @@ class Hash
   def >=(hash)
     raise TypeError, "can't convert #{hash.class} to Hash" unless Hash === hash
     size >= hash.size and hash.all? {|key, val|
-      key?(key) and self[key] == val
+      r = __value_eq(key, val)
+      :send == r ? val == self[key] : r
     }
   end
 

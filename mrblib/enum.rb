@@ -166,7 +166,10 @@ module Enumerable
   # ISO 15.3.2.2.10
   def include?(obj)
     self.each {|*val|
-      return true if val.__svalue == obj
+      if r = val.__svalue_eq(obj)
+        r = val.__svalue == obj if :send == r
+        return true if r
+      end
     }
     false
   end
@@ -217,7 +220,9 @@ module Enumerable
   # Return the maximum value of all elements
   # yield by `each`. If no block is given <=>
   # will be invoked to define this value. If
-  # a block is given it will be used instead.
+  # a block is given it will be used instead,
+  # read as the block of `Array#sort!` is,
+  # which states what the block is to return.
   #
   # ISO 15.3.2.2.13
   def max(&block)
@@ -261,7 +266,9 @@ module Enumerable
   # Return the minimum value of all elements
   # yield by `each`. If no block is given <=>
   # will be invoked to define this value. If
-  # a block is given it will be used instead.
+  # a block is given it will be used instead,
+  # read as the block of `Array#sort!` is,
+  # which states what the block is to return.
   #
   # ISO 15.3.2.2.14
   def min(&block)
@@ -357,7 +364,9 @@ module Enumerable
   # is given <=> will be invoked on each
   # element to define the order. Otherwise
   # the given block will be used for
-  # sorting.
+  # sorting, as it is by `Array#sort!`,
+  # which states what the block is to
+  # return.
   #
   # ISO 15.3.2.2.19
   def sort(&block)

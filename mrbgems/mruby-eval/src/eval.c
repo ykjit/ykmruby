@@ -110,7 +110,16 @@ create_proc_from_string(mrb_state *mrb, const char *s, mrb_int len, mrb_value bi
     ci = c->cibase;
   }
   if (scope) {
-    target_class = MRB_PROC_TARGET_CLASS(scope);
+    /* The class the string's frame runs under is the one the caller's frame
+       runs under: the class the method was found in, or the one a block was
+       given to run under. A `super` in the string, and the caller's own
+       `super` once its frame has been given an env here, read it for the
+       class to look above. The proc's own class is its cref, which for a
+       method written in a `Class.new` or `class_eval` block is the scope
+       around that block, not the class the method was installed in. A
+       binding stands in for the frame it was taken from and carries that
+       frame's class on its scope. */
+    target_class = mrb_nil_p(binding) ? mrb_vm_ci_target_class(ci) : MRB_PROC_TARGET_CLASS(scope);
     if (!MRB_PROC_CFUNC_P(scope)) {
       if (e == NULL) {
         /* when `binding` is nil */
@@ -143,8 +152,6 @@ eval_irep(mrb_state *mrb, mrb_value self, struct RProc *proc)
   /* no argument passed from eval() */
   ci->n = 0;
   ci->kw = FALSE;
-  /* clear visibility */
-  MRB_CI_SET_VISIBILITY_BREAK(ci);
   /* clear block */
   ci->stack[1] = mrb_nil_value();
   return mrb_exec_irep(mrb, self, proc);
@@ -242,6 +249,12 @@ binding_eval_prepare(mrb_state *mrb, mrb_value binding, const char *expr, mrb_in
   const struct RProc *proc = mrb_binding_extract_proc(mrb, binding);
   mrb_assert(!MRB_PROC_CFUNC_P(proc));
 
+  /* the parser interns the filename; refuse it here, as
+     create_proc_from_string() does, rather than from under the parser */
+  if (file && strlen(file) >= UINT16_MAX) {
+    mrb_raise(mrb, E_ARGUMENT_ERROR, "filename too long");
+  }
+
   d.cxt = mrb_ccontext_new(mrb);
   d.file = mrb_ccontext_filename(mrb, d.cxt, file ? file : "(eval)");
   d.cxt->capture_errors = TRUE;
@@ -292,6 +305,25 @@ f_eval(mrb_state *mrb, mrb_value self)
     self = mrb_iv_get(mrb, binding, MRB_SYM(recv));
   }
   mrb_assert(!MRB_PROC_CFUNC_P(proc));
+  /* The string runs on a frame of its own, and `mrb_exec_irep()` copies this
+     frame's `mid` to it. Left as `eval`, a `super` in the string looks for
+     the superclass method of `eval` itself; the env the string shares with
+     the caller carries the name the caller was called by, which is the one
+     the string's `super` and `defined?(super)` must answer for. A caller
+     with no env is a C function, which has no such name to lend. */
+  struct REnv *e = MRB_PROC_ENV(proc);
+  if (e) mrb->c->ci->mid = e->mid;
+  if (mrb_nil_p(binding)) {
+    /* The string runs in a copy of the caller's scope: a `def` in it answers
+       to the `private` written around the `eval` call, and a `private`
+       written inside the string reaches no further than its end. */
+    mrb_vm_ci_inherit_visibility(mrb, proc);
+    MRB_CI_SET_VISIBILITY_BREAK(mrb->c->ci);
+  }
+  /* A binding names a scope rather than copying one, so the frame is left
+     joined to it: the visibility written there reaches the string, and one
+     written in the string reaches back out to the scope and to every other
+     binding on it. */
   return eval_irep(mrb, self, proc);
 }
 
@@ -344,14 +376,27 @@ object_eval(mrb_state *mrb, mrb_value self, mrb_bool class_eval)
   mrb_value binding = mrb_nil_value();
   if (env) {
     binding = mrb_binding_new(mrb, caller, self, env);
-    /* The binding's own env starts with no method name; keep the caller's
-       so `__method__` and `super` inside the string see the caller. */
-    mrb_binding_extract_env(mrb, binding)->mid = env->mid;
   }
   struct RProc *proc = create_proc_from_string(mrb, s, len, binding, file, line);
   MRB_PROC_SET_TARGET_CLASS(proc, c);
+  proc->flags |= MRB_PROC_CREF;
   mrb_assert(!MRB_PROC_CFUNC_P(proc));
+#ifdef MRB_USE_REFINEMENTS
+  /* a scope of its own ends the walk for refinements too, so the string
+     is given the refinements active where it was written */
+  {
+    struct RArray *scope = mrb_vm_caller_refinements(mrb);
+    if (scope) mrb_proc_set_refscope(mrb, proc, scope);
+  }
+#endif
   mrb_vm_ci_target_class_set(mrb->c->ci, c);
+  /* The frame carries one class, and it is given to `c` here so that a `def`
+     in the string lands on the receiver. A `super` reads that same field for
+     the class the method was found in, so there is no answer for it to give
+     from this frame; the name the frame carries is left alone. */
+  /* The string gets the receiver for a scope rather than the caller's, so it
+     starts at the default and a visibility written in it ends with it. */
+  MRB_CI_SET_VISIBILITY_BREAK(mrb->c->ci);
   return eval_irep(mrb, self, proc);
 }
 

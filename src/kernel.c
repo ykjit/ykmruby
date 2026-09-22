@@ -49,6 +49,10 @@ static int
 inspect_i(mrb_state *mrb, mrb_sym sym, mrb_value v, void *p)
 {
   struct inspect_i *a = (struct inspect_i*)p;
+  /* An ivar whose name Ruby cannot spell (set from C without the '@') is
+     internal state, not part of the object's picture: instance_variables
+     leaves it out, and so does inspect. */
+  if (!mrb_iv_name_sym_p(mrb, sym)) return 0;
   if (mrb_nil_p(a->str)) {
     const char *cn = mrb_obj_classname(mrb, a->obj);
     a->str = mrb_str_new_capa(mrb, 30);
@@ -66,7 +70,6 @@ inspect_i(mrb_state *mrb, mrb_sym sym, mrb_value v, void *p)
 
   char *sp = RSTRING_PTR(a->str);
 
-  /* need not to show internal data */
   if (sp[0] == '-') { /* first element */
     sp[0] = '#';
     mrb_str_cat_lit(mrb, a->str, " ");
@@ -549,6 +552,14 @@ mrb_f_raise(mrb_state *mrb, mrb_value self)
   mrb->c->ci->mid = 0;
   switch (argc) {
   case 0:
+    /* Re-raise what a rescue clause is running, which is what `$!` names.
+       Outside one it is nil, and there being nothing to re-raise is itself
+       the RuntimeError.  `!` is not a word, so MRB_GVSYM() cannot spell the
+       name and it is interned here, as `$~` and `$?` are. */
+    exc = mrb_gv_get(mrb, mrb_intern_lit(mrb, "$!"));
+    if (!mrb_nil_p(exc)) {
+      mrb_exc_raise(mrb, exc);
+    }
     mrb_raise(mrb, E_RUNTIME_ERROR, "");
     break;
   case 1:
@@ -610,16 +621,46 @@ mrb_obj_remove_instance_variable(mrb_state *mrb, mrb_value self)
  *     obj.respond_to?(symbol, include_private=false) -> true or false
  *
  *  Returns `true` if _obj_ responds to the given
- *  method. Private methods are included in the search only if the
- *  optional second parameter evaluates to `true`.
+ *  method. Private and protected methods are included in the search
+ *  only if the optional second parameter evaluates to `true`.
  *
  *  If the method is defined but unimplemented on this machine,
  *  as IO#pread in a build without pread(2), false is returned
  *  and `respond_to_missing?` is not consulted.
  *
- *  If the method is not defined, `respond_to_missing?`
- *  method is called and the result is returned.
+ *  If the method is not defined, or is defined where the second
+ *  parameter does not reach it, `respond_to_missing?` method is
+ *  called and the result is returned.
  */
+static mrb_bool
+obj_respond_to_p(mrb_state *mrb, mrb_value self, mrb_sym id, mrb_bool priv)
+{
+  struct RClass *c = mrb_class(mrb, self);
+#ifdef MRB_USE_REFINEMENTS
+  mrb_method_t m = mrb_vm_find_method_in_scope(mrb, mrb_vm_caller_refinements(mrb), c, &c, id);
+#else
+  mrb_method_t m = mrb_method_search_vm(mrb, &c, id);
+#endif
+  if (!MRB_METHOD_UNDEF_P(m)) {
+    /* A method that is unimplemented on this machine answers a plain false,
+       and leaves `respond_to_missing?` nothing to add. */
+    if (MRB_METHOD_NOTIMPL_P(m)) return FALSE;
+    /* A method the caller may not reach is answered as if it were not there,
+       so `respond_to_missing?` gets its say, as in CRuby. */
+    if (priv || !(m.flags & (MRB_METHOD_PRIVATE_FL|MRB_METHOD_PROTECTED_FL))) {
+      return TRUE;
+    }
+  }
+  /* An entry `undef_method` left behind is not a redefinition: it stops the
+     lookup without standing for one, so it is not asked, as in CRuby. */
+  mrb_sym rtm_id = MRB_SYM_Q(respond_to_missing);
+  if (!mrb_func_basic_p(mrb, self, rtm_id, mrb_false) && mrb_respond_to(mrb, self, rtm_id)) {
+    mrb_value v = mrb_funcall_argv2(mrb, self, rtm_id, mrb_symbol_value(id), mrb_bool_value(priv));
+    return mrb_bool(v);
+  }
+  return FALSE;
+}
+
 static mrb_value
 obj_respond_to(mrb_state *mrb, mrb_value self)
 {
@@ -627,19 +668,7 @@ obj_respond_to(mrb_state *mrb, mrb_value self)
   mrb_bool priv = FALSE;
 
   mrb_get_args(mrb, "n|b", &id, &priv);
-  struct RClass *c = mrb_class(mrb, self);
-  mrb_method_t m = mrb_method_search_vm(mrb, &c, id);
-  if (MRB_METHOD_UNDEF_P(m)) {
-    mrb_sym rtm_id = MRB_SYM_Q(respond_to_missing);
-    if (!mrb_func_basic_p(mrb, self, rtm_id, mrb_false)) {
-      mrb_value v = mrb_funcall_argv2(mrb, self, rtm_id, mrb_symbol_value(id), mrb_bool_value(priv));
-      return mrb_bool_value(mrb_bool(v));
-    }
-    return mrb_false_value();
-  }
-  /* The method is there, so `respond_to_missing?` has nothing to add, and one
-     that is unimplemented on this machine answers a plain false. */
-  return mrb_bool_value(!MRB_METHOD_NOTIMPL_P(m));
+  return mrb_bool_value(obj_respond_to_p(mrb, self, id, priv));
 }
 
 static mrb_value
@@ -709,14 +738,27 @@ mrb_p_m(mrb_state *mrb, mrb_value self)
 /* defined? runtime helpers: each returns the CRuby result string, or nil when
    undefined. The compiler emits calls to these for `defined?(...)` operands
    whose kind can only be resolved at run time. */
+
+/* `defined?(meth)`, a call on self with no receiver written: the answer is
+   what `respond_to?(:meth, true)` says, asked of the caller's own self, the
+   way CRuby's `rb_obj_respond_to` decides it.  A `respond_to?` the object
+   redefines is what gets asked, and `respond_to_missing?` where the method
+   is not there; a call with a receiver written is answered elsewhere, on
+   the terms that call would be made on. */
 static mrb_value
 mrb_f_defined_method(mrb_state *mrb, mrb_value self)
 {
   mrb_sym sym;
   mrb_get_args(mrb, "n", &sym);
-  struct RClass *c = mrb_class(mrb, self);
-  mrb_method_t m = mrb_method_search_vm(mrb, &c, sym);
-  if (!MRB_METHOD_UNDEF_P(m)) return mrb_str_new_lit(mrb, "method");
+  mrb_sym rt_id = MRB_SYM_Q(respond_to);
+  mrb_bool found;
+  if (mrb_func_basic_p(mrb, self, rt_id, obj_respond_to) || !mrb_respond_to(mrb, self, rt_id)) {
+    found = obj_respond_to_p(mrb, self, sym, TRUE);
+  }
+  else {
+    found = mrb_test(mrb_funcall_argv2(mrb, self, rt_id, mrb_symbol_value(sym), mrb_true_value()));
+  }
+  if (found) return mrb_str_new_lit_frozen(mrb, "method");
   return mrb_nil_value();
 }
 
@@ -725,7 +767,7 @@ mrb_f_defined_ivar(mrb_state *mrb, mrb_value self)
 {
   mrb_sym sym;
   mrb_get_args(mrb, "n", &sym);
-  if (mrb_iv_defined(mrb, self, sym)) return mrb_str_new_lit(mrb, "instance-variable");
+  if (mrb_iv_defined(mrb, self, sym)) return mrb_str_new_lit_frozen(mrb, "instance-variable");
   return mrb_nil_value();
 }
 
@@ -737,8 +779,8 @@ mrb_f_defined_const(mrb_state *mrb, mrb_value self)
   /* resolve in the caller's lexical scope (ci[-1]), not this helper's */
   mrb_callinfo *ci = &mrb->c->ci[-1];
   if (ci >= mrb->c->cibase && ci->proc &&
-      mrb_vm_const_defined_p(mrb, ci->proc, sym)) {
-    return mrb_str_new_lit(mrb, "constant");
+      mrb_vm_const_defined_p(mrb, ci, sym)) {
+    return mrb_str_new_lit_frozen(mrb, "constant");
   }
   return mrb_nil_value();
 }
@@ -747,7 +789,7 @@ static mrb_value
 mrb_f_defined_yield(mrb_state *mrb, mrb_value self)
 {
   /* mrb_f_block_given_p_m inspects ci[-1], i.e. the frame that used defined? */
-  if (mrb_test(mrb_f_block_given_p_m(mrb, self))) return mrb_str_new_lit(mrb, "yield");
+  if (mrb_test(mrb_f_block_given_p_m(mrb, self))) return mrb_str_new_lit_frozen(mrb, "yield");
   return mrb_nil_value();
 }
 
@@ -756,7 +798,7 @@ mrb_f_defined_gvar(mrb_state *mrb, mrb_value self)
 {
   mrb_sym sym;
   mrb_get_args(mrb, "n", &sym);
-  if (mrb_gv_defined(mrb, sym)) return mrb_str_new_lit(mrb, "global-variable");
+  if (mrb_gv_defined(mrb, sym)) return mrb_str_new_lit_frozen(mrb, "global-variable");
   return mrb_nil_value();
 }
 
@@ -769,7 +811,7 @@ mrb_f_defined_cvar(mrb_state *mrb, mrb_value self)
   mrb_callinfo *ci = &mrb->c->ci[-1];
   if (ci >= mrb->c->cibase && ci->proc &&
       mrb_vm_cv_defined_p(mrb, ci->proc, sym)) {
-    return mrb_str_new_lit(mrb, "class variable");
+    return mrb_str_new_lit_frozen(mrb, "class variable");
   }
   return mrb_nil_value();
 }
@@ -785,7 +827,7 @@ mrb_f_defined_super(mrb_state *mrb, mrb_value self)
   if (mid != 0 && tc != NULL && tc->super != NULL) {
     struct RClass *c = tc->super;
     mrb_method_t m = mrb_method_search_vm(mrb, &c, mid);
-    if (!MRB_METHOD_UNDEF_P(m)) return mrb_str_new_lit(mrb, "super");
+    if (!MRB_METHOD_UNDEF_P(m)) return mrb_str_new_lit_frozen(mrb, "super");
   }
   return mrb_nil_value();
 }
@@ -793,8 +835,10 @@ mrb_f_defined_super(mrb_state *mrb, mrb_value self)
 /* `path` holds the names of a constant path from its root down, and `start`
    says where to look the first one up: nil for the caller's lexical scope
    (`A::B::C`), or the module the path is rooted at (`Object` for `::A::B`).
-   A name that is missing, or an outer value that is not a module, ends the
-   walk at nil rather than raising. */
+   Each name below the root resolves the way reading `outer::NAME` resolves
+   it, so a constant Object holds is out of reach through any other module,
+   and `const_missing` is not asked.  A name that is missing, or an outer
+   value that is not a module, ends the walk at nil rather than raising. */
 static mrb_value
 mrb_f_defined_const_path(mrb_state *mrb, mrb_value self)
 {
@@ -809,7 +853,7 @@ mrb_f_defined_const_path(mrb_state *mrb, mrb_value self)
   if (mrb_nil_p(start)) {
     mrb_callinfo *ci = &mrb->c->ci[-1];
     if (ci < mrb->c->cibase || ci->proc == NULL) return mrb_nil_value();
-    outer = mrb_vm_const_get_noraise(mrb, ci->proc, mrb_symbol(RARRAY_PTR(path)[0]));
+    outer = mrb_vm_const_get_noraise(mrb, ci, mrb_symbol(RARRAY_PTR(path)[0]));
     if (mrb_undef_p(outer)) return mrb_nil_value();
     i = 1;
   }
@@ -822,11 +866,10 @@ mrb_f_defined_const_path(mrb_state *mrb, mrb_value self)
       return mrb_nil_value();
     }
     if (!mrb_symbol_p(RARRAY_PTR(path)[i])) return mrb_nil_value();
-    mrb_sym name = mrb_symbol(RARRAY_PTR(path)[i]);
-    if (!mrb_const_defined(mrb, outer, name)) return mrb_nil_value();
-    if (i + 1 < len) outer = mrb_const_get(mrb, outer, name);
+    outer = mrb_const_get_noraise(mrb, mrb_class_ptr(outer), mrb_symbol(RARRAY_PTR(path)[i]));
+    if (mrb_undef_p(outer)) return mrb_nil_value();
   }
-  return mrb_str_new_lit(mrb, "constant");
+  return mrb_str_new_lit_frozen(mrb, "constant");
 }
 
 /* `defined?(recv.meth)`: the caller has evaluated the receiver and hands it
@@ -841,13 +884,17 @@ mrb_f_defined_method_on(mrb_state *mrb, mrb_value self)
   mrb_sym sym;
   mrb_get_args(mrb, "on", &recv, &sym);
   struct RClass *c = mrb_class(mrb, recv);
+#ifdef MRB_USE_REFINEMENTS
+  mrb_method_t m = mrb_vm_find_method_in_scope(mrb, mrb_vm_caller_refinements(mrb), c, &c, sym);
+#else
   mrb_method_t m = mrb_method_search_vm(mrb, &c, sym);
+#endif
   if (MRB_METHOD_UNDEF_P(m)) {
     mrb_sym rtm_id = MRB_SYM_Q(respond_to_missing);
-    if (!mrb_func_basic_p(mrb, recv, rtm_id, mrb_false)) {
+    if (!mrb_func_basic_p(mrb, recv, rtm_id, mrb_false) && mrb_respond_to(mrb, recv, rtm_id)) {
       mrb_value v = mrb_funcall_argv2(mrb, recv, rtm_id,
                                       mrb_symbol_value(sym), mrb_false_value());
-      if (mrb_test(v)) return mrb_str_new_lit(mrb, "method");
+      if (mrb_test(v)) return mrb_str_new_lit_frozen(mrb, "method");
     }
     return mrb_nil_value();
   }
@@ -856,13 +903,29 @@ mrb_f_defined_method_on(mrb_state *mrb, mrb_value self)
   if (MRB_METHOD_NOTIMPL_P(m)) return mrb_nil_value();
   /* the visibility test the VM applies to OP_SEND, in the same order */
   if (m.flags & MRB_METHOD_PRIVATE_FL) return mrb_nil_value();
+#ifdef MRB_USE_REFINEMENTS
+  /* a protected method a refinement holds is reached from the refined class */
+  if (MRB_CLASS_REFINEMENT_P(c)) c = c->super;
+#endif
   if ((m.flags & MRB_METHOD_PROTECTED_FL) && !mrb_obj_is_kind_of(mrb, self, c)) {
     return mrb_nil_value();
   }
-  return mrb_str_new_lit(mrb, "method");
+  return mrb_str_new_lit_frozen(mrb, "method");
 }
 
 /* ---------------------------*/
+/*
+ * A hash pattern reads what #deconstruct_keys answered through __pat_values,
+ * which only Hash carries, so anything else lands here and gets the TypeError
+ * CRuby raises for it.
+ */
+static mrb_value
+obj_pat_values(mrb_state *mrb, mrb_value self)
+{
+  mrb_raise(mrb, E_TYPE_ERROR, "deconstruct_keys must return Hash");
+  return mrb_nil_value();       /* not reached */
+}
+
 static const mrb_mt_entry kernel_rom_entries[] = {
   MRB_MT_ENTRY(mrb_f_defined_const_path, MRB_SYM_Q(__defined_const_path), MRB_ARGS_REQ(2) | MRB_MT_PRIVATE),
   MRB_MT_ENTRY(mrb_f_defined_method, MRB_SYM_Q(__defined_method), MRB_ARGS_REQ(1) | MRB_MT_PRIVATE),
@@ -898,6 +961,7 @@ static const mrb_mt_entry kernel_rom_entries[] = {
   MRB_MT_ENTRY(obj_respond_to,                   MRB_SYM_Q(respond_to), MRB_ARGS_ARG(1,1)),  /* 15.3.1.3.43 */
   MRB_MT_ENTRY(mrb_any_to_s,                     MRB_SYM(to_s),                      MRB_ARGS_NONE()),  /* 15.3.1.3.46 */
   MRB_MT_ENTRY(mrb_obj_ceqq,                     MRB_SYM(__case_eqq),     MRB_ARGS_REQ(1)),  /* internal */
+  MRB_MT_ENTRY(obj_pat_values,                   MRB_SYM(__pat_values),   MRB_ARGS_REQ(1)),  /* internal */
   MRB_MT_ENTRY(mrb_false,                MRB_SYM_Q(respond_to_missing),      MRB_ARGS_ARG(1,1) | MRB_MT_PRIVATE),
   MRB_MT_ENTRY(mrb_obj_method_recursive_p,       MRB_SYM_Q(__method_recursive), MRB_ARGS_ARG(1,1)),
 #ifndef HAVE_MRUBY_IO_GEM

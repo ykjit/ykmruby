@@ -59,15 +59,33 @@ mrb_value mrb_mod_to_s(mrb_state *, mrb_value);
 void mrb_method_added(mrb_state *mrb, struct RClass *c, mrb_sym mid);
 mrb_noreturn void mrb_method_missing(mrb_state *mrb, mrb_sym name, mrb_value self, mrb_value args);
 mrb_method_t mrb_vm_find_method(mrb_state *mrb, struct RClass *c, struct RClass **cp, mrb_sym mid);
+#ifdef MRB_USE_REFINEMENTS
+/* refinement.c / class.c / proc.c */
+struct RArray *mrb_vm_refinements(mrb_state *mrb, const mrb_callinfo *ci);
+struct RArray *mrb_proc_refinements(mrb_state *mrb, const struct RProc *p);
+mrb_bool mrb_proc_refined_p(mrb_state *mrb, const struct RProc *p);
+struct RArray *mrb_vm_caller_refinements(mrb_state *mrb);
+mrb_method_t mrb_vm_find_refined_method(mrb_state *mrb, struct RArray *scope, struct RClass *c, struct RClass **cp, mrb_sym mid, struct RClass *exclude);
+mrb_method_t mrb_vm_find_method_in_scope(mrb_state *mrb, struct RArray *scope, struct RClass *c, struct RClass **cp, mrb_sym mid);
+mrb_bool mrb_refined_mid_p(mrb_state *mrb, mrb_sym mid);
+void mrb_refinement_method_added(mrb_state *mrb, struct RClass *refinement, mrb_sym mid);
+void mrb_refinement_ancestry_changed(mrb_state *mrb, struct RClass *c, struct RClass *m);
+void mrb_proc_set_refscope(mrb_state *mrb, struct RProc *p, struct RArray *scope);
+struct RArray *mrb_refscope_at(mrb_state *mrb, uint32_t idx);
+struct RProc *mrb_scope_proc_new(mrb_state *mrb, const mrb_irep *irep);
+void mrb_gc_clear_dead_refscopes(mrb_state *mrb);
+#endif
 mrb_value mrb_mod_const_missing(mrb_state *mrb, mrb_value mod);
+int mrb_mod_method_visibility(mrb_state *mrb, mrb_value mod);
 mrb_value mrb_const_missing(mrb_state *mrb, mrb_value mod, mrb_sym sym);
 size_t mrb_class_mt_memsize(mrb_state*, struct RClass*);
 mrb_value mrb_obj_extend(mrb_state*, mrb_value obj);
 #endif
 
-/* inline index opcode guards (class.c); see `idx_class` in `struct mrb_state` */
-void mrb_idx_op_init(mrb_state *mrb);
-void mrb_idx_op_update(mrb_state *mrb, mrb_sym mid);
+/* builtin operator guards (class.c); see `idx_class` and `bop_redefined` in
+   `struct mrb_state` */
+void mrb_builtin_op_init(mrb_state *mrb);
+void mrb_builtin_op_update(mrb_state *mrb, mrb_sym mid);
 void mrb_idx_op_rearm(mrb_state *mrb, enum mrb_idx_op_slot slot);
 
 mrb_value mrb_obj_equal_m(mrb_state *mrb, mrb_value);
@@ -109,6 +127,8 @@ struct mrb_backtrace_location {
 
 /* gc */
 size_t mrb_gc_mark_mt(mrb_state*, struct RClass*);
+int mrb_equal_in_c(mrb_state*, mrb_value, mrb_value);
+void mrb_gc_each_live_object(mrb_state*, int (*)(mrb_state*, struct RBasic*, void*), void*);
 void mrb_gc_free_mt(mrb_state*, struct RClass*);
 
 /* hash */
@@ -298,6 +318,10 @@ void mrb_env_detach_all(mrb_state *mrb, struct mrb_context *c, mrb_bool resolve)
 struct RBasic *mrb_svar_frame_container(struct mrb_context *c, mrb_callinfo *ci);
 void mrb_proc_merge_lvar(mrb_state *mrb, mrb_irep *irep, struct REnv *env, int num, const mrb_sym *lv, const mrb_value *stack);
 mrb_value mrb_proc_local_variables(mrb_state *mrb, const struct RProc *proc);
+/* The env of `ci`'s frame, made if the frame has none; NULL where the frame
+   is a cfunc's and has no locals to keep.  A scope that has to outlive its
+   frame asks for one. */
+struct REnv *mrb_vm_ci_env_reify(mrb_state *mrb, struct mrb_context *c, mrb_callinfo *ci);
 const struct RProc *mrb_proc_get_caller(mrb_state *mrb, struct REnv **env);
 mrb_value mrb_proc_get_self(mrb_state *mrb, const struct RProc *p, struct RClass **target_class_p);
 mrb_bool mrb_proc_eql(mrb_state *mrb, mrb_value self, mrb_value other);
@@ -383,7 +407,6 @@ uint32_t mrb_str_hash(mrb_state *mrb, mrb_value str);
 mrb_value mrb_str_dump(mrb_state *mrb, mrb_value str);
 mrb_value mrb_str_inspect(mrb_state *mrb, mrb_value str);
 mrb_bool mrb_str_beg_len(mrb_int str_len, mrb_int *begp, mrb_int *lenp);
-mrb_value mrb_str_byte_subseq(mrb_state *mrb, mrb_value str, mrb_int beg, mrb_int len);
 mrb_value mrb_str_aref(mrb_state *mrb, mrb_value str, mrb_value idx, mrb_value len);
 void mrb_str_aset(mrb_state *mrb, mrb_value str, mrb_value idx, mrb_value len, mrb_value replace);
 
@@ -465,13 +488,115 @@ void mrb_str_check_byte_pos(mrb_state *mrb, mrb_value str, mrb_int pos);
 /* Write the UTF-8 spelling of a codepoint into a buffer of at least four
    bytes, and return how many it took (1-4), or 0 for a value that spells no
    character. What counts as one, and why a surrogate does spell one here
-   while mrb_utf8len() says it does not, is in the definition in string.c. */
+   while mrb_utf8len() says it does not, is in the definition in string.c.
+   A build that indexes by byte has one writer, mruby-regexp, which spells a
+   named codepoint as the bytes it matches; a byte build without the gem
+   carries none of it. */
+#if defined(MRB_UTF8_STRING) || defined(HAVE_MRUBY_REGEXP_GEM)
 mrb_int mrb_utf8_to_buf(char *buf, mrb_int cp);
+#endif
 
-/* UTF-8: what a run of bytes spells, and how many characters a string holds.
-   Only a build that indexes strings by character has to answer either, so a
-   build without MRB_UTF8_STRING carries none of them. What has to read a
-   string whatever the build encodes it in asks through mrb_enc_* below. */
+/* UTF-8: what a run of bytes spells. A build that indexes strings by
+   character reads through this on every character, so it is compiled
+   wherever that build compiles. A build that indexes by byte has one
+   reader, unpack("U") in mruby-pack, which reads UTF-8 whatever the build
+   indexes by: the gem defines HAVE_MRUBY_PACK_GEM for its own files alone,
+   so that build compiles the scan there and nowhere else, and a byte
+   build without the gem compiles none of it. What a caller reading a
+   string whatever the build encodes it in asks is mrb_enc_* below. */
+#if defined(MRB_UTF8_STRING) || defined(HAVE_MRUBY_PACK_GEM)
+/* What the sequence at `p`, which has to be a byte of the string rather than
+   `e` itself, has the form of. Which forms spell a character is a view the
+   scan keeps none of: it reads the length the lead byte claims, asks that
+   every byte after the lead continue it, and holds the byte after the lead
+   inside the bounds the caller's table gives for that lead. Everything a
+   view has to say about a sequence shows in those two bytes, so the table
+   is the view, one pair {lo, hi} per lead byte from 0xC0 that admits no
+   byte outside the continuation bytes 0x80-0xBF, and the answer is
+     n > 0               the shortest spelling, over n (1-4) bytes, of the
+                         value stored through `uv`
+     MRB_UTF8_MALFORMED  a byte that leads nothing, or a byte inside the
+                         claimed length that is no continuation byte
+     MRB_UTF8_TRUNCATED  fewer bytes before `e` than the lead byte claims
+     MRB_UTF8_REDUNDANT  a second byte below the table's lower bound, which
+                         a table set at the floor of each length makes the
+                         form of a value that has a shorter spelling
+     MRB_UTF8_EXCLUDED   a second byte above the table's upper bound
+     MRB_UTF8_LONG       a lead byte claiming five or six bytes, the lengths
+                         RFC 3629 withdrew, which a reader that admits them
+                         reads for itself
+   Nothing is stored through `uv` for a negative answer, and a caller that
+   wants the form alone passes NULL for it. The tables sit above: string.c
+   holds RFC 3629's for mrb_utf8len() below, and mruby-pack holds
+   unpack("U")'s. The scan is inline so that each reader takes it with its
+   table folded in, and one that counts characters pays nothing for the
+   value it never asked for. */
+#define MRB_UTF8_MALFORMED (-1)
+#define MRB_UTF8_TRUNCATED (-2)
+#define MRB_UTF8_REDUNDANT (-3)
+#define MRB_UTF8_EXCLUDED  (-4)
+#define MRB_UTF8_LONG      (-5)
+
+static inline mrb_int
+mrb_utf8_scan(const char *p, const char *e, uint32_t *uv, const uint8_t bounds[][2])
+{
+  /* the byte length a lead byte claims, by its top five bits; the last entry
+     folds 0xF8-0xFF together and they are told apart below. The table lives
+     in the function, as the lookup tables of boxing_word.h do, so that a
+     translation unit that never reads through the scan emits neither, at
+     any optimization level. */
+  static const uint8_t lead[32] = {
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    0, 0, 0, 0, 0, 0, 0, 0, 2, 2, 2, 2, 3, 3, 4, 0
+  };
+  const unsigned char *q = (const unsigned char*)p;
+  unsigned char c = q[0];
+  mrb_int n = lead[c >> 3];
+
+  if (n <= 1) {
+    if (n == 1) {
+      if (uv) *uv = c;
+      return 1;
+    }
+    /* a continuation byte leads nothing; 0xF8-0xFD claim five or six,
+       the lengths RFC 3629 withdrew, which a reader that wants them reads
+       for itself */
+    return (c < 0xF8 || c >= 0xFE) ? MRB_UTF8_MALFORMED : MRB_UTF8_LONG;
+  }
+  if (n > e - p) return MRB_UTF8_TRUNCATED;
+
+  /* Each byte after the lead has to continue it. A second byte inside its
+     bounds has, since the table admits nothing else, so only one outside
+     them walks the sequence to tell a malformed one from a bounded one. The
+     later checks nest in the order the bytes come, so a length costs the
+     compares up to its own and none past it. Read as a signed char, a
+     continuation byte is one below -0x40, a single compare where the mask
+     takes three. A caller that wants the form alone passes no `uv`, and the
+     value is dead code the compiler drops. */
+  const uint8_t *b = bounds[c - 0xC0];
+  if (q[1] < b[0] || q[1] > b[1]) {
+    for (mrb_int i = 1; i < n; i++) {
+      if ((signed char)q[i] >= -0x40) return MRB_UTF8_MALFORMED;
+    }
+    return q[1] < b[0] ? MRB_UTF8_REDUNDANT : MRB_UTF8_EXCLUDED;
+  }
+  uint32_t v = ((c & (0x7F >> n)) << 6) | (q[1] & 0x3F);
+  if (n > 2) {
+    if ((signed char)q[2] >= -0x40) return MRB_UTF8_MALFORMED;
+    v = (v << 6) | (q[2] & 0x3F);
+    if (n > 3) {
+      if ((signed char)q[3] >= -0x40) return MRB_UTF8_MALFORMED;
+      v = (v << 6) | (q[3] & 0x3F);
+    }
+  }
+  if (uv) *uv = v;
+  return n;
+}
+#endif
+
+/* How many characters a string holds, and where each one is. Only a build
+   that indexes strings by character has to answer, so a build without
+   MRB_UTF8_STRING carries none of them. */
 #ifdef MRB_UTF8_STRING
 /* The byte length of the character at `str`, which has to be a byte of the
    string rather than `end` itself, and 1 for a run of bytes that spells no
@@ -571,7 +696,14 @@ enum mrb_case_mode {
    or empty. A caller takes -1 as "the ASCII loop I have is the whole answer",
    which is what every build without the tables answers to every string.
    `swapcase` lives in mruby-string-ext and reaches the tables through this, so
-   they are asked about in one place. */
+   they are asked about in one place.
+   The walk raises rather than answering in two cases: `ArgumentError` for a
+   run of bytes that spells no character, which is what CRuby answers for the
+   same input, and `FrozenError` for a frozen receiver it would convert, raised
+   before anything is read. A string it answers -1 for is not looked at for
+   freezing: the caller's own loop is the one that writes it, and the one that
+   refuses it. A refused conversion leaves the receiver as it was: the answer
+   is built beside the string and taken only at the end. */
 #if defined(MRB_UTF8_STRING) && !defined(MRB_USE_ASCII_CTYPE)
 int mrb_str_case_convert_unicode(mrb_state *mrb, mrb_value str, enum mrb_case_mode mode);
 #else
@@ -643,15 +775,30 @@ void mrb_uni_case_unfold_range(uint32_t lo, uint32_t hi,
 mrb_value mrb_attr_reader(mrb_state *mrb, mrb_value obj);
 mrb_value mrb_attr_writer(mrb_state *mrb, mrb_value obj);
 
+/* symbol */
+/* How many symbols are preallocated, the largest of their numbers; a
+   dynamic symbol is numbered from there. The count is a macro of the presym
+   table header, which symbol.c alone includes (see there). */
+mrb_sym mrb_presym_max(void);
+
 /* variable */
 mrb_value mrb_vm_special_get(mrb_state*, mrb_sym);
 void mrb_vm_special_set(mrb_state*, mrb_sym, mrb_value);
 mrb_value mrb_vm_cv_get(mrb_state*, mrb_sym);
 void mrb_vm_cv_set(mrb_state*, mrb_sym, mrb_value);
 mrb_value mrb_vm_const_get(mrb_state*, mrb_sym);
-mrb_bool mrb_vm_const_defined_p(mrb_state *mrb, const struct RProc *proc, mrb_sym sym);
-mrb_value mrb_vm_const_get_noraise(mrb_state *mrb, const struct RProc *proc, mrb_sym sym);
+mrb_bool mrb_vm_const_defined_p(mrb_state *mrb, mrb_callinfo *ci, mrb_sym sym);
+mrb_value mrb_vm_const_get_noraise(mrb_state *mrb, mrb_callinfo *ci, mrb_sym sym);
+mrb_value mrb_const_get_noraise(mrb_state *mrb, struct RClass *mod, mrb_sym sym);
 mrb_bool mrb_vm_cv_defined_p(mrb_state *mrb, const struct RProc *proc, mrb_sym sym);
+struct RClass *mrb_vm_cref_class(mrb_state *mrb, mrb_callinfo *ci);
+struct RClass *mrb_vm_definee_class(mrb_state *mrb, mrb_callinfo *ci);
+#ifndef MRB_NO_CONST_CACHE
+void mrb_const_cache_forget_irep(mrb_state *mrb, const struct mrb_irep *irep);
+#else
+#define mrb_const_cache_forget_irep(mrb, irep) ((void)0)
+#endif
+struct RProc *mrb_method_proc_new(mrb_state *mrb, const mrb_irep *irep);
 mrb_bool mrb_gv_defined(mrb_state *mrb, mrb_sym sym);
 #ifdef MRUBY_VARIABLE_H
 void mrb_gv_foreach(mrb_state *mrb, mrb_iv_foreach_func *func, void *p);
@@ -759,6 +906,14 @@ mrb_shape_lookup(mrb_state *mrb, mrb_iv_shape *shape, mrb_sym sym)
 #define MRB_CI_MODFUNC_P(ci) MRB_FLAG_CHECK((ci)->vis, 3)
 #define MRB_CI_SET_MODFUNC(ci) MRB_FLAG_ON((ci)->vis, 3)
 #define MRB_CI_CLEAR_MODFUNC(ci) MRB_FLAG_OFF((ci)->vis, 3)
+/* The frame was given the class to define in rather than finding a method
+   in it: `class_eval` and its kin run a block this way.  A `def` written in
+   the block adds to that class, and so does one written in a block inside
+   it, which carries the class as MRB_PROC_GIVEN_CLASS.  Not copied to the
+   env, unlike the flags below bit 4; the walk reads the procs. */
+#define MRB_CI_GIVEN_CLASS_P(ci) MRB_FLAG_CHECK((ci)->vis, 4)
+#define MRB_CI_SET_GIVEN_CLASS(ci) MRB_FLAG_ON((ci)->vis, 4)
+void mrb_vm_ci_inherit_visibility(mrb_state *mrb, const struct RProc *p);
 mrb_int mrb_ci_bidx(mrb_callinfo *ci);
 mrb_int mrb_ci_nregs(mrb_callinfo *ci);
 mrb_value mrb_exec_irep(mrb_state *mrb, mrb_value self, const struct RProc *p);

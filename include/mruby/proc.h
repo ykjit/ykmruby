@@ -30,7 +30,7 @@ struct REnv {
   mrb_sym mid;
 };
 
-/* flags (20bits): 1(module_function):1(visibility break):2(visibility):1(svar):7(bidx):8(stack_len)
+/* flags (20bits): 1(module_function):1(visibility break):2(visibility):1(given class):1(svar):6(bidx):8(stack_len)
  * The bit above the block argument index says whether the heap stack of a
  * closed env carries the special-variable slot past its locals; it is an
  * implementation detail of the core, so its accessors live in
@@ -40,12 +40,14 @@ struct REnv {
 #define MRB_ENV_LEN(e) ((mrb_int)((e)->flags & 0xff))
 #define MRB_ENV_CLOSE(e) ((e)->cxt = NULL)
 #define MRB_ENV_ONSTACK_P(e) ((e)->cxt != NULL)
-#define MRB_ENV_BIDX(e) MRB_FLAGS_GET((e)->flags, 8, 7)
+#define MRB_ENV_BIDX(e) MRB_FLAGS_GET((e)->flags, 8, 6)
 /* MRB_FLAGS_SET() masks to the width, so an index that does not fit is
    stored truncated rather than reaching the flag above it. That is silent,
    and this macro is public and was eight bits wide before, so a debug build
    says so instead. The tighter bound the VM itself works to, 43, is
    asserted where the VM computes the index (mrb_env_new()).
+   Six bits, one fewer than it had: the bit that went is MRB_ENV_GIVEN_CLASS
+   below, and every index the core stores is the 1..16 mrb_env_new() computes.
    A static inline function rather than a bare macro: mrb_assert() expands
    to nothing under release, so a macro body using it evaluates idx once in
    release and twice under MRB_DEBUG, which a public macro cannot ask a
@@ -53,10 +55,18 @@ struct REnv {
 static inline void
 mrb_env_set_bidx(struct REnv *e, unsigned int idx)
 {
-  mrb_assert(idx < 128);
-  MRB_FLAGS_SET(e->flags, 8, 7, idx);
+  mrb_assert(idx < 64);
+  MRB_FLAGS_SET(e->flags, 8, 6, idx);
 }
 #define MRB_ENV_SET_BIDX(e, idx) mrb_env_set_bidx((e), (unsigned int)(idx))
+/* The class the scope this env belongs to runs under was given to it, the
+   way `class_eval` and its kin give a block one, rather than being the class
+   a method was found in.  A `def` written in that scope adds to it, and so
+   does one written in a block made there, which closes over this env and
+   reads the flag off it.  A constant is not looked up from it: see
+   mrb_vm_cref_class() against mrb_vm_definee_class() in src/proc.c. */
+#define MRB_ENV_GIVEN_CLASS_P(e) MRB_FLAG_CHECK((e)->flags, 14)
+#define MRB_ENV_SET_GIVEN_CLASS(e) MRB_FLAG_ON((e)->flags, 14)
 #define MRB_ENV_SET_VISIBILITY(e, vis) MRB_FLAGS_SET((e)->flags, 16, 2, vis)
 #define MRB_ENV_VISIBILITY(e) MRB_FLAGS_GET((e)->flags, 16, 2)
 #define MRB_ENV_VISIBILITY_BREAK_P(e) MRB_FLAG_CHECK((e)->flags, 18)
@@ -121,17 +131,63 @@ struct RProc {
 } while (0)
 #define MRB_PROC_SCOPE 2048
 #define MRB_PROC_SCOPE_P(p) (((p)->flags & MRB_PROC_SCOPE) != 0)
+/* Where a walk up the `upper` chain looking for local variables has to
+   stop.  A proc `def` made carries no env, and the locals of the scope it
+   was written in are not its own.  `define_method` marks the block it
+   installs a scope too, but that block keeps the closure it was made with:
+   its `upper` chain is that closure chain, which is what the runtime walk
+   (`uvenv()`) follows, so its locals go on up. */
+#define MRB_PROC_LVAR_BOUNDARY_P(p) (MRB_PROC_SCOPE_P(p) && !MRB_PROC_ENV_P(p))
 #define MRB_PROC_NOARG 4096 /* for MRB_PROC_CFUNC_FL, aspec == MRB_ARGS_NONE() */
 #define MRB_PROC_NOARG_P(p) (((p)->flags & MRB_PROC_NOARG) != 0)
 #define MRB_PROC_ALIAS 8192
+/* A proc the VM made as a lexical scope: a class or module body, a method
+   body, or an eval string given a class to run under.  What a `def` written
+   in it adds to is the class the scope carries, and a walk up the `upper`
+   chain looking for that class stops here.
+   Not the same as MRB_PROC_SCOPE, which mrb_define_method_raw() also puts on
+   a block installed by `define_method`: that block keeps the scope it was
+   written in, its class along with its locals, and the walk goes on past
+   it. */
+#define MRB_PROC_CREF 16384
+#define MRB_PROC_CREF_P(p) (((p)->flags & MRB_PROC_CREF) != 0)
+/* A method body written in a block that was given the class to run under:
+   a `Class.new`, `class_eval` or `instance_eval` block.  The class the proc
+   carries is the given one, where a `def` in the body adds, and not its
+   cref: the cref is the scope the block was written in, and a walk up the
+   `upper` chain looking for the cref, or for the scopes a constant or a
+   class variable is read from, passes over the proc as if it were a block.
+   The bit is an aspec bit on a cfunc proc, and a walk that reads it may
+   pass through one, so the test answers no for a cfunc proc. */
+#define MRB_PROC_GIVEN 32768
+#define MRB_PROC_GIVEN_P(p) (((p)->flags & (MRB_PROC_GIVEN | MRB_PROC_CFUNC_FL)) == MRB_PROC_GIVEN)
 #define MRB_PROC_ALIAS_P(p) (((p)->flags & MRB_PROC_ALIAS) != 0)
 
 /* Compressed aspec for cfunc procs (13 bits in RProc.flags).
- * Uses free bits 0-6 and 14-19 to store a compressed argument spec.
+ * Uses bits 0-6 and 14-19 to store a compressed argument spec.  Bits 14 and
+ * 15 are also MRB_PROC_CREF and MRB_PROC_GIVEN; the two never meet, because
+ * only mrb_proc_new() makes a proc that can be a scope and only
+ * mrb_proc_new_cfunc() makes one that carries an aspec.  A walk that reads
+ * MRB_PROC_CREF off the `upper` chain says so by stopping at
+ * MRB_PROC_CFUNC_P(), and MRB_PROC_GIVEN_P() tests for a cfunc proc itself.
  * Layout: block(0) kdict(1) key(2-3) post(4-5) rest(6) opt(14-16) req(17-19)
  * Field widths are smaller than the full 24-bit aspec: req/opt max 7, post/key max 3.
  * Values exceeding the compressed range are clamped and rest is forced to 1. */
 #define MRB_PROC_CASPEC_MASK  0xfc07fu  /* bits 0-6 and 14-19 */
+
+#ifdef MRB_USE_REFINEMENTS
+/* The refinement scope a proc carries, as an index+1 into mrb->refscopes
+ * (0: none), packed into the flag bits an irep proc leaves unused: bits 0-6
+ * and 16-19, which only a cfunc proc reads as its compressed aspec.  A scope
+ * proc (MRB_PROC_CREF) carries the scope `using` gave it; a method body made
+ * in a scope copies the scope's at definition, so a `using` written later
+ * does not reach it; a block carries none and reads its scope's. */
+#define MRB_PROC_REFSCOPE_MAX 2047
+#define MRB_PROC_REFSCOPE(p) \
+  (MRB_PROC_CFUNC_P(p) ? 0 : (((p)->flags & 0x7f) | (((p)->flags >> 9) & 0x780)))
+#define MRB_PROC_SET_REFSCOPE(p, i) \
+  ((p)->flags = ((p)->flags & ~0xf007fu) | ((i) & 0x7f) | (((i) & 0x780) << 9))
+#endif
 
 static inline uint32_t
 mrb_proc_compress_aspec(mrb_aspec aspec)

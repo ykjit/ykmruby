@@ -240,6 +240,84 @@ assert('Kernel#inspect', '15.3.1.3.17') do
   assert_equal "main", s
 end
 
+assert('Kernel#inspect leaves out an ivar Ruby cannot name') do
+  # C extensions keep private state in ivars whose names have no '@'
+  # (mrb_iv_set with a bare symbol); instance_variables already leaves them
+  # out, and inspect must not print them either.
+  o = Object.new
+  o.__iv_set_hidden(:secret, "hidden")
+  assert_not_include o.inspect, "secret"
+  assert_equal o.to_s, o.inspect
+
+  o.__iv_set_hidden(:@pub, 1)
+  assert_include o.inspect, "@pub=1"
+  assert_not_include o.inspect, "secret"
+end
+
+assert('Kernel#inspect survives a callback that grows the object mid-walk (GHSA-j6fq-xj4w-877x)') do
+  # inspect calls each ivar value's own #inspect, which can run arbitrary
+  # Ruby. Adding a new ivar to the object being inspected from in there
+  # used to free its shaped storage (shaped_iv_set growing to a wider
+  # block) out from under the walk still reading the old one.
+  owner_class = Class.new do
+    def initialize(mutator_class)
+      @first = mutator_class.new(self)
+      @second = "kept"
+    end
+
+    def grow
+      @third = :grown
+    end
+  end
+  mutator_class = Class.new do
+    def initialize(owner)
+      @owner = owner
+    end
+
+    def inspect
+      @owner.grow
+      "mutated"
+    end
+  end
+
+  o = owner_class.new(mutator_class)
+  s = o.inspect
+  assert_include s, "@first=mutated"
+  assert_include s, '@second="kept"'
+end
+
+assert('Kernel#inspect survives a callback that removes an ivar mid-walk (GHSA-j6fq-xj4w-877x)') do
+  # remove_instance_variable de-shapes the object (shaped storage to a
+  # plain table), freeing the same shaped block a growing callback frees;
+  # the walk used to keep reading through it for the remaining keys.
+  owner_class = Class.new do
+    def initialize(remover_class)
+      @a = remover_class.new(self)
+      @b = "kept"
+      @c = "also kept"
+    end
+
+    def drop_b
+      remove_instance_variable(:@b)
+    end
+  end
+  remover_class = Class.new do
+    def initialize(owner)
+      @owner = owner
+    end
+
+    def inspect
+      @owner.drop_b
+      "dropped"
+    end
+  end
+
+  o = owner_class.new(remover_class)
+  s = o.inspect
+  assert_include s, "@a=dropped"
+  assert_include s, '@c="also kept"'
+end
+
 assert('Kernel#is_a?', '15.3.1.3.24') do
   assert_true is_a?(Kernel)
   assert_false is_a?(Array)
@@ -443,6 +521,173 @@ assert('Kernel#respond_to? skips respond_to_missing? for an unimplemented method
   # A method that exists leaves respond_to_missing? nothing to answer.
   assert_false cls.new.respond_to?(:gone)
   assert_true cls.new.respond_to?(:no_such_method)
+
+  # Hiding it changes nothing: what the build does not implement is answered
+  # before visibility is weighed, at either visibility asked for.
+  hidden = Class.new(TestNotImplement) do
+    private :gone
+    def respond_to_missing?(name, priv = false)
+      true
+    end
+  end
+  assert_false hidden.new.respond_to?(:gone)
+  assert_false hidden.new.respond_to?(:gone, true)
+end
+
+class RespondToVisibility
+  def pub; end
+  private def priv; end
+  protected def prot; end
+
+  def later; end
+  def again; end
+  private :later, :again
+  public :again
+
+  alias_method :priv_alias, :priv
+
+  def self.smeth; end
+  class << self
+    private def shidden; end
+  end
+end
+
+class RespondToVisibilityChild < RespondToVisibility; end
+
+module RespondToVisibilityModule
+  def mpub; end
+  private def mpriv; end
+  protected def mprot; end
+end
+
+class RespondToVisibilityIncluder
+  include RespondToVisibilityModule
+end
+
+module RespondToVisibilityPrepended
+  private def ppriv; end
+end
+
+class RespondToVisibilityPrepender
+  prepend RespondToVisibilityPrepended
+end
+
+assert('Kernel#respond_to? weighs how the method may be called') do
+  obj = RespondToVisibility.new
+
+  assert_true  obj.respond_to?(:pub)
+  assert_true  obj.respond_to?(:pub, true)
+
+  # A method a call with a receiver cannot reach is not one the object
+  # responds to, unless the second parameter asks for it.
+  assert_false obj.respond_to?(:priv)
+  assert_true  obj.respond_to?(:priv, true)
+  assert_false obj.respond_to?(:prot)
+  assert_true  obj.respond_to?(:prot, true)
+
+  # the visibility a name carries is what counts, however it got there,
+  # and it is the one it carries now
+  assert_false obj.respond_to?(:later)
+  assert_true  obj.respond_to?(:later, true)
+  assert_true  obj.respond_to?(:again)
+  assert_false obj.respond_to?(:priv_alias)
+  assert_true  obj.respond_to?(:priv_alias, true)
+
+  # a singleton method is public where the surrounding scope said nothing,
+  # and private where its own class body said so
+  assert_true  RespondToVisibility.respond_to?(:smeth)
+  assert_false RespondToVisibility.respond_to?(:shidden)
+  assert_true  RespondToVisibility.respond_to?(:shidden, true)
+
+  # the answer comes from wherever the method is found
+  child = RespondToVisibilityChild.new
+  assert_false child.respond_to?(:priv)
+  assert_true  child.respond_to?(:priv, true)
+
+  includer = RespondToVisibilityIncluder.new
+  assert_true  includer.respond_to?(:mpub)
+  assert_false includer.respond_to?(:mpriv)
+  assert_true  includer.respond_to?(:mpriv, true)
+  assert_false includer.respond_to?(:mprot)
+  assert_true  includer.respond_to?(:mprot, true)
+
+  prepender = RespondToVisibilityPrepender.new
+  assert_false prepender.respond_to?(:ppriv)
+  assert_true  prepender.respond_to?(:ppriv, true)
+
+  # the private methods mruby itself defines answer the same way
+  assert_false obj.respond_to?(:initialize)
+  assert_true  obj.respond_to?(:initialize, true)
+  assert_false obj.respond_to?(:method_missing)
+  assert_false obj.respond_to?(:respond_to_missing?)
+end
+
+class RespondToHidden
+  private def hidden; end
+
+  def asked; @asked; end
+
+  def respond_to_missing?(name, include_private = false)
+    @asked = [name, include_private]
+    name == :hidden
+  end
+end
+
+class RespondToRefused < RespondToHidden
+  def respond_to_missing?(name, include_private = false)
+    @asked = [name, include_private]
+    false
+  end
+end
+
+assert('Kernel#respond_to? leaves a method out of reach to respond_to_missing?') do
+  obj = RespondToHidden.new
+  assert_true obj.respond_to?(:hidden)
+  assert_equal [:hidden, false], obj.asked
+
+  # the second parameter is handed over as it was given
+  refused = RespondToRefused.new
+  assert_false refused.respond_to?(:hidden)
+  assert_equal [:hidden, false], refused.asked
+
+  # a method the second parameter reaches is answered without asking
+  reached = RespondToRefused.new
+  assert_true reached.respond_to?(:hidden, true)
+  assert_nil reached.asked
+end
+
+class RespondToMissingUndefined
+  def pub; end
+  private def priv; end
+  undef_method :respond_to_missing?
+end
+
+class RespondToMissingClaims
+  def respond_to_missing?(name, include_private = false)
+    true
+  end
+end
+
+class RespondToMissingStopped < RespondToMissingClaims
+  undef_method :respond_to_missing?
+end
+
+assert('Kernel#respond_to? answers false where respond_to_missing? is undefined') do
+  obj = RespondToMissingUndefined.new
+  # a name with no method behind it is false at either visibility asked for,
+  # rather than an error about `respond_to_missing?` itself
+  assert_false obj.respond_to?(:no_such_method)
+  assert_false obj.respond_to?(:no_such_method, true)
+
+  # the methods that are there answer as before
+  assert_true obj.respond_to?(:pub)
+  assert_false obj.respond_to?(:priv)
+  assert_true obj.respond_to?(:priv, true)
+
+  # the undefinition stops the lookup, so a superclass that would have
+  # claimed the name is not asked either
+  assert_true RespondToMissingClaims.new.respond_to?(:no_such_method)
+  assert_false RespondToMissingStopped.new.respond_to?(:no_such_method)
 end
 
 assert('an unimplemented method can be overridden, aliased and undefined') do
