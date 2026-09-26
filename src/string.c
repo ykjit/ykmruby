@@ -2155,7 +2155,7 @@ str_replace_partial(mrb_state *mrb, mrb_value src, mrb_int pos, mrb_int end, mrb
    `mrb_digitmap` is lower case because `Integer#to_s` reads a number
    through it and CRuby spells that in lower case, so the two cannot share
    one table. */
-static const char escape_hexmap[] = "0123456789ABCDEF";
+MRB_YK_STATIC const char escape_hexmap[] = "0123456789ABCDEF";
 
 static mrb_value
 str_escape(mrb_state *mrb, mrb_value str, mrb_bool inspect)
@@ -4569,7 +4569,7 @@ mrb_encoding(mrb_state *mrb, mrb_value self)
 }
 
 /* ---------------------------*/
-static const mrb_mt_entry string_rom_entries[] = {
+MRB_YK_STATIC const mrb_mt_entry string_rom_entries[] = {
   MRB_MT_ENTRY(mrb_str_bytesize,        MRB_SYM(bytesize),        MRB_ARGS_NONE()),
   MRB_MT_ENTRY(mrb_str_cmp_m,           MRB_OPSYM(cmp),           MRB_ARGS_REQ(1)),                   /* 15.2.10.5.1  */
   MRB_MT_ENTRY(mrb_str_equal_m,         MRB_OPSYM(eq),            MRB_ARGS_REQ(1)),                   /* 15.2.10.5.2  */

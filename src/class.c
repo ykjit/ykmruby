@@ -3167,7 +3167,7 @@ mrb_idx_op_rearm(mrb_state *mrb, enum mrb_idx_op_slot slot)
  * arms or rechecks it.
  */
 
-static const mrb_sym bop_mids[MRB_BOP_COUNT] = {
+MRB_YK_STATIC const mrb_sym bop_mids[MRB_BOP_COUNT] = {
   MRB_OPSYM(add), MRB_OPSYM(sub), MRB_OPSYM(mul), MRB_OPSYM(div),
   MRB_OPSYM(eq), MRB_OPSYM(lt), MRB_OPSYM(le), MRB_OPSYM(gt), MRB_OPSYM(ge),
 };
@@ -5134,7 +5134,7 @@ inspect_main(mrb_state *mrb, mrb_value mod)
   return mrb_str_new_lit(mrb, "main");
 }
 
-static const mrb_code new_iseq[] = {
+MRB_YK_STATIC const mrb_code new_iseq[] = {
   OP_ENTER, 0x0, 0x10, 0x3,  // 000 OP_ENTER     0:0:1:0:0:1:1
   OP_SSEND, 4, 0, 0,         // 004 OP_SSEND     R4  :allocate  n=0
   OP_MOVE, 0, 4,             // 008 OP_MOVE      R0  R4
@@ -5147,14 +5147,14 @@ static const mrb_code new_iseq[] = {
 
 MRB_PRESYM_DEFINE_VAR_AND_INITER(new_syms, 2, MRB_SYM(allocate), MRB_SYM(initialize))
 
-static const mrb_irep new_irep = {
+MRB_YK_STATIC const mrb_irep new_irep = {
   4, 6, 0, MRB_IREP_STATIC,
   new_iseq, NULL, new_syms, NULL, NULL, NULL,
   sizeof(new_iseq), 0, 2, 0, 0,
 };
 
 mrb_alignas(8)
-static const struct RProc new_proc = {
+MRB_YK_STATIC const struct RProc new_proc = {
   NULL, MRB_TT_PROC, MRB_GC_RED, MRB_OBJ_IS_FROZEN, MRB_PROC_SCOPE | MRB_PROC_STRICT,
   { &new_irep }, NULL, { NULL }
 };
@@ -5169,7 +5169,7 @@ init_class_new(mrb_state *mrb, struct RClass *cls)
   mrb_define_method_raw(mrb, cls, MRB_SYM(new), m);
 }
 
-static const mrb_code neq_iseq[] = {
+MRB_YK_STATIC const mrb_code neq_iseq[] = {
   OP_ENTER, 0x4, 0, 0,       // 000 OP_ENTER     1:0:0:0:0:0:0
   OP_EQ, 0,                  // 004 OP_EQ        R0  (R1)
   OP_JMPNOT, 0, 0, 5,        // 006 OP_JMPNOT    R0  015
@@ -5179,20 +5179,20 @@ static const mrb_code neq_iseq[] = {
   OP_RETURN, 0               // 017 OP_RETURN    R0
 };
 
-static const mrb_irep neq_irep = {
+MRB_YK_STATIC const mrb_irep neq_irep = {
   4, 6, 0, MRB_IREP_STATIC,
   neq_iseq, NULL, NULL, NULL, NULL, NULL,
   sizeof(neq_iseq), 0, 2, 0, 0,
 };
 
 mrb_alignas(8)
-static const struct RProc neq_proc = {
+MRB_YK_STATIC const struct RProc neq_proc = {
   NULL, MRB_TT_PROC, MRB_GC_RED, MRB_OBJ_IS_FROZEN, MRB_PROC_SCOPE | MRB_PROC_STRICT,
   { &neq_irep }, NULL, { NULL }
 };
 
 /* ---------------------------*/
-static const mrb_mt_entry bob_rom_entries[] = {
+MRB_YK_STATIC const mrb_mt_entry bob_rom_entries[] = {
   MRB_MT_ENTRY(mrb_obj_equal_m,       MRB_OPSYM(eq),                       MRB_ARGS_REQ(1)),                                   /* 15.3.1.3.1  */
   MRB_MT_ENTRY(mrb_bob_not,           MRB_OPSYM(not),                      MRB_ARGS_NONE()),
   MRB_MT_ENTRY(mrb_obj_id_m,          MRB_SYM(__id__),                     MRB_ARGS_NONE()),                                   /* 15.3.1.3.4  */
@@ -5206,14 +5206,14 @@ static const mrb_mt_entry bob_rom_entries[] = {
   MRB_MT_ENTRY(mrb_do_nothing,        MRB_SYM(singleton_method_undefined), MRB_ARGS_REQ(1) | MRB_MT_PRIVATE),
 };
 
-static const mrb_mt_entry cls_rom_entries[] = {
+MRB_YK_STATIC const mrb_mt_entry cls_rom_entries[] = {
   MRB_MT_ENTRY(mrb_instance_alloc,   MRB_SYM(allocate),   MRB_ARGS_NONE()),
   MRB_MT_ENTRY(mrb_do_nothing,       MRB_SYM(inherited),  MRB_ARGS_REQ(1) | MRB_MT_PRIVATE),
   MRB_MT_ENTRY(mrb_class_initialize, MRB_SYM(initialize), MRB_ARGS_OPT(1) | MRB_MT_PRIVATE),  /* 15.2.3.3.1 */
   MRB_MT_ENTRY(mrb_class_superclass, MRB_SYM(superclass), MRB_ARGS_NONE()),                   /* 15.2.3.3.4 */
 };
 
-static const mrb_mt_entry mod_rom_entries[] = {
+MRB_YK_STATIC const mrb_mt_entry mod_rom_entries[] = {
   MRB_MT_ENTRY(mrb_mod_eqq,             MRB_OPSYM(eqq),            MRB_ARGS_REQ(1)),                   /* 15.2.2.4.7 */
   MRB_MT_ENTRY(mrb_mod_alias,           MRB_SYM(alias_method),     MRB_ARGS_ANY()),                    /* 15.2.2.4.8 */
   MRB_MT_ENTRY(mrb_mod_ancestors,       MRB_SYM(ancestors),        MRB_ARGS_NONE()),                   /* 15.2.2.4.9 */

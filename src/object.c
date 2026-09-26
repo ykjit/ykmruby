@@ -367,7 +367,7 @@ mrb_false_to_s(mrb_state *mrb, mrb_value obj)
 }
 
 /* ---------------------------*/
-static const mrb_mt_entry nil_rom_entries[] = {
+MRB_YK_STATIC const mrb_mt_entry nil_rom_entries[] = {
   MRB_MT_ENTRY(false_and,   MRB_OPSYM(and), MRB_ARGS_REQ(1)),  /* 15.2.4.3.1  */
   MRB_MT_ENTRY(false_or,    MRB_OPSYM(or), MRB_ARGS_REQ(1)),  /* 15.2.4.3.2  */
   MRB_MT_ENTRY(false_xor,   MRB_OPSYM(xor), MRB_ARGS_REQ(1)),  /* 15.2.4.3.3  */
@@ -377,7 +377,7 @@ static const mrb_mt_entry nil_rom_entries[] = {
   MRB_MT_ENTRY(nil_match,   MRB_OPSYM(match), MRB_ARGS_REQ(1)),
 };
 
-static const mrb_mt_entry true_rom_entries[] = {
+MRB_YK_STATIC const mrb_mt_entry true_rom_entries[] = {
   MRB_MT_ENTRY(true_and,  MRB_OPSYM(and), MRB_ARGS_REQ(1)),  /* 15.2.5.3.1  */
   MRB_MT_ENTRY(true_or,   MRB_OPSYM(or), MRB_ARGS_REQ(1)),  /* 15.2.5.3.2  */
   MRB_MT_ENTRY(true_xor,  MRB_OPSYM(xor), MRB_ARGS_REQ(1)),  /* 15.2.5.3.3  */
@@ -385,7 +385,7 @@ static const mrb_mt_entry true_rom_entries[] = {
   MRB_MT_ENTRY(mrb_true_to_s, MRB_SYM(inspect), MRB_ARGS_NONE()),
 };
 
-static const mrb_mt_entry false_rom_entries[] = {
+MRB_YK_STATIC const mrb_mt_entry false_rom_entries[] = {
   MRB_MT_ENTRY(false_and,  MRB_OPSYM(and), MRB_ARGS_REQ(1)),  /* 15.2.4.3.1  */
   MRB_MT_ENTRY(false_or,   MRB_OPSYM(or), MRB_ARGS_REQ(1)),  /* 15.2.4.3.2  */
   MRB_MT_ENTRY(false_xor,  MRB_OPSYM(xor), MRB_ARGS_REQ(1)),  /* 15.2.4.3.3  */

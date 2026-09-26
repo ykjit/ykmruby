@@ -13,6 +13,9 @@
 #include <mruby/string.h>
 #include <mruby/class.h>
 #include <mruby/internal.h>
+#ifdef USE_YK
+#include <mruby/yk.h>
+#endif
 
 void mrb_init_core(mrb_state*);
 void mrb_init_mrbgems(mrb_state*);
@@ -52,6 +55,9 @@ mrb_open_core(void)
   *mrb = mrb_state_zero;
   mrb->atexit_stack_len = 0;
   mrb->bootstrapping = TRUE;
+#ifdef USE_YK
+  yk_init();
+#endif
 
   if (mrb_core_init_protect(mrb, init_gc_and_core, NULL)) {
     /* Return mrb with mrb->exc set for caller to inspect */
@@ -145,8 +151,20 @@ mrb_irep_free(mrb_state *mrb, mrb_irep *irep)
 
   if (irep->flags & MRB_IREP_NO_FREE) return;
   consolidated = (irep->flags & MRB_IREP_CONSOLIDATED) != 0;
+#ifdef USE_YK
+  yk_free_loc(mrb, irep);
+#endif
+#ifndef USE_YK
+  /* YKFIXME: Memory leak under - the iseq of a freed irep is never freed.
+     yk_load_insn is idempotent on the iseq address, so another iseq allocated
+     at the same address would make old traces read stale values.
+
+     Tried numeric version (bumped on free) as part of the idempotence key.
+     It works but cost ~9% (Permute, Richards). This needs further investigation.
+  */
   if (!(irep->flags & MRB_ISEQ_NO_FREE))
     mrb_free(mrb, (void*)irep->iseq);
+#endif
   if (irep->pool) {
     for (i=0; i<irep->plen; i++) {
       if ((irep->pool[i].tt & 3) == IREP_TT_STR ||

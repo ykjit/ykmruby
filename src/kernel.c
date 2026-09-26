@@ -926,7 +926,7 @@ obj_pat_values(mrb_state *mrb, mrb_value self)
   return mrb_nil_value();       /* not reached */
 }
 
-static const mrb_mt_entry kernel_rom_entries[] = {
+MRB_YK_STATIC const mrb_mt_entry kernel_rom_entries[] = {
   MRB_MT_ENTRY(mrb_f_defined_const_path, MRB_SYM_Q(__defined_const_path), MRB_ARGS_REQ(2) | MRB_MT_PRIVATE),
   MRB_MT_ENTRY(mrb_f_defined_method, MRB_SYM_Q(__defined_method), MRB_ARGS_REQ(1) | MRB_MT_PRIVATE),
   MRB_MT_ENTRY(mrb_f_defined_method_on, MRB_SYM_Q(__defined_method_on), MRB_ARGS_REQ(2) | MRB_MT_PRIVATE),
@@ -973,7 +973,7 @@ static const mrb_mt_entry kernel_rom_entries[] = {
 /* Public counterparts on `Kernel` itself, so that the qualified form
    `Kernel.raise` works while the instance methods above stay private.
    This is what `module_function` gives these methods in CRuby. */
-static const mrb_mt_entry kernel_module_function_entries[] = {
+MRB_YK_STATIC const mrb_mt_entry kernel_module_function_entries[] = {
   MRB_MT_ENTRY(mrb_f_block_given_p_m, MRB_SYM_Q(block_given), MRB_ARGS_NONE()),  /* 15.3.1.2.2  */
   MRB_MT_ENTRY(mrb_f_block_given_p_m, MRB_SYM_Q(iterator),    MRB_ARGS_NONE()),  /* 15.3.1.2.5  */
   MRB_MT_ENTRY(mrb_f_raise,           MRB_SYM(raise),      MRB_ARGS_OPT(2)),  /* 15.3.1.2.12 */

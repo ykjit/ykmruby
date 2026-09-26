@@ -469,7 +469,7 @@ cdump_irep_struct(mrc_ccontext *c, const mrc_irep *irep, uint8_t flags, FILE *fp
       if (cdump_irep_struct(c, irep->reps[i], flags, fp, name, max+i, init_syms_code, mp) != MRC_DUMP_OK)
         return MRC_DUMP_INVALID_ARGUMENT;
     }
-    fprintf(fp,   "static const mrb_irep *%s_reps_%d[%d] = {\n", name, n, len);
+    fprintf(fp,   "MRB_YK_STATIC const mrb_irep *%s_reps_%d[%d] = {\n", name, n, len);
     for (i=0,len=irep->rlen; i<len; i++) {
       fprintf(fp,   "  &%s_irep_%d,\n", name, max+i);
     }
@@ -478,7 +478,7 @@ cdump_irep_struct(mrc_ccontext *c, const mrc_irep *irep, uint8_t flags, FILE *fp
   /* dump pool */
   if (0 < irep->plen) {
     len=irep->plen;
-    fprintf(fp,   "static const mrb_irep_pool %s_pool_%d[%d] = {\n", name, n, len);
+    fprintf(fp,   "MRB_YK_STATIC const mrb_irep_pool %s_pool_%d[%d] = {\n", name, n, len);
     for (i=0; i<len; i++) {
       if (cdump_pool(c, &irep->pool[i], fp) != MRC_DUMP_OK)
         return MRC_DUMP_INVALID_ARGUMENT;
@@ -491,7 +491,7 @@ cdump_irep_struct(mrc_ccontext *c, const mrc_irep *irep, uint8_t flags, FILE *fp
   }
   /* dump iseq */
   len=irep->ilen+sizeof(struct mrc_irep_catch_handler)*irep->clen;
-  fprintf(fp,   "static const mrb_code %s_iseq_%d[%d] = {", name, n, len);
+  fprintf(fp,   "MRB_YK_STATIC const mrb_code %s_iseq_%d[%d] = {", name, n, len);
   for (i=0; i<len; i++) {
     if (i%20 == 0) fputs("\n", fp);
     fprintf(fp, "0x%02x,", irep->iseq[i]);
@@ -510,7 +510,7 @@ cdump_irep_struct(mrc_ccontext *c, const mrc_irep *irep, uint8_t flags, FILE *fp
 
 
   /* dump irep */
-  fprintf(fp, "static const mrb_irep %s_irep_%d = {\n", name, n);
+  fprintf(fp, "MRB_YK_STATIC const mrb_irep %s_irep_%d = {\n", name, n);
   fprintf(fp,   "  %d,%d,%d,\n", irep->nlocals, irep->nregs, irep->clen);
   fprintf(fp,   "  MRB_IREP_STATIC,%s_iseq_%d,\n", name, n);
   if (0 < irep->plen) {
@@ -564,7 +564,7 @@ mrc_dump_irep_cstruct(mrc_ccontext *c, const mrc_irep *irep, uint8_t flags, FILE
   }
   fputs("#define mrb_BRACED(...) {__VA_ARGS__}\n", fp);
   fputs("#define mrb_DEFINE_SYMS_VAR(name, len, syms, qualifier) \\\n", fp);
-  fputs("  static qualifier mrb_sym name[len] = mrb_BRACED syms\n", fp);
+  fputs("  MRB_YK_STATIC qualifier mrb_sym name[len] = mrb_BRACED syms\n", fp);
   fputs("\n", fp);
   mrc_string *init_syms_code = mrc_str_new_capa(c, 1);
   int max = 1;

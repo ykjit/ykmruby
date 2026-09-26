@@ -1687,7 +1687,7 @@ gv_virtual_free(mrb_state *mrb, void *p)
   mrb_free(mrb, p);
 }
 
-static const mrb_data_type gv_virtual_type = { "gv_virtual", gv_virtual_free };
+MRB_YK_STATIC const mrb_data_type gv_virtual_type = { "gv_virtual", gv_virtual_free };
 
 static const struct gv_virtual*
 gv_virtual_check(mrb_value v)

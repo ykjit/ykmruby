@@ -123,6 +123,14 @@ MRB_API char *mrb_int_to_cstr(char *buf, size_t len, mrb_int n, mrb_int base);
 #endif
 #endif
 
+/*
+// Skip overflow intrinsics for now.
+// TODO: Implement the overflow handling
+*/
+#ifdef USE_YK
+#undef MRB_HAVE_TYPE_GENERIC_CHECKED_ARITHMETIC_BUILTINS
+#endif
+
 #ifdef MRB_HAVE_TYPE_GENERIC_CHECKED_ARITHMETIC_BUILTINS
 
 static inline mrb_bool

@@ -20,6 +20,38 @@
 #include <mruby/throw.h>
 #include <mruby/dump.h>
 #include <mruby/internal.h>
+#ifdef USE_YK
+#include <mruby/yk.h>
+
+/* Workaround for yk's "Multi-locations not yet supported" panic.
+   numeric.h's mrb_int_{add,sub,mul}_overflow use __builtin_*_overflow, which are lowered to
+   llvm.{sadd,ssub,smul}.with.overflow: one call returning a {result, overflow-flag} struct.
+   OP_MATH branches on the flag, and that struct stays live across the branch, so it ends up
+   in the guard's stackmap. yk sets it as a value with two live locations, which is not
+   supported at the moment.
+
+   These wrappers keep the builtin for the flag but discard its result and compute the result
+   with a plain operator, so no struct is live across the branch. They are redirected only
+   within this file.
+
+   Assumed but not measured overhead vs. plain mruby is small - the result is computed twice,
+   once by the builtin and once by the plain operator.
+*/
+#define YK_INT_OVERFLOW(op, sym)                                            \
+  static inline mrb_bool yk_int_##op##_overflow(mrb_int a, mrb_int b, mrb_int *c) \
+  {                                                                         \
+    mrb_int t;                                                              \
+    mrb_bool o = mrb_int_##op##_overflow(a, b, &t);                         \
+    *c = (mrb_int)((mrb_uint)a sym (mrb_uint)b);                            \
+    return o;                                                               \
+  }
+YK_INT_OVERFLOW(add, +)
+YK_INT_OVERFLOW(sub, -)
+YK_INT_OVERFLOW(mul, *)
+#define mrb_int_add_overflow yk_int_add_overflow
+#define mrb_int_sub_overflow yk_int_sub_overflow
+#define mrb_int_mul_overflow yk_int_mul_overflow
+#endif // end of USE_YK
 
 #ifdef MRB_NO_STDIO
 #if defined(__cplusplus)
@@ -1181,6 +1213,12 @@ cipop(mrb_state *mrb)
   struct mrb_context *c = mrb->c;
   mrb_callinfo *ci = c->ci;
 
+#ifdef USE_YK
+  if (ci->proc && !MRB_PROC_CFUNC_P(ci->proc)) {
+    ((mrb_irep*)ci->proc->body.irep)->called = FALSE;
+  }
+#endif
+
   /* Fast path: no env and no blk (most common for simple method calls) */
   if (mrb_likely((!ci->u.env || ci->u.env->tt != MRB_TT_ENV) && !ci->blk)) {
     c->ci--;
@@ -1424,7 +1462,7 @@ mrb_ci_nregs(mrb_callinfo *ci)
 
 mrb_value mrb_obj_missing(mrb_state *mrb, mrb_value mod);
 
-static mrb_method_t
+MRB_YK_OUTLINE static mrb_method_t
 prepare_missing(mrb_state *mrb, mrb_callinfo *ci, mrb_value recv, mrb_sym mid, mrb_bool super)
 {
   mrb_sym missing = MRB_SYM(method_missing);
@@ -1750,7 +1788,7 @@ mrb_object_exec(mrb_state *mrb, mrb_value self, struct RClass *target_class)
   return mrb_exec_irep(mrb, self, mrb_proc_ptr(blk));
 }
 
-static mrb_noreturn void
+MRB_YK_OUTLINE static mrb_noreturn void
 vis_error(mrb_state *mrb, mrb_sym mid, mrb_value args, mrb_value recv, mrb_bool priv)
 {
   mrb_no_method_error(mrb, mid, args, "%s method '%n' called for %T", (priv ? "private" : "protected"), mid, recv);
@@ -2477,7 +2515,44 @@ prepare_tagged_break(mrb_state *mrb, uint32_t tag, const mrb_callinfo *return_ci
 } while (0)
 
 #define DECODE_OPERANDS(ops) do { const mrb_code *pc = ci->pc+1; FETCH_ ## ops (); ci->pc = pc; } while (0)
+
+#ifdef USE_YK
+
+__attribute__((yk_idempotent, noinline))
+mrb_code yk_load_insn(const mrb_code *pc) {
+  __asm__ volatile("" : "+r,m"(pc) : : "memory");
+  return *pc;
+}
+
+__attribute__((yk_idempotent, noinline))
+uint32_t yk_load_b(const mrb_code *pc) { return pc[0]; }
+__attribute__((yk_idempotent, noinline))
+uint32_t yk_load_s(const mrb_code *pc) { return pc[0]<<8|pc[1]; }
+__attribute__((yk_idempotent, noinline))
+uint32_t yk_load_w(const mrb_code *pc) { return pc[0]<<16|pc[1]<<8|pc[2]; }
+
+#undef READ_B
+#undef READ_S
+#undef READ_W
+#define READ_B() (yk_is_interpreting() ? PEEK_B(pc++) : yk_load_b(pc++))
+#define READ_S() (pc+=2, yk_is_interpreting() ? PEEK_S(pc-2) : yk_load_s(pc-2))
+#define READ_W() (pc+=3, yk_is_interpreting() ? PEEK_W(pc-3) : yk_load_w(pc-3))
+
+#define CALL_CODE_HOOKS() do { \
+  irep = ci->proc->body.irep; \
+  mrb_jit_yk_hook(mrb, irep, ci->pc); \
+  if (yk_is_interpreting()) { \
+    insn_pc = ci->pc; \
+    insn = BYTECODE_DECODER(*insn_pc); \
+  } else { \
+    insn_pc = (const mrb_code*)yk_promote((void*)ci->pc); \
+    insn = BYTECODE_DECODER(yk_load_insn(insn_pc)); \
+  } \
+  CODE_FETCH_HOOK(mrb, irep, ci->pc, regs); \
+} while (0)
+#else
 #define CALL_CODE_HOOKS() do { insn = BYTECODE_DECODER(*ci->pc); CODE_FETCH_HOOK(mrb, irep, ci->pc, regs); } while (0)
+#endif // End of USE_YK
 
 #ifdef MRB_USE_TASK_SCHEDULER
 /* TRUE when the current context is executing across a C call boundary, i.e.
@@ -3311,6 +3386,9 @@ mrb_vm_exec(mrb_state *mrb, const struct RProc *begin_proc, const mrb_code *iseq
   /* mrb_assert(MRB_PROC_CFUNC_P(begin_proc)) */
   const mrb_irep *irep = begin_proc->body.irep;
   mrb_code insn;
+#ifdef USE_YK
+  const mrb_code *insn_pc;
+#endif
   int ai = mrb_gc_arena_save(mrb);
   struct mrb_jmpbuf *prev_jmp = mrb->jmp;
   struct mrb_jmpbuf c_jmp;
@@ -3319,7 +3397,6 @@ mrb_vm_exec(mrb_state *mrb, const struct RProc *begin_proc, const mrb_code *iseq
   uint16_t c;
   mrb_sym mid;
   const struct mrb_irep_catch_handler *ch;
-
 #ifndef MRB_USE_VM_SWITCH_DISPATCH
   static const void * const optable[] = {
 #define OPCODE(x,_) &&L_OP_ ## x,
@@ -3506,7 +3583,19 @@ RETRY_TRY_BLOCK:
         struct RObject *o = mrb_obj_ptr(recv);
         if (MRB_OBJ_SHAPED_P(o) && o->iv) {
           mrb_shaped_iv *siv = (mrb_shaped_iv*)o->iv;
+#ifdef USE_YK
+          int idx;
+          if (yk_is_interpreting()) {
+            idx = mrb_shape_lookup(mrb, siv->shape, irep->syms[b]);
+          }
+          else {
+            idx = mrb_shape_lookup((mrb_state*)yk_promote((void*)mrb),
+                                   (mrb_iv_shape*)yk_promote((void*)siv->shape),
+                                   yk_promote(irep->syms[b]));
+          }
+#else
           int idx = mrb_shape_lookup(mrb, siv->shape, irep->syms[b]);
+#endif
           regs[a] = (idx >= 0 && !mrb_undef_p(siv->values[idx]))
                     ? siv->values[idx] : mrb_nil_value();
           NEXT;
@@ -3531,7 +3620,19 @@ RETRY_TRY_BLOCK:
         struct RObject *o = mrb_obj_ptr(recv);
         if (MRB_OBJ_SHAPED_P(o) && o->iv && !mrb_frozen_p(o)) {
           mrb_shaped_iv *siv = (mrb_shaped_iv*)o->iv;
+#ifdef USE_YK
+          int idx;
+          if (yk_is_interpreting()) {
+            idx = mrb_shape_lookup(mrb, siv->shape, irep->syms[b]);
+          }
+          else {
+            idx = mrb_shape_lookup((mrb_state*)yk_promote((void*)mrb),
+                                   (mrb_iv_shape*)yk_promote((void*)siv->shape),
+                                   yk_promote(irep->syms[b]));
+          }
+#else
           int idx = mrb_shape_lookup(mrb, siv->shape, irep->syms[b]);
+#endif
           if (idx >= 0 && !mrb_undef_p(siv->values[idx])) {
             siv->values[idx] = regs[a];
             mrb_field_write_barrier_value(mrb, (struct RBasic*)o, regs[a]);

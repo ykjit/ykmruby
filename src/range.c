@@ -568,7 +568,7 @@ mrb_range_beg_len(mrb_state *mrb, mrb_value range, mrb_int *begp, mrb_int *lenp,
 }
 
 /* ---------------------------*/
-static const mrb_mt_entry range_rom_entries[] = {
+MRB_YK_STATIC const mrb_mt_entry range_rom_entries[] = {
   MRB_MT_ENTRY(range_beg,             MRB_SYM(begin),        MRB_ARGS_NONE()),  /* 15.2.14.4.3  */
   MRB_MT_ENTRY(range_end,             MRB_SYM(end),          MRB_ARGS_NONE()),  /* 15.2.14.4.5  */
   MRB_MT_ENTRY(range_eq,              MRB_OPSYM(eq), MRB_ARGS_REQ(1)),  /* 15.2.14.4.1  */

@@ -281,7 +281,7 @@ mrb_static_assert(MRB_GC_RED <= GC_COLOR_MASK);
 static size_t incremental_gc_finish(mrb_state *mrb, mrb_gc *gc);
 static size_t incremental_gc_run(mrb_state *mrb, mrb_gc *gc);
 
-MRB_API void*
+MRB_YK_OUTLINE MRB_API void*
 mrb_realloc_simple(mrb_state *mrb, void *p,  size_t len)
 {
   void *p2;
@@ -365,7 +365,7 @@ mrb_realloc_simple(mrb_state *mrb, void *p,  size_t len)
   return p2;
 }
 
-MRB_API void*
+MRB_YK_OUTLINE MRB_API void*
 mrb_realloc(mrb_state *mrb, void *p, size_t len)
 {
   void *p2;
@@ -377,19 +377,19 @@ mrb_realloc(mrb_state *mrb, void *p, size_t len)
   return p2;
 }
 
-MRB_API void*
+MRB_YK_OUTLINE MRB_API void*
 mrb_malloc(mrb_state *mrb, size_t len)
 {
   return mrb_realloc(mrb, 0, len);
 }
 
-MRB_API void*
+MRB_YK_OUTLINE MRB_API void*
 mrb_malloc_simple(mrb_state *mrb, size_t len)
 {
   return mrb_realloc_simple(mrb, 0, len);
 }
 
-MRB_API void*
+MRB_YK_OUTLINE MRB_API void*
 mrb_calloc(mrb_state *mrb, size_t nelem, size_t len)
 {
   void *p;
@@ -410,7 +410,7 @@ mrb_calloc(mrb_state *mrb, size_t nelem, size_t len)
   return p;
 }
 
-MRB_API void
+MRB_YK_OUTLINE MRB_API void
 mrb_free(mrb_state *mrb, void *p)
 {
   mrb_basic_alloc_func(p, 0);
@@ -671,7 +671,7 @@ gc_protect(mrb_state *mrb, mrb_gc *gc, struct RBasic *p)
 }
 
 /* mrb_gc_protect() leaves the object in the arena */
-MRB_API void
+MRB_YK_OUTLINE MRB_API void
 mrb_gc_protect(mrb_state *mrb, mrb_value obj)
 {
   if (mrb_immediate_p(obj)) return;
@@ -857,7 +857,7 @@ mrb_obj_alloc_core(mrb_state *mrb, enum mrb_vtype ttype, struct RClass *cls)
   return &p->as.basic;
 }
 
-MRB_API struct RBasic*
+MRB_YK_OUTLINE MRB_API struct RBasic*
 mrb_obj_alloc(mrb_state *mrb, enum mrb_vtype ttype, struct RClass *cls)
 {
   if (cls) {
@@ -1200,7 +1200,7 @@ gc_mark_children(mrb_state *mrb, mrb_gc *gc, struct RBasic *obj)
   return children;
 }
 
-MRB_API void
+MRB_YK_OUTLINE MRB_API void
 mrb_gc_mark(mrb_state *mrb, struct RBasic *obj)
 {
   if (obj == 0) return;
@@ -1884,7 +1884,7 @@ incremental_gc_run(mrb_state *mrb, mrb_gc *gc)
  * task scheduler instead (GC.scheduler_driven = true, auto_step off), this
  * call silently no-ops. An embedder that needs unconditional collection must
  * use mrb_full_gc(). */
-MRB_API void
+MRB_YK_OUTLINE MRB_API void
 mrb_incremental_gc(mrb_state *mrb)
 {
   mrb_gc *gc = &mrb->gc;
@@ -1901,7 +1901,7 @@ mrb_incremental_gc(mrb_state *mrb)
 }
 
 /* Perform a full gc cycle */
-MRB_API void
+MRB_YK_OUTLINE MRB_API void
 mrb_full_gc(mrb_state *mrb)
 {
   mrb_gc *gc = &mrb->gc;
@@ -1967,7 +1967,7 @@ mrb_garbage_collect(mrb_state *mrb)
  *   Paint obj(Black) -> value(White) to obj(Black) -> value(Gray).
  */
 
-MRB_API void
+MRB_YK_OUTLINE MRB_API void
 mrb_field_write_barrier(mrb_state *mrb, struct RBasic *obj, struct RBasic *value)
 {
   mrb_gc *gc = &mrb->gc;
@@ -1998,7 +1998,7 @@ mrb_field_write_barrier(mrb_state *mrb, struct RBasic *obj, struct RBasic *value
  *   e.g. Set element on Array.
  */
 
-MRB_API void
+MRB_YK_OUTLINE MRB_API void
 mrb_write_barrier(mrb_state *mrb, struct RBasic *obj)
 {
   mrb_gc *gc = &mrb->gc;

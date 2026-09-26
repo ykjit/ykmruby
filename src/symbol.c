@@ -164,7 +164,7 @@ struct mrb_sym_hash_table {
 #else
 # define SYMBOL_INLINE_P(sym) ((sym) >= (1<<20))
 
-static const char pack_table[] = "_abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+MRB_YK_STATIC const char pack_table[] = "_abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 
 static mrb_sym
 sym_inline_pack(const char *name, size_t len)
@@ -1379,7 +1379,7 @@ sym_cmp(mrb_state *mrb, mrb_value s1)
 #undef lesser
 
 /* ---------------------------*/
-static const mrb_mt_entry symbol_rom_entries[] = {
+MRB_YK_STATIC const mrb_mt_entry symbol_rom_entries[] = {
   MRB_MT_ENTRY(sym_to_s,         MRB_SYM(to_s), MRB_ARGS_NONE()),  /* 15.2.11.3.3 */
   MRB_MT_ENTRY(sym_name,         MRB_SYM(name), MRB_ARGS_NONE()),
   MRB_MT_ENTRY(mrb_obj_itself,   MRB_SYM(to_sym), MRB_ARGS_NONE()),  /* 15.2.11.3.4 */

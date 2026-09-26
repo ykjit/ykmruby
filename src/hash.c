@@ -2481,7 +2481,7 @@ mrb_hash_eql(mrb_state *mrb, mrb_value hash)
 }
 
 /* ---------------------------*/
-static const mrb_mt_entry hash_rom_entries[] = {
+MRB_YK_STATIC const mrb_mt_entry hash_rom_entries[] = {
   MRB_MT_ENTRY(mrb_hash_equal,            MRB_OPSYM(eq),            MRB_ARGS_REQ(1)),                                    /* 15.2.13.4.1  */
   MRB_MT_ENTRY(mrb_hash_aget,             MRB_OPSYM(aref),          MRB_ARGS_REQ(1)),                                    /* 15.2.13.4.2  */
   MRB_MT_ENTRY(mrb_hash_aset,             MRB_OPSYM(aset),          MRB_ARGS_REQ(2)),                                    /* 15.2.13.4.3  */

@@ -13,11 +13,11 @@
 #include <mruby/hash.h>
 #include <mruby/internal.h>
 
-static const mrb_code call_iseq[] = {
+MRB_YK_STATIC const mrb_code call_iseq[] = {
   OP_CALL,
 };
 
-static const mrb_irep call_irep = {
+MRB_YK_STATIC const mrb_irep call_irep = {
   0,                                   /* nlocals */
   2,                                   /* nregs */
   0,                                   /* clen */
@@ -36,7 +36,7 @@ static const mrb_irep call_irep = {
 };
 
 mrb_alignas(8)
-static const struct RProc call_proc = {
+MRB_YK_STATIC const struct RProc call_proc = {
   NULL, MRB_TT_PROC, MRB_GC_RED, MRB_OBJ_IS_FROZEN, MRB_PROC_SCOPE | MRB_PROC_STRICT,
   { &call_irep }, NULL, { NULL }
 };
@@ -752,7 +752,7 @@ mrb_proc_merge_lvar(mrb_state *mrb, mrb_irep *irep, struct REnv *env, int num, c
 }
 
 /* ---------------------------*/
-static const mrb_mt_entry proc_rom_entries[] = {
+MRB_YK_STATIC const mrb_mt_entry proc_rom_entries[] = {
   MRB_MT_ENTRY(mrb_proc_init_copy, MRB_SYM(initialize_copy), MRB_ARGS_REQ(1) | MRB_MT_PRIVATE),
   MRB_MT_ENTRY(proc_arity,         MRB_SYM(arity),        MRB_ARGS_NONE()),  /* 15.2.17.4.2 */
   MRB_MT_ENTRY(proc_eql,           MRB_OPSYM(eq), MRB_ARGS_REQ(1)),

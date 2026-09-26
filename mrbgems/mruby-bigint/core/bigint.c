@@ -5375,7 +5375,7 @@ bint_norm(mrb_state *mrb, struct RBigint *b)
   return mrb_obj_value(b);
 }
 
-mrb_value
+MRB_YK_OUTLINE mrb_value
 mrb_bint_new_str(mrb_state *mrb, const char *x, mrb_int len, mrb_int base)
 {
   mpz_t z;
@@ -5746,7 +5746,7 @@ mrb_bint_div(mrb_state *mrb, mrb_value x, mrb_value y)
   return bint_norm(mrb, bint_new(ctx, &z));
 }
 
-mrb_value
+MRB_YK_OUTLINE mrb_value
 mrb_bint_add_ii(mrb_state *mrb, mrb_int x, mrb_int y)
 {
   mpz_t a, b, z;
@@ -5761,7 +5761,7 @@ mrb_bint_add_ii(mrb_state *mrb, mrb_int x, mrb_int y)
   return bint_norm(mrb, bint_new(ctx, &z));
 }
 
-mrb_value
+MRB_YK_OUTLINE mrb_value
 mrb_bint_sub_ii(mrb_state *mrb, mrb_int x, mrb_int y)
 {
   mpz_t a, b, z;
@@ -5776,7 +5776,7 @@ mrb_bint_sub_ii(mrb_state *mrb, mrb_int x, mrb_int y)
   return bint_norm(mrb, bint_new(ctx, &z));
 }
 
-mrb_value
+MRB_YK_OUTLINE mrb_value
 mrb_bint_mul_ii(mrb_state *mrb, mrb_int x, mrb_int y)
 {
   mpz_t a, b, z;

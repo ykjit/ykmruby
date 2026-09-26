@@ -13,6 +13,24 @@
   #endif
 #endif
 
+/* yk resolves globals the JIT loads from via dlsym, which only finds symbols
+ * with external linkage. */
+#ifdef USE_YK
+# define MRB_YK_STATIC
+#else
+# define MRB_YK_STATIC static
+#endif
+#ifdef USE_YK
+# define MRB_YK_OUTLINE __attribute__((noinline, yk_outline))
+#else
+# define MRB_YK_OUTLINE
+#endif
+#ifdef USE_YK
+# define MRB_YK_IDEMPOTENT __attribute__((yk_idempotent))
+#else
+# define MRB_YK_IDEMPOTENT
+#endif
+
 #ifdef __cplusplus
 #ifdef MRB_USE_CXX_ABI
 #define MRB_BEGIN_DECL
