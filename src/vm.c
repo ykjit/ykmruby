@@ -923,6 +923,18 @@ cipush(mrb_state *mrb, mrb_int push_stacks, uint8_t cci, struct RClass *target_c
   return ci;
 }
 
+/*
+This is a hack.
+We have an issue herewith a function that takes 8 arguments.
+yk j2 only handles the first 6 registers. So the rest of the arguments, came out as garbage..
+TODO: Add a clear error in yk or add support for more than 6 arguments in yk j2
+*/
+static __attribute__((noinline)) MRB_YK_OUTLINE mrb_callinfo*
+cipush_send(mrb_state *mrb, mrb_int push_stacks, struct RProc *blk, uint16_t argc)
+{
+  return cipush(mrb, push_stacks, CINFO_DIRECT, NULL, NULL, blk, 0, argc);
+}
+
 static void
 fiber_terminate(mrb_state *mrb, struct mrb_context *c, mrb_callinfo *ci)
 {
@@ -3990,7 +4002,7 @@ RETRY_TRY_BLOCK:
         regs[new_bidx] = blk;
       }
 
-      ci = cipush(mrb, a, CINFO_DIRECT, NULL, NULL, BLK_PTR(blk), 0, c);
+      ci = cipush_send(mrb, a, BLK_PTR(blk), c);
       recv = regs[0];
       ci->u.target_class = (insn == OP_SUPER) ? CI_TARGET_CLASS(ci - 1)->super : mrb_class(mrb, recv);
 #ifdef MRB_USE_REFINEMENTS
