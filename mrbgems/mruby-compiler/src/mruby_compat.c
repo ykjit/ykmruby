@@ -692,6 +692,9 @@ mrb_decode_insn(const mrb_code *pc)
   data.a = a;
   data.b = b;
   data.c = c;
+#ifdef USE_YK
+  data.next = pc;
+#endif
   return data;
 }
 

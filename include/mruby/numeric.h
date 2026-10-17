@@ -123,6 +123,13 @@ MRB_API char *mrb_int_to_cstr(char *buf, size_t len, mrb_int n, mrb_int base);
 #endif
 #endif
 
+/* YKFIXME: llvm.*.with.overflow returns a {result, flag} struct.
+  structs are not yet supported by yk j2 deopt.
+  */
+#ifdef USE_YK
+#undef MRB_HAVE_TYPE_GENERIC_CHECKED_ARITHMETIC_BUILTINS
+#endif
+
 #ifdef MRB_HAVE_TYPE_GENERIC_CHECKED_ARITHMETIC_BUILTINS
 
 static inline mrb_bool

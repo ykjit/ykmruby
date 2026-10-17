@@ -281,7 +281,7 @@ mrb_static_assert(MRB_GC_RED <= GC_COLOR_MASK);
 static size_t incremental_gc_finish(mrb_state *mrb, mrb_gc *gc);
 static size_t incremental_gc_run(mrb_state *mrb, mrb_gc *gc);
 
-MRB_API void*
+MRB_YK_OUTLINE MRB_API void*
 mrb_realloc_simple(mrb_state *mrb, void *p,  size_t len)
 {
   void *p2;
@@ -365,7 +365,7 @@ mrb_realloc_simple(mrb_state *mrb, void *p,  size_t len)
   return p2;
 }
 
-MRB_API void*
+MRB_YK_OUTLINE MRB_API void*
 mrb_realloc(mrb_state *mrb, void *p, size_t len)
 {
   void *p2;
@@ -377,19 +377,19 @@ mrb_realloc(mrb_state *mrb, void *p, size_t len)
   return p2;
 }
 
-MRB_API void*
+MRB_YK_OUTLINE MRB_API void*
 mrb_malloc(mrb_state *mrb, size_t len)
 {
   return mrb_realloc(mrb, 0, len);
 }
 
-MRB_API void*
+MRB_YK_OUTLINE MRB_API void*
 mrb_malloc_simple(mrb_state *mrb, size_t len)
 {
   return mrb_realloc_simple(mrb, 0, len);
 }
 
-MRB_API void*
+MRB_YK_OUTLINE MRB_API void*
 mrb_calloc(mrb_state *mrb, size_t nelem, size_t len)
 {
   void *p;
@@ -410,7 +410,7 @@ mrb_calloc(mrb_state *mrb, size_t nelem, size_t len)
   return p;
 }
 
-MRB_API void
+MRB_YK_OUTLINE MRB_API void
 mrb_free(mrb_state *mrb, void *p)
 {
   mrb_basic_alloc_func(p, 0);

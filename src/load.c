@@ -15,6 +15,9 @@
 #include <mruby/endian.h>
 #include <mruby/internal.h>
 #include <string.h>
+#ifdef USE_YK
+#include <mruby/yk.h>
+#endif
 
 #if SIZE_MAX < UINT32_MAX
 # error size_t must be at least 32 bits wide
@@ -141,6 +144,9 @@ irep_alloc_consolidated(mrb_state *mrb, uint16_t plen, uint16_t slen, uint16_t r
   irep = (mrb_irep*)block;
   irep->flags = MRB_IREP_CONSOLIDATED;
   irep->refcnt = 1;
+#ifdef USE_YK
+  mrb_yk_iseq_gen++;
+#endif
   if (plen > 0) irep->pool = (const mrb_irep_pool*)(block + pool_off);
   if (slen > 0) irep->syms = (const mrb_sym*)(block + syms_off);
   if (rlen > 0) irep->reps = (const struct mrb_irep *const*)(block + reps_off);
