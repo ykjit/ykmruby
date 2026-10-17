@@ -1,0 +1,97 @@
+<!doctype html>
+<meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>ykmruby AWFY history</title>
+<style>
+  body {
+    background: #fff;
+    color: #000;
+    margin: 16px
+  }
+
+  li {
+    font-family: monospace
+  }
+
+  .pair {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px
+  }
+
+  .pair div {
+    flex: 1 1 22rem;
+    aspect-ratio: 2;
+    max-width: 1200px
+  }
+</style>
+<h1>ykmruby Benchmarking Results</h1>
+Generated: @GENERATED
+<h2>Summary</h2>
+<div class=pair id=summary></div>
+<a href='#prs'>View measured PRs</a>
+<div id=benchmarks></div>
+<h2 id=prs>Measured PRs</h2>
+<ol id=prlist></ol>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script>
+  const SUMMARY = @SUMMARY, ROWS = @ROWS, REPO = '@REPO';
+  const t = r => Date.parse(r.date), day = r => r.date.slice(0, 10);
+  for (const a of [SUMMARY, ROWS]) a.sort((p, q) => t(p) - t(q));
+  const pt = (r, y) => ({ x: label(r), y, r });
+  const prUrl = n => `https://github.com/${REPO}/pull/${n}`;
+  const geomeanOf = new Map(SUMMARY.map(g => [g.pr, g.geomean]));
+  const el = (tag, props) => Object.assign(document.createElement(tag), props);
+
+  const label = r => `PR #${r.pr}`;
+
+  // Points are in time order, one x-axis category per PR.
+  function chart(parent, title, ylabel, color, pts) {
+    const div = el('div'), canvas = el('canvas');
+    div.append(canvas);
+    parent.append(div);
+    new Chart(canvas, {
+      type: 'line',
+      data: {
+        labels: pts.map(p => label(p.r)),
+        datasets: [{
+          data: pts, borderColor: color, borderWidth: 1, pointRadius: 5, pointHoverRadius: 7,
+          pointBackgroundColor: '#fff'
+        }]
+      },
+      options: {
+        maintainAspectRatio: false,
+        onClick: (e, els) => els.length && open(prUrl(pts[els[0].index].r.pr)),
+        scales: {
+          x: { offset: true, title: { display: true, text: 'PR' } },
+          y: { grace: '5%', title: { display: true, text: ylabel } }
+        },
+        plugins: {
+          title: { display: true, text: title, font: { size: 16, weight: 'normal' } },
+          legend: { display: false },
+          tooltip: { callbacks: { label: c => `${c.raw.y}  ${day(c.raw.r)}  ${c.raw.r.title}` } }
+        }
+      }
+    });
+  }
+
+  if (SUMMARY.length)
+    chart(document.getElementById('summary'),
+      'Performance relative to @BASE over all benchmarks (y < 1 means we are mostly faster)',
+      'Performance relative to @BASE', 'magenta', SUMMARY.map(g => pt(g, g.geomean)));
+
+  for (const b of [...new Set(ROWS.map(r => r.benchmark))].sort()) {
+    const rs = ROWS.filter(r => r.benchmark == b), last = rs.at(-1);
+    const pair = el('div', { className: 'pair' });
+    document.getElementById('benchmarks').append(el('h2', { textContent: b }),
+      el('p', { textContent: `Last PR is ${last.pr} (${day(last)})` }), pair);
+    chart(pair, 'Benchmark performance over time', 'Wallclock time (ms)', 'red', rs.map(r => pt(r, r.ms)));
+  }
+
+  new Map(ROWS.map(r => [r.pr, r])).forEach(r => {
+    const li = el('li');
+    li.append(`${day(r)} `, el('a', { href: prUrl(r.pr), textContent: `#${r.pr}` }),
+      ` ${r.title}`, geomeanOf.has(r.pr) ? ` (${geomeanOf.get(r.pr)})` : '');
+    document.getElementById('prlist').append(li);
+  });
+</script>
