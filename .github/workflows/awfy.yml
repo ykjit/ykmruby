@@ -5,6 +5,14 @@ name: AWFY history
 on:
   push:
     branches: [master]
+    # Trigger this check only when interpreter sources change
+    paths:
+      - 'src/**'
+      - 'include/**'
+      - 'mrblib/**'
+      - 'mrbgems/**'
+      - 'scripts/yk/awfy_history.*'
+      - '.github/workflows/awfy.yml'
   workflow_dispatch:
 
 permissions:
