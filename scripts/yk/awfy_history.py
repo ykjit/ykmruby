@@ -33,7 +33,7 @@ class PageTemplate(string.Template):
 class Pr(TypedDict):
     number: int
     title: str
-    date: str 
+    date: str
     ms: dict[str, float]  # {benchmark: median wallclock ms}
 
 
