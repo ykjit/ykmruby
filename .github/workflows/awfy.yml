@@ -1,0 +1,39 @@
+name: AWFY history
+
+# Rebuild the chart from the haste.zip attached to each merged PR's description.
+# A PR that gets its zip after merging needs a manual run (workflow_dispatch).
+on:
+  push:
+    branches: [master]
+    # Trigger this check only when interpreter sources change
+    paths:
+      - 'src/**'
+      - 'include/**'
+      - 'mrblib/**'
+      - 'mrbgems/**'
+      - 'scripts/yk/awfy_history.*'
+      - '.github/workflows/awfy.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+  pages: write
+  id-token: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: scripts/yk/awfy_history.py
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+      - id: deploy
+        uses: actions/deploy-pages@v4
