@@ -79,6 +79,7 @@ struct mrb_irep {
   uint16_t refcnt;
 #ifdef USE_YK
   void *yk_locs;
+  mrb_bool called;
 #endif
 };
 
