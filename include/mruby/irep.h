@@ -77,6 +77,10 @@ struct mrb_irep {
   uint16_t plen, slen;
   uint16_t rlen;
   uint16_t refcnt;
+#ifdef USE_YK
+  void *yk_locs;
+  mrb_bool called;
+#endif
 };
 
 #define MRB_ISEQ_NO_FREE 1
@@ -129,6 +133,9 @@ struct mrb_insn_data {
   uint16_t b;
   uint16_t c;
   const mrb_code *addr;
+#ifdef USE_YK
+  const mrb_code *next;
+#endif
 };
 
 #define mrb_irep_catch_handler_pack(n, v) uint32_to_bin(n, v)

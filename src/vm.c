@@ -20,6 +20,7 @@
 #include <mruby/throw.h>
 #include <mruby/dump.h>
 #include <mruby/internal.h>
+#include <mruby/yk.h>
 
 #ifdef MRB_NO_STDIO
 #if defined(__cplusplus)
@@ -891,6 +892,15 @@ cipush(mrb_state *mrb, mrb_int push_stacks, uint8_t cci, struct RClass *target_c
   return ci;
 }
 
+#ifdef USE_YK
+/* YKFIXME: cipush takes 8 arguments. This is not yet supported in yk */
+static MRB_YK_OUTLINE mrb_callinfo*
+cipush_send(mrb_state *mrb, mrb_int push_stacks, struct RProc *blk, uint16_t argc)
+{
+  return cipush(mrb, push_stacks, CINFO_DIRECT, NULL, NULL, blk, 0, argc);
+}
+#endif
+
 static void
 fiber_terminate(mrb_state *mrb, struct mrb_context *c, mrb_callinfo *ci)
 {
@@ -1175,11 +1185,34 @@ mrb_env_detach_all(mrb_state *mrb, struct mrb_context *c, mrb_bool resolve)
   }
 }
 
+#ifdef USE_YK
+#define YK_MARK_CALLED(irep) do { \
+  if (yk_is_interpreting()) { \
+    if (!(irep)->called) { \
+      ((mrb_irep*)(irep))->called = TRUE; \
+    } \
+    else { \
+      if (!(irep)->yk_locs) ((mrb_irep*)(irep))->yk_locs = yk_init_loc(mrb, (irep)); \
+      if (yk_location_is_null(((YkLocation*)(irep)->yk_locs)[0])) \
+        ((YkLocation*)(irep)->yk_locs)[0] = yk_location_new(); \
+    } \
+  } \
+} while (0)
+#else
+#define YK_MARK_CALLED(irep) do { } while (0)
+#endif
+
 static inline mrb_callinfo*
 cipop(mrb_state *mrb)
 {
   struct mrb_context *c = mrb->c;
   mrb_callinfo *ci = c->ci;
+
+#ifdef USE_YK
+  if (ci->proc && !MRB_PROC_CFUNC_P(ci->proc)) {
+    ((mrb_irep*)ci->proc->body.irep)->called = FALSE;
+  }
+#endif
 
   /* Fast path: no env and no blk (most common for simple method calls) */
   if (mrb_likely((!ci->u.env || ci->u.env->tt != MRB_TT_ENV) && !ci->blk)) {
@@ -2449,7 +2482,11 @@ prepare_tagged_break(mrb_state *mrb, uint32_t tag, const mrb_callinfo *return_ci
 #define INIT_DISPATCH for (;;) { CALL_CODE_HOOKS(); switch (insn) {
 #define CASE(insn,ops) case insn: DECODE_OPERANDS(ops); L_ ## insn ## _BODY:
 #define NEXT goto L_END_DISPATCH
+#ifdef USE_YK
+#define JUMP do { yk_pc = NULL; NEXT; } while (0)
+#else
 #define JUMP NEXT
+#endif
 #define END_DISPATCH L_END_DISPATCH: RETURN_IF_TASK_STOPPED(mrb);}}
 
 #else
@@ -2476,8 +2513,52 @@ prepare_tagged_break(mrb_state *mrb, uint32_t tag, const mrb_callinfo *return_ci
   } \
 } while (0)
 
+#ifdef USE_YK
+#define DECODE_OPERANDS(ops) do { const mrb_code *pc = insn_pc+1; FETCH_ ## ops (); ci->pc = pc; yk_pc = pc; } while (0)
+#else
 #define DECODE_OPERANDS(ops) do { const mrb_code *pc = ci->pc+1; FETCH_ ## ops (); ci->pc = pc; } while (0)
+#endif
+
+#ifdef USE_YK
+
+#define NOOPT_VAL(x) __asm__ volatile("" : "+r,m"(x) : : "memory")
+/* Same decoding as PEEK_*; `gen` keys the load so a reused iseq address misses. */
+__attribute__((yk_idempotent, noinline))
+uint32_t yk_peek_b(const mrb_code *pc, uint64_t gen) { NOOPT_VAL(gen); return PEEK_B(pc); }
+__attribute__((yk_idempotent, noinline))
+uint32_t yk_peek_s(const mrb_code *pc, uint64_t gen) { NOOPT_VAL(gen); return PEEK_S(pc); }
+__attribute__((yk_idempotent, noinline))
+uint32_t yk_peek_w(const mrb_code *pc, uint64_t gen) { NOOPT_VAL(gen); return PEEK_W(pc); }
+
+#undef READ_B
+#undef READ_S
+#undef READ_W
+#define READ_B() (yk_is_interpreting() ? PEEK_B(pc++) : yk_peek_b(pc++, yk_gen))
+#define READ_S() (pc+=2, yk_is_interpreting() ? PEEK_S(pc-2) : yk_peek_s(pc-2, yk_gen))
+#define READ_W() (pc+=3, yk_is_interpreting() ? PEEK_W(pc-3) : yk_peek_w(pc-3, yk_gen))
+
+#define CALL_CODE_HOOKS() do { \
+  if (!yk_pc) { \
+    irep = ci->proc->body.irep; \
+    yk_pc = ci->pc; \
+    yk_gen = mrb_yk_iseq_gen; \
+    if (!irep->yk_locs) ((mrb_irep*)irep)->yk_locs = yk_init_loc(mrb, irep); \
+  } \
+  YkLocation *yk_loc = &((YkLocation*)irep->yk_locs)[(size_t)(yk_pc - irep->iseq)]; \
+  yk_mt_control_point(yk_mt, yk_loc); \
+  if (yk_is_interpreting()) { \
+    insn_pc = yk_pc; \
+    insn = BYTECODE_DECODER(*insn_pc); \
+  } else { \
+    insn_pc = (const mrb_code*)yk_promote((void*)yk_pc); \
+    yk_gen = yk_promote(yk_gen); \
+    insn = BYTECODE_DECODER(yk_peek_b(insn_pc, yk_gen)); \
+  } \
+  CODE_FETCH_HOOK(mrb, irep, ci->pc, regs); \
+} while (0)
+#else
 #define CALL_CODE_HOOKS() do { insn = BYTECODE_DECODER(*ci->pc); CODE_FETCH_HOOK(mrb, irep, ci->pc, regs); } while (0)
+#endif // End of USE_YK
 
 #ifdef MRB_USE_TASK_SCHEDULER
 /* TRUE when the current context is executing across a C call boundary, i.e.
@@ -3232,6 +3313,7 @@ vm_call_proc(mrb_state *mrb, const struct RProc *p, mrb_int nargs,
     if (MRB_PROC_ENV_P(p)) {
       ci->stack[0] = MRB_PROC_ENV(p)->stack[0];
     }
+    YK_MARK_CALLED(irep);
     ci->pc = irep->iseq;
     *irepp = irep;
   }
@@ -3311,6 +3393,11 @@ mrb_vm_exec(mrb_state *mrb, const struct RProc *begin_proc, const mrb_code *iseq
   /* mrb_assert(MRB_PROC_CFUNC_P(begin_proc)) */
   const mrb_irep *irep = begin_proc->body.irep;
   mrb_code insn;
+#ifdef USE_YK
+  const mrb_code *insn_pc;
+  const mrb_code *yk_pc = NULL;
+  uint64_t yk_gen = 0;
+#endif
   int ai = mrb_gc_arena_save(mrb);
   struct mrb_jmpbuf *prev_jmp = mrb->jmp;
   struct mrb_jmpbuf c_jmp;
@@ -3319,7 +3406,6 @@ mrb_vm_exec(mrb_state *mrb, const struct RProc *begin_proc, const mrb_code *iseq
   uint16_t c;
   mrb_sym mid;
   const struct mrb_irep_catch_handler *ch;
-
 #ifndef MRB_USE_VM_SWITCH_DISPATCH
   static const void * const optable[] = {
 #define OPCODE(x,_) &&L_OP_ ## x,
@@ -3337,6 +3423,9 @@ mrb_vm_exec(mrb_state *mrb, const struct RProc *begin_proc, const mrb_code *iseq
 RETRY_TRY_BLOCK:
 
   MRB_TRY(&c_jmp) {
+#ifdef USE_YK
+  yk_pc = NULL;
+#endif
 
   if (mrb_unlikely(mrb->exc)) {
     mrb_gc_arena_restore(mrb, ai);
@@ -3801,7 +3890,11 @@ RETRY_TRY_BLOCK:
         stack_extend(mrb, irep->nregs);
         ci->pc = irep->iseq + mrb_irep_catch_handler_unpack(ch->target);
       }
+#ifdef USE_YK
+      JUMP;
+#else
       NEXT;
+#endif
     }
 
     CASE(OP_MATCHERR, B) {
@@ -3889,7 +3982,11 @@ RETRY_TRY_BLOCK:
         regs[new_bidx] = blk;
       }
 
+#ifdef USE_YK
+      ci = cipush_send(mrb, a, BLK_PTR(blk), c);
+#else
       ci = cipush(mrb, a, CINFO_DIRECT, NULL, NULL, BLK_PTR(blk), 0, c);
+#endif
       recv = regs[0];
       ci->u.target_class = (insn == OP_SUPER) ? CI_TARGET_CLASS(ci - 1)->super : mrb_class(mrb, recv);
 #ifdef MRB_USE_REFINEMENTS
@@ -3996,6 +4093,7 @@ RETRY_TRY_BLOCK:
           /* setup environment for calling method */
           irep = p->body.irep;
           stack_extend(mrb, (irep->nregs < 4) ? 4 : irep->nregs);
+          YK_MARK_CALLED(irep);
           ci->pc = irep->iseq;
           JUMP;
         }
@@ -4820,7 +4918,11 @@ RETRY_TRY_BLOCK:
         prepare_exec_strcat(mrb, a);
         ci = mrb->c->ci;
         irep = ci->proc->body.irep;
+#ifdef USE_YK
+        JUMP;
+#else
         break;
+#endif
       }
       NEXT;
     }
@@ -4968,6 +5070,7 @@ RETRY_TRY_BLOCK:
       irep = p->body.irep;
       stack_extend(mrb, irep->nregs);
       stack_clear(regs+1, irep->nregs-1);
+      YK_MARK_CALLED(irep);
       ci->pc = irep->iseq;
       JUMP;
     }
@@ -5064,7 +5167,11 @@ RETRY_TRY_BLOCK:
       const mrb_code *pc = ci->pc;
       insn = READ_B();
       switch (insn) {
+#ifdef USE_YK
+#define OPCODE(insn,ops) case OP_ ## insn: FETCH_ ## ops ## _1(); ci->pc = pc; yk_pc = pc; goto L_OP_ ## insn ## _BODY;
+#else
 #define OPCODE(insn,ops) case OP_ ## insn: FETCH_ ## ops ## _1(); ci->pc = pc; goto L_OP_ ## insn ## _BODY;
+#endif
 #include <mruby/ops.h>
 #undef OPCODE
       }
@@ -5074,7 +5181,11 @@ RETRY_TRY_BLOCK:
       const mrb_code *pc = ci->pc;
       insn = READ_B();
       switch (insn) {
+#ifdef USE_YK
+#define OPCODE(insn,ops) case OP_ ## insn: FETCH_ ## ops ## _2(); ci->pc = pc; yk_pc = pc; goto L_OP_ ## insn ## _BODY;
+#else
 #define OPCODE(insn,ops) case OP_ ## insn: FETCH_ ## ops ## _2(); ci->pc = pc; goto L_OP_ ## insn ## _BODY;
+#endif
 #include <mruby/ops.h>
 #undef OPCODE
       }
@@ -5084,7 +5195,11 @@ RETRY_TRY_BLOCK:
       const mrb_code *pc = ci->pc;
       insn = READ_B();
       switch (insn) {
+#ifdef USE_YK
+#define OPCODE(insn,ops) case OP_ ## insn: FETCH_ ## ops ## _3(); ci->pc = pc; yk_pc = pc; goto L_OP_ ## insn ## _BODY;
+#else
 #define OPCODE(insn,ops) case OP_ ## insn: FETCH_ ## ops ## _3(); ci->pc = pc; goto L_OP_ ## insn ## _BODY;
+#endif
 #include <mruby/ops.h>
 #undef OPCODE
       }

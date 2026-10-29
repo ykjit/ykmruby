@@ -13,6 +13,7 @@
 #include <mruby/string.h>
 #include <mruby/class.h>
 #include <mruby/internal.h>
+#include <mruby/yk.h>
 
 void mrb_init_core(mrb_state*);
 void mrb_init_mrbgems(mrb_state*);
@@ -52,6 +53,9 @@ mrb_open_core(void)
   *mrb = mrb_state_zero;
   mrb->atexit_stack_len = 0;
   mrb->bootstrapping = TRUE;
+#ifdef USE_YK
+  yk_init();
+#endif
 
   if (mrb_core_init_protect(mrb, init_gc_and_core, NULL)) {
     /* Return mrb with mrb->exc set for caller to inspect */
@@ -145,6 +149,9 @@ mrb_irep_free(mrb_state *mrb, mrb_irep *irep)
 
   if (irep->flags & MRB_IREP_NO_FREE) return;
   consolidated = (irep->flags & MRB_IREP_CONSOLIDATED) != 0;
+#ifdef USE_YK
+  yk_free_loc(mrb, irep);
+#endif
   if (!(irep->flags & MRB_ISEQ_NO_FREE))
     mrb_free(mrb, (void*)irep->iseq);
   if (irep->pool) {
@@ -227,6 +234,9 @@ mrb_add_irep(mrb_state *mrb)
   irep = (mrb_irep*)mrb_malloc(mrb, sizeof(mrb_irep));
   *irep = mrb_irep_zero;
   irep->refcnt = 1;
+#ifdef USE_YK
+  mrb_yk_iseq_gen++;
+#endif
 
   return irep;
 }
