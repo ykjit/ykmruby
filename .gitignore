@@ -34,6 +34,7 @@ gmon.out
 mruby-source-*.gem
 node_modules
 perf.data*
+/site
 tags
 /tools/unicode/data
 !Gemfile.lock
