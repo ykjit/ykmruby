@@ -1,0 +1,27 @@
+name: haste.zip reminder
+
+# The AWFY history page (awfy.yml) reads benchmark results from the haste.zip
+# linked in each merged PR's description. Not everyone has access to the
+# benchmarking machine, so remind rather than require.
+on:
+  pull_request_target:
+    types: [opened]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  remind:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Comment if the PR description does not link a haste.zip
+        env:
+          # Passed via env, not ${{ }} in the script, so the body cannot inject shell.
+          BODY: ${{ github.event.pull_request.body }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          if ! grep -qE 'https://github\.com/user-attachments/files/[0-9]+/haste\.zip' <<< "$BODY"; then
+            gh pr comment "$PR" --body "If you have AWFY results for this change, attach them as \`haste.zip\` to the PR description so they show up on the AWFY history page."
+          fi
