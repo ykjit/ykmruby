@@ -2476,6 +2476,11 @@ prepare_tagged_break(mrb_state *mrb, uint32_t tag, const mrb_callinfo *return_ci
 #define MRB_USE_VM_SWITCH_DISPATCH
 #endif
 #endif /* ifndef MRB_USE_VM_SWITCH_DISPATCH */
+#ifdef USE_YK
+#define JUMP_REL(off) do { ci->pc += (off); yk_pc += (off); NEXT; } while (0)
+#else
+#define JUMP_REL(off) do { ci->pc += (off); JUMP; } while (0)
+#endif
 
 #ifdef MRB_USE_VM_SWITCH_DISPATCH
 
@@ -3739,30 +3744,26 @@ RETRY_TRY_BLOCK:
 
     CASE(OP_JMP, S) {
       CHECK_VM_INTERRUPT(mrb);
-      ci->pc += (int16_t)a;
-      JUMP;
+      JUMP_REL((int16_t)a);
     }
     CASE(OP_JMPIF, BS) {
       if (mrb_test(regs[a])) {
         CHECK_VM_INTERRUPT(mrb);
-        ci->pc += (int16_t)b;
-        JUMP;
+        JUMP_REL((int16_t)b);
       }
       NEXT;
     }
     CASE(OP_JMPNOT, BS) {
       if (!mrb_test(regs[a])) {
         CHECK_VM_INTERRUPT(mrb);
-        ci->pc += (int16_t)b;
-        JUMP;
+        JUMP_REL((int16_t)b);
       }
       NEXT;
     }
     CASE(OP_JMPNIL, BS) {
       if (mrb_nil_p(regs[a])) {
         CHECK_VM_INTERRUPT(mrb);
-        ci->pc += (int16_t)b;
-        JUMP;
+        JUMP_REL((int16_t)b);
       }
       NEXT;
     }
