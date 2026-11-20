@@ -9,6 +9,7 @@
 
 YkMT *yk_mt = NULL;
 uint64_t mrb_yk_iseq_gen = 0;
+uint64_t mrb_yk_method_version = 0;
 YkLocation yk_null_loc;
 
 void yk_init(void)

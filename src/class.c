@@ -17,6 +17,7 @@
 #include <mruby/istruct.h>
 #include <mruby/opcode.h>
 #include <mruby/internal.h>
+#include <mruby/yk.h>
 
 /* mrb_mt_tbl, union mrb_mt_ptr, mrb_mt_entry defined in internal.h */
 #define MT_PROTECTED MRB_METHOD_PROTECTED_FL
@@ -3015,6 +3016,7 @@ mrb_define_module_function(mrb_state *mrb, struct RClass *c, const char *name, m
 MRB_API void
 mrb_method_cache_clear(mrb_state *mrb)
 {
+  MRB_YK_METHOD_VERSION_INC();
   static const struct mrb_cache_entry ce_zero ={0};
 
   for (int i=0; i<MRB_METHOD_CACHE_SIZE; i++) {
@@ -3026,6 +3028,7 @@ mrb_method_cache_clear(mrb_state *mrb)
 void
 mrb_mc_clear_by_class(mrb_state *mrb, struct RClass *c)
 {
+  MRB_YK_METHOD_VERSION_INC();
   struct mrb_cache_entry *mc = mrb->cache;
 
   for (int i=0; i<MRB_METHOD_CACHE_SIZE; mc++,i++) {
@@ -3036,6 +3039,7 @@ mrb_mc_clear_by_class(mrb_state *mrb, struct RClass *c)
 static void
 mc_clear_by_id(mrb_state *mrb, mrb_sym id)
 {
+  MRB_YK_METHOD_VERSION_INC();
   struct mrb_cache_entry *mc = mrb->cache;
 
   for (int i=0; i<MRB_METHOD_CACHE_SIZE; mc++,i++) {

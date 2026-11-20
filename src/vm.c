@@ -2535,6 +2535,18 @@ uint32_t yk_peek_s(const mrb_code *pc, uint64_t gen) { NOOPT_VAL(gen); return PE
 __attribute__((yk_idempotent, noinline))
 uint32_t yk_peek_w(const mrb_code *pc, uint64_t gen) { NOOPT_VAL(gen); return PEEK_W(pc); }
 
+__attribute__((yk_idempotent, noinline))
+uint32_t yk_find_method_flags(mrb_state *mrb, struct RClass *c, mrb_sym mid, uint64_t version)
+{ NOOPT_VAL(version); return mrb_vm_find_method(mrb, c, &c, mid).flags; }
+
+__attribute__((yk_idempotent, noinline))
+const struct RProc *yk_find_method_proc(mrb_state *mrb, struct RClass *c, mrb_sym mid, uint64_t version)
+{ NOOPT_VAL(version); return mrb_vm_find_method(mrb, c, &c, mid).as.proc; }
+
+__attribute__((yk_idempotent, noinline))
+struct RClass *yk_find_target_class(mrb_state *mrb, struct RClass *c, mrb_sym mid, uint64_t version)
+{ NOOPT_VAL(version); mrb_vm_find_method(mrb, c, &c, mid); return c; }
+
 #undef READ_B
 #undef READ_S
 #undef READ_W
@@ -4009,7 +4021,27 @@ RETRY_TRY_BLOCK:
       }
       else
 #endif
+#ifdef USE_YK
+      if (yk_is_interpreting()) {
+        m = mrb_vm_find_method(mrb, ci->u.target_class, &ci->u.target_class, mid);
+      }
+      else {
+        mrb_state *kmrb = (mrb_state*)yk_promote((void*)mrb);
+        struct RClass *kc = (struct RClass*)yk_promote((void*)ci->u.target_class);
+        mrb_sym kmid = yk_promote(mid);
+        uint64_t kversion = yk_promote(mrb_yk_method_version);
+        /* These three calls give the same results as one mrb_vm_find_method
+           call:
+           1. m.flags -  the `flags` it passes to create_method_value.
+           2. m.as.proc - the `ptr` it passes to create_method_value.
+           3. ci->u.target_class - the target class it updated as `*cp = c`. */
+        m.flags = yk_find_method_flags(kmrb, kc, kmid, kversion);
+        m.as.proc = yk_find_method_proc(kmrb, kc, kmid, kversion);
+        ci->u.target_class = yk_find_target_class(kmrb, kc, kmid, kversion);
+      }
+#else
       m = mrb_vm_find_method(mrb, ci->u.target_class, &ci->u.target_class, mid);
+#endif
       if (mrb_unlikely(MRB_METHOD_UNDEF_P(m))) {
         m = prepare_missing(mrb, ci, recv, mid, (insn == OP_SUPER));
       }

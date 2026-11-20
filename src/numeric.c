@@ -1149,7 +1149,9 @@ flo_round(mrb_state *mrb, mrb_value num)
 }
 
 /* 15.2.9.3.14 */
-static mrb_value
+/* YKFIXME: outlined because yk x64 cannot yet compile what this
+   lowers to: `freeze` of a double and `fpclass` for isinf(). */
+static MRB_YK_OUTLINE mrb_value
 flo_to_i(mrb_state *mrb, mrb_value num)
 {
   mrb_float f = mrb_float(num);
