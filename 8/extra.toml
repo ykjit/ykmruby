@@ -1,0 +1,14 @@
+comment = "ykmruby_fork method lookups"
+date = "2026-11-15T16:48:56Z"
+
+[executors]
+mruby = "/home/pd/research/ykmruby-fork/build/yk_build_config/bin/mruby"
+
+[suite_env.awfy]
+
+[machine]
+os = "Linux (Debian GNU/Linux 13)"
+cpu = "Intel(R) Xeon(R) Platinum 8452Y"
+memory = "345.9 GiB"
+arch = "x86_64"
+cpu_count = "72"
