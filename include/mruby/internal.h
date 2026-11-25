@@ -63,6 +63,8 @@ mrb_value mrb_false_to_s(mrb_state *, mrb_value);
 mrb_value mrb_flo_to_s(mrb_state *, mrb_value);
 #endif
 void mrb_method_added(mrb_state *mrb, struct RClass *c, mrb_sym mid);
+mrb_value mrb_mod_define_method_m(mrb_state *mrb, struct RClass *c);
+void mrb_mod_define_method_scoped(mrb_state *mrb, struct RClass *c, mrb_sym mid, mrb_method_t m);
 mrb_noreturn void mrb_method_missing(mrb_state *mrb, mrb_sym name, mrb_value self, mrb_value args);
 mrb_method_t mrb_vm_find_method(mrb_state *mrb, struct RClass *c, struct RClass **cp, mrb_sym mid);
 #ifdef MRB_USE_REFINEMENTS
@@ -99,7 +101,7 @@ mrb_value mrb_obj_equal_m(mrb_state *mrb, mrb_value);
 /* debug */
 size_t mrb_packed_int_len(uint32_t num);
 size_t mrb_packed_int_encode(uint32_t num, uint8_t *p);
-uint32_t mrb_packed_int_decode(const uint8_t *p, const uint8_t **newpos);
+uint32_t mrb_packed_int_decode(const uint8_t *p, const uint8_t *end, const uint8_t **newpos);
 
 
 /* codedump */
@@ -110,9 +112,16 @@ void mrb_codedump_all_file(mrb_state *mrb, struct RProc *proc, FILE *out);
 
 /* error */
 mrb_noreturn void mrb_raise_nomemory(mrb_state *mrb);
+mrb_noreturn void mrb_no_method_error_recv(mrb_state *mrb, mrb_sym id, mrb_value recv, mrb_value args, const char *fmt, ...);
+mrb_noreturn void mrb_name_error_recv(mrb_state *mrb, mrb_sym id, mrb_value recv, const char *fmt, ...);
 mrb_value mrb_exc_inspect(mrb_state *mrb, mrb_value exc);
 mrb_value mrb_exc_backtrace(mrb_state *mrb, mrb_value exc);
+mrb_noreturn void mrb_exc_raise_with_cause(mrb_state *mrb, mrb_value exc, mrb_value cause);
 mrb_value mrb_get_backtrace(mrb_state *mrb);
+mrb_value mrb_get_packed_backtrace(mrb_state *mrb);
+mrb_value mrb_exc_packed_backtrace(mrb_state *mrb, mrb_value exc);
+mrb_int mrb_backtrace_len(mrb_value bt);
+mrb_bool mrb_backtrace_location(mrb_state *mrb, mrb_value bt, mrb_int i, const char **file, int32_t *lineno, mrb_sym *mid, mrb_value *str);
 void mrb_exc_mesg_set(mrb_state *mrb, struct RException *exc, mrb_value mesg);
 mrb_value mrb_exc_mesg_get(mrb_state *mrb, struct RException *exc);
 mrb_value mrb_f_raise(mrb_state*, mrb_value);
@@ -136,6 +145,30 @@ size_t mrb_gc_mark_mt(mrb_state*, struct RClass*);
 int mrb_equal_in_c(mrb_state*, mrb_value, mrb_value);
 void mrb_gc_each_live_object(mrb_state*, int (*)(mrb_state*, struct RBasic*, void*), void*);
 void mrb_gc_free_mt(mrb_state*, struct RClass*);
+#ifdef MRB_USE_GC_WEAK
+/* A table that holds objects weakly, defined by a gem that sets
+   MRB_USE_GC_WEAK: what it holds is not marked through it, and `clear` is
+   called once marking is complete, before the sweep, to drop each object
+   mrb_gc_weak_dead_p() reports. `clear` may neither allocate nor run Ruby
+   code. `after`, unless NULL, is called by GC.start once it has collected,
+   and may run Ruby code. `syms`, unless NULL, is called by the symbol GC,
+   and calls `mark` with each value the table keeps that may be a Symbol:
+   an immediate is never dropped, so the table may be its only holder. The
+   table owns the node and links it with mrb_gc_weak_add(), and unlinks it
+   before the node is freed. */
+struct mrb_gc_weak {
+  struct mrb_gc_weak *prev, *next;
+  void (*clear)(mrb_state *mrb, struct mrb_gc_weak *weak);
+  void (*after)(mrb_state *mrb, struct mrb_gc_weak *weak);
+  void (*syms)(mrb_state *mrb, struct mrb_gc_weak *weak,
+               void (*mark)(mrb_state *mrb, mrb_value v));
+};
+void mrb_gc_weak_add(mrb_state *mrb, struct mrb_gc_weak *weak);
+void mrb_gc_weak_remove(mrb_state *mrb, struct mrb_gc_weak *weak);
+/* Only in a `clear` callback: whether `v`, which the table holds, is to be
+   freed by this sweep. An immediate value never is. */
+mrb_bool mrb_gc_weak_dead_p(mrb_state *mrb, mrb_value v);
+#endif
 
 /* hash */
 size_t mrb_hash_memsize(mrb_value obj);
@@ -216,8 +249,13 @@ mrb_value mrb_rational_hash(mrb_state *mrb, mrb_value rat);
 void mrb_rational_copy(mrb_state *mrb, mrb_value x, mrb_value y);
 int mrb_rational_mark(mrb_state *mrb, struct RBasic *rat);
 #endif
+#ifdef MRB_USE_COERCE
+mrb_value mrb_num_coerce_bin(mrb_state *mrb, mrb_value x, mrb_value y, mrb_sym op);
+#endif
 #ifdef MRB_USE_SET
 size_t mrb_gc_mark_set(mrb_state *mrb, struct RBasic *set);
+/* calls `func` with each element of a Set, for the symbol GC */
+void mrb_set_foreach(mrb_state *mrb, struct RBasic *set, void (*func)(mrb_state*, mrb_value, void*), void *data);
 void mrb_gc_free_set(mrb_state *mrb, struct RBasic *set);
 size_t mrb_set_memsize(mrb_value);
 #endif
@@ -393,6 +431,14 @@ size_t mrb_gc_mark_range(mrb_state *mrb, struct RRange *r);
 #endif
 
 /* string */
+
+/*
+ *  Converts `obj` to a string.
+ *  The difference from `mrb_obj_as_string()` is that, if there is no
+ *  mruby's built-in function to convert the object to a string, it returns
+ *  `mrb_undef_value()` instead of calling the `#to_s` method.
+ */
+mrb_value mrb_obj_as_string_nomethod(mrb_state *mrb, mrb_value obj);
 
 /* Writing what a string's bytes are read as, and what reading them came back
    with. mruby/string.h hands both fields back to anyone who asks, since what
@@ -845,10 +891,21 @@ mrb_value mrb_vm_special_get(mrb_state*, mrb_sym);
 void mrb_vm_special_set(mrb_state*, mrb_sym, mrb_value);
 mrb_value mrb_vm_cv_get(mrb_state*, mrb_sym);
 void mrb_vm_cv_set(mrb_state*, mrb_sym, mrb_value);
-mrb_value mrb_vm_const_get(mrb_state*, mrb_sym);
+mrb_value mrb_vm_const_get(mrb_state*, mrb_sym, mrb_bool *cachep);
 mrb_bool mrb_vm_const_defined_p(mrb_state *mrb, mrb_callinfo *ci, mrb_sym sym);
-mrb_value mrb_vm_const_get_noraise(mrb_state *mrb, mrb_callinfo *ci, mrb_sym sym);
-mrb_value mrb_const_get_noraise(mrb_state *mrb, struct RClass *mod, mrb_sym sym);
+mrb_value mrb_vm_const_get_noraise(mrb_state *mrb, mrb_callinfo *ci, mrb_sym sym, mrb_bool load);
+mrb_value mrb_const_get_noraise(mrb_state *mrb, struct RClass *mod, mrb_sym sym, mrb_bool load);
+mrb_value mrb_vm_const_get_path(mrb_state *mrb, mrb_value mod, mrb_sym sym);
+/* the marks Module#private_constant and #deprecate_constant leave */
+#define MRB_CONST_PRIVATE    1
+#define MRB_CONST_DEPRECATED 2
+int mrb_const_flags(mrb_state *mrb, struct RClass *c, mrb_sym sym);
+void mrb_const_flags_set(mrb_state *mrb, struct RClass *c, mrb_sym sym, int flag, mrb_bool on);
+void mrb_const_flags_copy(mrb_state *mrb, struct RClass *dst, struct RClass *src);
+mrb_bool mrb_const_lookup_at(mrb_state *mrb, struct RClass *c, mrb_sym sym, mrb_value *vp, mrb_bool load);
+void mrb_autoload_define(mrb_state *mrb, struct RClass *c, mrb_sym sym, mrb_value path);
+mrb_value mrb_autoload_path(mrb_state *mrb, struct RClass *c, mrb_sym sym, mrb_bool inherit);
+mrb_bool mrb_autoload_p(mrb_value v);
 mrb_bool mrb_vm_cv_defined_p(mrb_state *mrb, const struct RProc *proc, mrb_sym sym);
 struct RClass *mrb_vm_cref_class(mrb_state *mrb, mrb_callinfo *ci);
 struct RClass *mrb_vm_definee_class(mrb_state *mrb, mrb_callinfo *ci);
@@ -876,6 +933,52 @@ mrb_value mrb_exc_const_get(mrb_state *mrb, mrb_sym sym);
 
 /* GC functions */
 void mrb_gc_mark_gv(mrb_state*);
+/* A String, Array, Struct, Set, Fiber, Proc or inline struct has no iv slot in
+   its struct, so its instance variables live in a side table keyed by the
+   object (variable.c). The table exists only once such an object has been
+   given an ivar. */
+static inline mrb_bool
+mrb_obj_iv_slot_p(enum mrb_vtype tt)
+{
+  switch (tt) {
+    case MRB_TT_OBJECT:
+    case MRB_TT_CLASS:
+    case MRB_TT_MODULE:
+    case MRB_TT_SCLASS:
+    case MRB_TT_HASH:
+    case MRB_TT_CDATA:
+    case MRB_TT_EXCEPTION:
+      return TRUE;
+    default:
+      return FALSE;
+  }
+}
+/* Set on an object with an entry in the side table, so that nothing else has
+   to look it up. A Proc uses every flag bit, this one included (see
+   MRB_PROC_CASPEC_MASK), so Procs are looked up, but only once a Proc has been
+   given an ivar (mrb_gc.giv_proc). */
+#define MRB_FL_HAS_GIV (1 << 19)
+static inline mrb_bool
+mrb_gc_giv_p(mrb_state *mrb, struct RBasic *obj)
+{
+  if (!mrb->giv) return FALSE;
+  switch (obj->tt) {
+    case MRB_TT_STRING:
+    case MRB_TT_ARRAY:
+    case MRB_TT_STRUCT:
+    case MRB_TT_SET:
+    case MRB_TT_FIBER:
+    case MRB_TT_ISTRUCT:
+      return MRB_FLAG_TEST(obj, MRB_FL_HAS_GIV) != 0;
+    case MRB_TT_PROC:
+      return mrb->gc.giv_proc;
+    default:
+      return FALSE;
+  }
+}
+size_t mrb_gc_mark_giv(mrb_state *mrb, struct RBasic *obj);
+void mrb_gc_free_giv(mrb_state *mrb, struct RBasic *obj);
+void mrb_gc_free_giv_all(mrb_state *mrb);
 void mrb_gc_free_gv(mrb_state*);
 size_t mrb_gc_mark_iv(mrb_state*, struct RObject*);
 void mrb_gc_free_iv(mrb_state*, struct RObject*);
@@ -1030,6 +1133,7 @@ mrb_int mrb_bint_cmp(mrb_state *mrb, mrb_value x, mrb_value y);
 void mrb_gc_free_bint(mrb_state *mrb, struct RBasic *x);
 void mrb_bint_copy(mrb_state *mrb, mrb_value x, mrb_value y);
 size_t mrb_bint_memsize(mrb_value x);
+size_t mrb_bint_abs_bytes(mrb_value x);
 mrb_value mrb_bint_hash(mrb_state *mrb, mrb_value x);
 mrb_value mrb_bint_sqrt(mrb_state *mrb, mrb_value x);
 /* The bytes mrb_bint_new_bytes() takes to build a Bignum the size of this
@@ -1051,6 +1155,12 @@ mrb_value mrb_bint_abs(mrb_state *mrb, mrb_value x);
 #ifdef MRB_USE_TASK_SCHEDULER
 /* GC marking for task scheduler */
 void mrb_task_mark_all(mrb_state *mrb);
+/* calls `ctx` with each task's context and `val` with its values, for the
+   symbol GC */
+void mrb_task_foreach(mrb_state *mrb, void (*ctx)(mrb_state*, struct mrb_context*),
+                      void (*val)(mrb_state*, mrb_value));
+/* vm.c: whether the running task can be switched away from here */
+mrb_bool mrb_task_across_c_boundary(mrb_state *mrb);
 #endif
 
 /* Internal object allocation without type validation (gc.c) */

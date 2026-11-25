@@ -337,6 +337,7 @@ complex_s_rect(mrb_state *mrb, mrb_value self)
 static mrb_value
 complex_float_to_i(mrb_state *mrb, mrb_value self, mrb_float f)
 {
+  mrb_check_num_exact(mrb, f);
 #ifdef MRB_USE_BIGINT
   if (!FIXABLE_FLOAT(f)) {
     return mrb_bint_new_float(mrb, f);
@@ -845,15 +846,17 @@ mrb_complex_div(mrb_state *mrb, mrb_value self, mrb_value rhs)
     return complex_new(mrb, F(ldexp)(zr_p.s, zr_p.x), F(ldexp)(zi_p.s, zi_p.x));
   }
   else {
+    /* mrb_div_float(): a zero divisor (both parts zero) is NaN, as
+       elsewhere, without a C division by zero */
     if (F(fabs)(br) > F(fabs)(bi)) {
       r = bi / br;
       den = br + r * bi;
-      return complex_new(mrb, (ar + ai * r) / den, (ai - ar * r) / den);
+      return complex_new(mrb, mrb_div_float(ar + ai * r, den), mrb_div_float(ai - ar * r, den));
     }
     else {
-      r = br / bi;
+      r = mrb_div_float(br, bi);
       den = bi + r * br;
-      return complex_new(mrb, (ar * r + ai) / den, (ai * r - ar) / den);
+      return complex_new(mrb, mrb_div_float(ar * r + ai, den), mrb_div_float(ai * r - ar, den));
     }
   }
 }

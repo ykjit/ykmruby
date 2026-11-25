@@ -6,7 +6,9 @@
 
 #ifdef _MSC_VER
 # define _CRT_NONSTDC_NO_DEPRECATE
-# define WIN32_LEAN_AND_MEAN
+# ifndef WIN32_LEAN_AND_MEAN
+#  define WIN32_LEAN_AND_MEAN
+# endif
 #endif
 
 #include <mruby.h>
@@ -3129,6 +3131,16 @@ mrb_str_intern(mrb_state *mrb, mrb_value self)
 MRB_API mrb_value
 mrb_obj_as_string(mrb_state *mrb, mrb_value obj)
 {
+  mrb_value ret = mrb_obj_as_string_nomethod(mrb, obj);
+  if (mrb_undef_p(ret)) {
+    ret = mrb_type_convert(mrb, obj, MRB_TT_STRING, MRB_SYM(to_s));
+  }
+  return ret;
+}
+
+mrb_value
+mrb_obj_as_string_nomethod(mrb_state *mrb, mrb_value obj)
+{
   switch (mrb_type(obj)) {
   case MRB_TT_STRING:
     return obj;
@@ -3149,7 +3161,7 @@ mrb_obj_as_string(mrb_state *mrb, mrb_value obj)
   case MRB_TT_TRUE:
     return mrb_true_to_s(mrb, obj);
   default:
-    return mrb_type_convert(mrb, obj, MRB_TT_STRING, MRB_SYM(to_s));
+    return mrb_undef_value();
   }
 }
 
@@ -3681,9 +3693,14 @@ mrb_str_len_to_integer(mrb_state *mrb, const char *str, size_t len, mrb_int base
     if (mrb_int_mul_overflow(n, base, &n)) goto overflow;
     if (MRB_INT_MAX - c < n) {
       if (sign == 0 && MRB_INT_MAX - n == c - 1) {
-        n = MRB_INT_MIN;
-        sign = 1;
-        break;
+        /* MRB_INT_MIN fits, if no digit follows (past one '_') */
+        const char *q = (p+1 < pend && p[1] == '_') ? p+2 : p+1;
+        if (q >= pend || conv_digit(*q) < 0 || conv_digit(*q) >= base) {
+          n = MRB_INT_MIN;
+          sign = 1;
+          p++;                  /* past the last digit, for trailingbad() */
+          break;
+        }
       }
     overflow:
 #ifdef MRB_USE_BIGINT
@@ -3691,12 +3708,19 @@ mrb_str_len_to_integer(mrb_state *mrb, const char *str, size_t len, mrb_int base
       const char *p3 = p2;
       while (p3 < pend) {
         char c = TOLOWER(*p3);
+        if (c == '_') {
+          /* "__" ends the number, as in the loop above */
+          if (p3 + 1 < pend && p3[1] == '_') break;
+          p3++;
+          continue;
+        }
         const char *p4 = strchr(mrb_digitmap, c);
-        if (p4 == NULL && c != '_') break;
+        if (p4 == NULL) break;
         if (p4 - mrb_digitmap >= base) break;
         p3++;
       }
-      if (badcheck && trailingbad(str, p, pend)) goto bad;
+      /* p is where the overflow was found, not where the digits end */
+      if (badcheck && trailingbad(str, p3, pend)) goto bad;
       return mrb_bint_new_str(mrb, p2, (mrb_int)(p3-p2), sign ? base : -base);
 #else
       mrb_raisef(mrb, E_RANGE_ERROR, "string (%l) too big for integer", str, pend-str);
@@ -3830,14 +3854,18 @@ mrb_str_to_i(mrb_state *mrb, mrb_value self)
 static double
 mrb_str_len_to_dbl(mrb_state *mrb, const char *s, size_t len, mrb_bool badcheck)
 {
-  char buf[DBL_DIG * 4 + 20];
+  char sbuf[DBL_DIG * 4 + 20];
+  char *heap = NULL;
+  char *buf = sbuf;
   const char *p = s, *p2;
   const char *pend = p + len;
+  const char *parse;
+  const char *parse_end;
   char *end;
   char *n;
   char prev = 0;
   double d;
-  mrb_bool dot = FALSE;
+  mrb_bool strip_us = FALSE;
 
   if (!p) return 0.0;
   while (p<pend && ISSPACE(*p)) p++;
@@ -3848,11 +3876,11 @@ mrb_str_len_to_dbl(mrb_state *mrb, const char *s, size_t len, mrb_bool badcheck)
 
     if (!badcheck) return 0.0;
     x = mrb_str_len_to_integer(mrb, p, pend-p, 0, badcheck);
-    if (mrb_integer_p(x))
-      d = (double)mrb_integer(x);
-    else /* if (mrb_float_p(x)) */
-      d = mrb_float(x);
-    return d;
+#ifdef MRB_USE_BIGINT
+    if (mrb_bigint_p(x))
+      return mrb_bint_as_float(mrb, x);
+#endif
+    return (double)mrb_integer(x);
   }
   while (p < pend) {
     if (!*p) {
@@ -3861,57 +3889,73 @@ mrb_str_len_to_dbl(mrb_state *mrb, const char *s, size_t len, mrb_bool badcheck)
         /* not reached */
       }
       pend = p;
-      p = p2;
-      goto nocopy;
+      parse = p2;
+      parse_end = pend;
+      goto parse;
     }
     if (!badcheck && *p == ' ') {
       pend = p;
-      p = p2;
-      goto nocopy;
+      parse = p2;
+      parse_end = pend;
+      goto parse;
     }
-    if (*p == '_') break;
+    if (*p == '_') {
+      strip_us = TRUE;
+      break;
+    }
     p++;
   }
-  p = p2;
-  n = buf;
-  while (p < pend) {
-    char c = *p++;
-    if (c == '.') dot = TRUE;
-    if (c == '_') {
-      /* remove an underscore between digits */
-      if (n == buf || !ISDIGIT(prev) || p == pend) {
-        if (badcheck) goto bad;
-        break;
-      }
+  {
+    size_t copylen = (size_t)(pend - p2);
+    size_t bufsize = copylen + 1;
+
+    if (bufsize > sizeof(sbuf))
+      buf = heap = (char*)mrb_malloc(mrb, bufsize);
+    if (!strip_us) {
+      memcpy(buf, p2, copylen);
+      buf[copylen] = '\0';
+      parse = buf;
+      parse_end = buf + copylen;
     }
-    else if (badcheck && prev == '_' && !ISDIGIT(c)) goto bad;
     else {
-      const char *bend = buf+sizeof(buf)-1;
-      if (n==bend) {            /* buffer overflow */
-        if (dot) break;         /* cut off remaining fractions */
-        return INFINITY;
+      p = p2;
+      n = buf;
+      while (p < pend) {
+        char c = *p++;
+
+        if (c == '_') {
+          /* remove an underscore between digits */
+          if (n == buf || !ISDIGIT(prev) || p == pend) {
+            if (badcheck) goto bad;
+            break;
+          }
+        }
+        else if (badcheck && prev == '_' && !ISDIGIT(c)) goto bad;
+        else *n++ = c;
+        prev = c;
       }
-      *n++ = c;
+      *n = '\0';
+      parse = buf;
+      parse_end = n;
     }
-    prev = c;
   }
-  *n = '\0';
-  p = buf;
-  pend = n;
-nocopy:
-  if (mrb_read_float(p, &end, &d) == FALSE) {
+parse:
+  if (mrb_read_float(parse, &end, &d) == FALSE) {
     if (badcheck) {
 bad:
+      if (heap) mrb_free(mrb, heap);
       mrb_raisef(mrb, E_ARGUMENT_ERROR, "invalid string for float(%!s)", s);
       /* not reached */
     }
+    if (heap) mrb_free(mrb, heap);
     return 0.0;
   }
   if (badcheck) {
-    if (!end || p == end) goto bad;
-    while (end<pend && ISSPACE(*end)) end++;
-    if (end<pend) goto bad;
+    if (!end || parse == end) goto bad;
+    while (end<parse_end && ISSPACE(*end)) end++;
+    if (end<parse_end) goto bad;
   }
+  if (heap) mrb_free(mrb, heap);
   return d;
 }
 
@@ -4486,6 +4530,13 @@ str_bytesplice(mrb_state *mrb, mrb_value str, mrb_int idx1, mrb_int len1, mrb_va
      mrb_str_modify() would have made is not lost. */
   if (idx1 == RSTR_LEN(s)) {
     return mrb_str_cat(mrb, str, RSTRING_PTR(replace) + idx2, (size_t)len2);
+  }
+
+  /* The bytes spliced in are read after the tail has moved to make room for
+     them. When they are the receiver's own, those past the range replaced
+     have moved with it, so keep what the receiver held at the call. */
+  if (mrb_str_ptr(replace) == s) {
+    replace = mrb_str_dup(mrb, replace);
   }
 
   mrb_str_modify(mrb, s);

@@ -461,6 +461,50 @@ mrb_object_dead_p(mrb_state *mrb, struct RBasic *object)
   return is_dead(gc, object);
 }
 
+#ifdef MRB_USE_GC_WEAK
+void
+mrb_gc_weak_add(mrb_state *mrb, struct mrb_gc_weak *weak)
+{
+  mrb_gc *gc = &mrb->gc;
+
+  weak->prev = NULL;
+  weak->next = gc->weaks;
+  if (gc->weaks) gc->weaks->prev = weak;
+  gc->weaks = weak;
+}
+
+void
+mrb_gc_weak_remove(mrb_state *mrb, struct mrb_gc_weak *weak)
+{
+  mrb_gc *gc = &mrb->gc;
+
+  if (weak->prev) weak->prev->next = weak->next;
+  else if (gc->weaks == weak) gc->weaks = weak->next;
+  else return;                  /* not linked */
+  if (weak->next) weak->next->prev = weak->prev;
+  weak->prev = weak->next = NULL;
+}
+
+/* An object a weak table holds is one the heap holds, so the page walk of
+   mrb_object_dead_p() is not needed. */
+mrb_bool
+mrb_gc_weak_dead_p(mrb_state *mrb, mrb_value v)
+{
+  if (mrb_immediate_p(v)) return FALSE;
+  return is_dead(&mrb->gc, mrb_basic_ptr(v));
+}
+
+/* marking is complete: each weak table drops what nothing marked, before
+   the sweep frees it */
+static void
+gc_clear_weaks(mrb_state *mrb, mrb_gc *gc)
+{
+  for (struct mrb_gc_weak *w = gc->weaks; w; w = w->next) {
+    w->clear(mrb, w);
+  }
+}
+#endif
+
 static void
 link_heap_page(mrb_gc *gc, mrb_heap_page *page)
 {
@@ -584,6 +628,9 @@ mrb_gc_init(mrb_state *mrb, mrb_gc *gc)
   gc->heaps = NULL;
   gc->free_heaps = NULL;
   gc->regions = NULL;
+#ifdef MRB_USE_GC_WEAK
+  gc->weaks = NULL;
+#endif
   add_heap(mrb, gc);
   gc->interval_ratio = DEFAULT_GC_INTERVAL_RATIO;
   gc->step_ratio = DEFAULT_GC_STEP_RATIO;
@@ -830,8 +877,25 @@ mrb_obj_alloc_core(mrb_state *mrb, enum mrb_vtype ttype, struct RClass *cls)
       }
       size_t slack = capacity/10;
       if (slack < MRB_HEAP_PAGE_SIZE/2) slack = MRB_HEAP_PAGE_SIZE/2;
-      if (gc->live_after_mark + slack < capacity) {
+
+      /* live_after_mark is refreshed only when a cycle completes, so while
+         the live set grows between cycles it falls behind, and the test above
+         came true at every tenth of growth: a heap building a large structure
+         paid a full collection of nearly all live objects for each tenth it
+         grew, freeing a few percent each time (#7651). A reclaim that finds
+         less garbage than the slack it looked for is evidence the heap is
+         live, so the next one waits until the heap has grown by half again,
+         which keeps the cost to a constant number of collections per doubling.
+         A heap that shrank since has had its garbage collected, and the
+         verdict no longer applies. A heap mostly garbage frees enough each
+         time and is never held. */
+      if (capacity < gc->reclaim_hold) gc->reclaim_hold = 0;
+      if (gc->live_after_mark + slack < capacity &&
+          (gc->reclaim_hold == 0 || capacity >= gc->reclaim_hold + gc->reclaim_hold/2)) {
+        size_t before = gc->live;
         mrb_full_gc(mrb);
+        size_t freed = before > gc->live ? before - gc->live : 0;
+        gc->reclaim_hold = freed < slack ? capacity : 0;
       }
     }
     if (gc->free_heaps == NULL) {
@@ -973,6 +1037,9 @@ gc_mark_children(mrb_state *mrb, mrb_gc *gc, struct RBasic *obj)
   mrb_assert(is_gray(obj));
   paint_black(obj);
   mrb_gc_mark(mrb, (struct RBasic*)obj->c);
+  if (mrb_gc_giv_p(mrb, obj)) {
+    children += mrb_gc_mark_giv(mrb, obj);
+  }
   switch (obj->tt) {
   case MRB_TT_ICLASS:
     {
@@ -1209,6 +1276,9 @@ mrb_gc_mark(mrb_state *mrb, struct RBasic *obj)
   mrb_assert((obj)->tt != MRB_TT_FREE);
   switch (obj->tt) {
   case MRB_TT_STRING:
+    /* an instance variable can be a string with its own: not a depth to
+       recurse to, so this one goes by the gray list */
+    if (MRB_FLAG_TEST(obj, MRB_FL_HAS_GIV)) break;
     /* most strings have no children; handle fshared inline */
     paint_black(obj);
     mrb_gc_mark(mrb, (struct RBasic*)obj->c);
@@ -1240,6 +1310,9 @@ static void
 obj_free(mrb_state *mrb, struct RBasic *obj, mrb_bool end)
 {
   DEBUG(fprintf(stderr, "obj_free(%p,tt=%d)\n",obj,obj->tt));
+  if (mrb_gc_giv_p(mrb, obj)) {
+    mrb_gc_free_giv(mrb, obj);
+  }
   switch (obj->tt) {
   case MRB_TT_OBJECT:
     mrb_gc_free_iv(mrb, (struct RObject*)obj);
@@ -1279,9 +1352,15 @@ obj_free(mrb_state *mrb, struct RBasic *obj, mrb_bool end)
 
   case MRB_TT_FIBER:
     {
-      struct mrb_context *c = ((struct RFiber*)obj)->cxt;
+      struct RFiber *f = (struct RFiber*)obj;
+      struct mrb_context *c = f->cxt;
 
-      if (c && c != mrb->root_c) {
+      if (MRB_FLAG_TEST(f, MRB_FL_FIBER_BORROWED)) {
+        /* Tearing the heap down frees this object and a task's object in no
+           set order, so whichever goes first unlinks itself from the other. */
+        if (c->fib == f) c->fib = NULL;
+      }
+      else if (c) {
         if (!end && c->status != MRB_FIBER_TERMINATED) {
           /* Every surviving env escapes with its frame's container (see
              mrb_env_detach_all() in vm.c for the carrying policy); FALSE
@@ -1668,6 +1747,9 @@ incremental_gc(mrb_state *mrb, mrb_gc *gc, size_t limit)
          from the weak table before the sweep frees it */
       mrb_gc_clear_dead_refscopes(mrb);
 #endif
+#ifdef MRB_USE_GC_WEAK
+      gc_clear_weaks(mrb, gc);
+#endif
 #ifdef MRB_GC_PROFILE
       {
         uint64_t fmdt = gc_prof_now_us() - fm0;
@@ -2028,6 +2110,14 @@ static mrb_value
 gc_start(mrb_state *mrb, mrb_value obj)
 {
   mrb_full_gc(mrb);
+#ifdef MRB_USE_GC_WEAK
+  /* what a weak table does with what was collected may run Ruby code,
+     which may link or unlink tables: take the next one first */
+  for (struct mrb_gc_weak *w = mrb->gc.weaks, *next; w; w = next) {
+    next = w->next;
+    if (w->after) w->after(mrb, w);
+  }
+#endif
   return mrb_nil_value();
 }
 

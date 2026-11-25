@@ -63,12 +63,40 @@ assert 'Kernel#Rational' do
   assert_raise(ArgumentError) { Rational(1,2,3) }
 end
 
+assert 'Kernel#Rational with a Float operand and a zero denominator' do
+  skip 'no Float in this build' unless RATIONAL_FLOAT
+  assert_raise(ZeroDivisionError) { Rational(1, 0) }
+  assert_raise(ZeroDivisionError) { Rational(3.6, 0) }
+  assert_raise(ZeroDivisionError) { Rational(3, 0.0) }
+  assert_raise(ZeroDivisionError) { Rational(3, -0.0) }
+end
+
 assert 'Rational#to_f' do
   skip 'no Float in this build' unless RATIONAL_FLOAT
   assert_float(2.0, Rational(2).to_f)
   assert_float(2.25, Rational(9, 4).to_f)
   assert_float(-0.75, Rational(-3, 4).to_f)
   assert_float(6.666666666666667, Rational(20, 3).to_f)
+end
+
+assert 'Float#to_r and Rational(Float) for a float below 2**-10' do
+  skip 'no Float in this build' unless RATIONAL_FLOAT
+  # The denominator of 2**-64 is wider than any mrb_int, so a build without
+  # mruby-bigint raises RangeError.  Every float below is exact in float32 too.
+  begin
+    (2.0**-64).to_r
+  rescue RangeError
+    skip 'requires mruby-bigint'
+  end
+  assert_equal Rational(1, 1 << 11), (2.0**-11).to_r
+  assert_equal Rational(1, 1 << 12), Rational(2.0**-12)
+  assert_equal Rational(-1, 1 << 13), (-2.0**-13).to_r
+  assert_equal Rational(3, 1 << 20), (3 * 2.0**-20).to_r
+  assert_equal Rational(1, 1 << 62), (2.0**-62).to_r
+  assert_equal Rational(1, 1 << 64), (2.0**-64).to_r
+  assert_operator 0, :<, 0.0005.to_r
+  assert_operator 0, :<, 0.0001.to_r
+  assert_operator 0, :>, -0.00001.to_r
 end
 
 assert 'Rational#to_i' do
@@ -630,6 +658,23 @@ assert 'Integer#quo' do
   assert_equal 6/5r, a
 end
 
+assert 'Integer#quo with a Bigint operand' do
+  k = 65
+  begin
+    big = 1 << k
+  rescue RangeError
+    skip 'requires mruby-bigint'
+  end
+  assert_equal Rational(big / 2, 1), big.quo(2)
+  assert_equal Rational(big, 3), big.quo(3)
+  assert_equal Rational(7, big), 7.quo(big)
+  assert_equal Rational(2, 1), big.quo(big / 2)
+  assert_kind_of Rational, 7.quo(big)
+  assert_kind_of Rational, big.quo(big / 2)
+  assert_equal Rational(big * 3, 1), big.quo(Rational(1, 3))
+  assert_raise(ZeroDivisionError) { big.quo(0) }
+end
+
 assert 'Kernel#Rational with a Rational operand stays exact' do
   assert_equal Rational(1, 3), Rational(Rational(1, 3), 1)
   assert_equal Rational(3, 2), Rational(Rational(1, 2), Rational(1, 3))
@@ -651,4 +696,90 @@ assert 'Kernel#Rational with a Rational and a Bigint operand stays exact' do
   assert_equal Rational(1, big * 2), Rational(Rational(1, 2), big)
   assert_equal Rational(big * 2, 1), Rational(big, Rational(1, 2))
   assert_equal Rational(1, big * 3), Rational(Rational(1, 3), big)
+end
+
+assert 'Rational keeps a bigint half it boxes after itself across minor GCs' do
+  # A bigint-backed Rational whose other half fits an mrb_int, the 3 of
+  # Rational(big, 3) or the 1 of Rational(1, big), boxes that half for
+  # itself.  Boxed after the Rational was allocated, it was the call's last
+  # allocation: a minor GC run by it left the Rational old, nothing
+  # barriered the young half stored into it, and the next minor GC freed
+  # the half while the Rational still held it, so the slot read back as
+  # whatever was allocated there next.
+  k = 70
+  begin
+    big = 1 << k
+  rescue RangeError
+    skip 'requires mruby-bigint'
+  end
+  origin = [GC.generational_mode, GC.interval_ratio]
+  burn = ->(n) { i = 0; while i < n; s = "ab"; i += 1; end }
+  begin
+    GC.generational_mode = true
+    GC.interval_ratio = 100
+    GC.disable
+    ballast = Array.new(8192) { |i| s = "b" * 30; s if i % 8 == 0 }
+    GC.enable
+    [[big, 3], [1, big]].each do |num, den|
+      GC.start
+      debt = GC.stat[:debt]
+      Rational(num, den)
+      n = GC.stat[:debt] - debt
+      # a minor GC on each allocation around the last one the call makes
+      (n - 4).upto(n + 4) do |at|
+        GC.start
+        burn.(-GC.stat[:debt] - at)
+        r = Rational(num, den)
+        burn.(2048)  # twice the credit GC.interval_ratio = 100 leaves
+        assert_equal num, r.numerator
+        assert_equal den, r.denominator
+      end
+    end
+    assert_equal 8192, ballast.size
+  ensure
+    GC.enable
+    GC.generational_mode, GC.interval_ratio = origin
+  end
+end
+
+assert 'Rational#floor, #ceil, #truncate and #round' do
+  rs = [Rational(7, 2), Rational(-7, 2), Rational(5, 2), Rational(-5, 2),
+        Rational(1, 3), Rational(-1, 3), Rational(3)]
+  assert_equal [3, -4, 2, -3, 0, -1, 3], rs.map(&:floor)
+  assert_equal [4, -3, 3, -2, 1, 0, 3], rs.map(&:ceil)
+  assert_equal [3, -3, 2, -2, 0, 0, 3], rs.map(&:truncate)
+  assert_equal [4, -4, 3, -3, 0, 0, 3], rs.map(&:round)
+  assert_kind_of Integer, Rational(7, 2).floor
+end
+
+assert 'Rational#round with half:' do
+  assert_equal 2, Rational(5, 2).round(half: :even)
+  assert_equal 4, Rational(7, 2).round(half: :even)
+  assert_equal(-2, Rational(-5, 2).round(half: :even))
+  assert_equal 2, Rational(5, 2).round(half: :down)
+  assert_equal(-2, Rational(-5, 2).round(half: :down))
+  assert_equal 3, Rational(5, 2).round(half: nil)
+  assert_equal 2, Rational(5, 2).round(half: "even")
+  assert_raise(ArgumentError) { Rational(1, 3).round(half: :foo) }
+end
+
+assert 'Rational rounding to ndigits' do
+  r = Rational(12345, 100)
+  assert_rational Rational(617, 5), r.floor(1)
+  assert_rational Rational(247, 2), r.ceil(1)
+  assert_rational Rational(617, 5), r.truncate(1)
+  assert_rational Rational(247, 2), r.round(1)
+  assert_rational Rational(-247, 2), (-r).floor(1)
+  assert_rational Rational(-247, 2), (-r).round(1)
+  assert_rational Rational(2469, 20), r.round(5)
+  assert_rational Rational(1, 5), Rational(25, 100).round(1, half: :even)
+  assert_rational Rational(2, 5), Rational(35, 100).round(1, half: :even)
+  assert_equal 120, r.round(-1)
+  assert_equal 120, r.floor(-1)
+  assert_equal 130, r.ceil(-1)
+  assert_equal(-120, (-r).truncate(-1))
+  assert_equal 20, Rational(15).round(-1, half: :even)
+  assert_equal 20, Rational(25).round(-1, half: :down)
+  assert_kind_of Integer, r.round(0)
+  assert_raise(TypeError) { r.floor(nil) }
 end

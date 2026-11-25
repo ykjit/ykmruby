@@ -43,8 +43,8 @@ enum re_opcode {
                     RE_CHAR. */
   RE_ANY,        /* match any character (. without DOTALL) */
   RE_ANY_NL,     /* match any character including newline (. with DOTALL) */
-  RE_CLASS,      /* match character class: operand = class_id */
-  RE_NCLASS,     /* match negated character class: operand = class_id */
+  RE_CLASS,      /* match character class: offset = class_id */
+  RE_NCLASS,     /* match negated character class: offset = class_id */
   RE_MATCH,      /* successful match */
   RE_JMP,        /* unconditional jump: operand = target offset */
   RE_SPLIT,      /* fork: operand = target offset (greedy: try next first) */
@@ -145,11 +145,14 @@ enum re_opcode {
                         either takes an end and jumps to `offset`, or runs
                         the body once at the position it stands at and goes
                         on to the next position. */
-  RE_ABSENT_END      /* end of the absent's body, reached where the body
+  RE_ABSENT_END,     /* end of the absent's body, reached where the body
                         matched: the match is not the absent's, it is what
                         says the absent may not reach past it, so the round
                         records how far the absent may still reach and the
                         scan goes on at the next position. */
+  RE_GPOS            /* \G, assert the position this search started from,
+                        which the backtracking engine keeps as
+                        bt_state::gpos; the pattern needs that engine */
 };
 
 /* RE_LOOK_END::a. The polarity says what a matched sub-pattern means. The
@@ -170,11 +173,14 @@ enum re_opcode {
 #define RE_LB_BYTES(offset) ((int)((offset) >> 8))
 #define RE_LB_CHARS(offset) ((int)((offset) & 0xff))
 
-/* Bytecode instruction (4 bytes each for alignment) */
+/* Bytecode instruction, 8 bytes: a jump target, a class id or another
+   extended operand takes 32 bits, so a program may hold more than 65535
+   instructions (a table of a few thousand words compiles to more). Searches
+   measured no slower than with the 16-bit field the 4-byte instruction had. */
 typedef struct {
   uint8_t op;
-  uint8_t a;       /* small operand or class id */
-  uint16_t offset;  /* jump target or extended operand */
+  uint8_t a;       /* small operand */
+  uint32_t offset;  /* jump target or extended operand */
 } re_inst;
 
 /* Character class bitmap (ASCII range) */
@@ -255,11 +261,14 @@ typedef struct mrb_regexp_pattern {
   re_named_capture *named_captures;
   char *named_arena;       /* owned storage for named_captures[i].name; NULL if num_named == 0 */
   uint16_t num_named;
+  uint16_t keep_slot;      /* the even capture slot past the groups
+                              where a \K records its position, or 0 for a
+                              pattern with no \K; see keep_apply() */
   mrb_bool has_backref;    /* true if pattern uses \1-\9 */
   mrb_bool needs_backtrack; /* true if pattern needs backtracking engine */
   uint8_t *prefix;         /* literal prefix bytes for fast skip (or NULL) */
   uint8_t prefix_len;      /* length of prefix (0 = no prefix) */
-  uint8_t first_bytes[16]; /* bitmap of possible first bytes (128-bit, ASCII) */
+  uint8_t first_bytes[32]; /* bitmap of possible first bytes, all 256 */
   mrb_bool has_first_bytes; /* true if first_bytes is usable for skipping */
   uint8_t first_byte_count; /* how many bytes first_byte[] holds (1..3), or 0
                                when the set is wider and only the bitmap
@@ -274,8 +283,27 @@ typedef struct mrb_regexp_pattern {
                               alone under RE_ANCHOR_BOT */
   uint8_t loop_depth;      /* deepest nesting of repetitions whose body can
                               match empty (see RE_MAX_PASS) */
+  uint8_t end_anchor;      /* the end assertion every path reaches within
+                              end_reach bytes of where its attempt began, the
+                              weakest across paths: RE_END_EOT for \z,
+                              RE_END_EOTNL for \Z, RE_END_EOL for $, or
+                              RE_END_NONE. An attempt that begins further than
+                              that from every place the assertion can pass
+                              cannot match, so the engines start no attempt
+                              there; see skip_to_end_window(). */
+  uint32_t end_reach;      /* the most bytes any path consumes before it
+                              reaches that assertion */
+  uint8_t *required;       /* bytes every match holds somewhere at or after
+                              where its attempt began (or NULL): a subject
+                              that holds them nowhere past the search's start
+                              holds no match, which is answered without a
+                              single attempt; see compute_required() */
+  uint8_t required_len;
   /* Cached VM state for pike_vm (avoids malloc per mrb_re_exec call) */
   uint32_t *cached_visited;     /* generation-based visited array */
+  uint32_t cached_gen;          /* the highest key a search has marked
+                                   cached_visited with: the next search's
+                                   keys start above it */
   void *cached_threads[2];      /* curr/next thread lists */
   int cached_list_capa;         /* capacity of cached thread lists */
   mrb_bool cache_in_use;        /* re-entrancy guard */
@@ -286,6 +314,13 @@ typedef struct mrb_regexp_pattern {
 #define RE_ANCHOR_NONE 0
 #define RE_ANCHOR_BOL  1  /* every branch passes ^ first: line starts only */
 #define RE_ANCHOR_BOT  2  /* every branch passes \A first: string start only */
+
+/* mrb_regexp_pattern::end_anchor. Ordered by how little each says about
+   where the assertion can pass, so the weakest across paths is their max. */
+#define RE_END_NONE  0
+#define RE_END_EOT   1  /* \z: at the end of the subject alone */
+#define RE_END_EOTNL 2  /* \Z: there, or before a \n that ends the subject */
+#define RE_END_EOL   3  /* $: at the end of any line */
 
 /* Regexp flags */
 #define RE_FLAG_IGNORECASE  1
@@ -565,7 +600,10 @@ mrb_bool mrb_re_needs_case_data(uint32_t lo, uint32_t hi);
 static inline int
 mrb_re_charlen(const char *s, const char *end, mrb_bool binary)
 {
-  return binary ? 1 : (int)mrb_enc_charlen(s, end);
+  /* ASCII is answered here: this is asked at every step of a search, and
+     the scan behind mrb_enc_charlen() is a call away. */
+  if (binary || (s < end && (uint8_t)*s < 0x80)) return 1;
+  return (int)mrb_enc_charlen(s, end);
 }
 
 static inline uint32_t

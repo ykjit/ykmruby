@@ -189,6 +189,25 @@ assert 'Bigint -/+ keeps the sign when a small operand grows the magnitude' do
   assert_equal n, (n + 7) - 7
 end
 
+assert 'Bigint * where Toom-3 evaluates a negative value at -1' do
+  # Toom-3 splits an operand into thirds x2, x1, x0 and multiplies at -1 by
+  # x0 - x1 + x2, negated when x1 outweighs the other two. The negation lost
+  # its carry where limbs are 16 bits wide (MRB_NO_MPZ64BIT), so products
+  # like this one came out wrong. N is a multiple of 96, so that with limbs
+  # of either width a third falls at N/3 and the operands are past the Toom-3
+  # threshold; the middle third of `a` is all ones, which makes the value at
+  # -1 negative. `a` is a sum of powers of two, so the product needs no
+  # multiplication to check.
+  n = 3840
+  a = (1 << (n - 1)) + (1 << (2 * n / 3)) - (1 << (n / 3))
+  b = ((7 ** 1400) & ((1 << n) - 1)) | (1 << (n - 1))
+  times_a = ->(v) { (v << (n - 1)) + (v << (2 * n / 3)) - (v << (n / 3)) }
+  assert_equal times_a.(b), a * b
+  assert_equal times_a.(b), b * a
+  assert_equal times_a.(a), a * a
+  assert_equal(-times_a.(b), -a * b)
+end
+
 assert 'Bigint *' do
   n = 1<<65
   assert_equal 0, n * 0
@@ -236,6 +255,35 @@ assert 'Bigint mod' do
   assert_equal 18446744073709551616, (n / 2) % n
 end
 
+assert 'Integer#div by a Bigint' do
+  n = 1<<65
+  assert_equal 0, 7.div(n)
+  assert_equal(-1, (-7).div(n))
+  assert_equal(-1, 7.div(-n))
+  assert_equal 0, 0.div(n)
+end
+
+assert 'Bigint mod with a Float' do
+  skip unless Object.const_defined?(:Float)
+  n = 1<<65
+  assert_equal 2.0, n % 3.0
+  assert_equal(-1.0, n % -3.0)
+  assert_equal 1.0, -n % 3.0
+  assert_equal(-2.0, -n % -3.0)
+  assert_equal Float::INFINITY, -n % Float::INFINITY
+  assert_raise(ZeroDivisionError) { n % 0.0 }
+end
+
+assert 'Integer#remainder by a Bigint' do
+  n = 1<<65
+  assert_equal 7, 7.remainder(n)
+  assert_equal(-7, (-7).remainder(n))
+  assert_equal 7, 7.remainder(-n)
+  assert_equal 0, 0.remainder(n)
+  assert_equal 9007199254740993, 9007199254740993.remainder(n)
+  assert_kind_of Integer, 7.remainder(n)
+end
+
 assert 'Bigint divmod' do
   n = 1<<65
   assert_equal [37004501652376231, 925], n.divmod(997)
@@ -250,6 +298,18 @@ assert 'Bigint divmod' do
   assert_equal [0, 18446744073709551616], (n / 2).divmod(n)
 end
 
+assert 'Float#divmod with a quotient past fixnum' do
+  skip unless Object.const_defined?(:Float)
+  q, r = (2.0**65).divmod(3.0)
+  assert_kind_of Integer, q
+  assert_equal (2.0**65 / 3.0).floor, q
+  assert_equal 2.0, r
+  q, r = (2**65).divmod(3.0)
+  assert_kind_of Integer, q
+  assert_equal 2.0, r
+  assert_raise(FloatDomainError) { Float::INFINITY.divmod(2.0) }
+end
+
 assert 'Bigint &' do
   n = 1<<65
   assert_equal 0, n & 0
@@ -261,6 +321,15 @@ assert 'Bigint &' do
   assert_equal n, n & n
   assert_equal 36893488147419103232, n & -1
   assert_equal 36893488147419103232, -1 & n
+
+  # A negative value meets the mask as its two's complement: the small-mask
+  # fast path read the magnitude's low limb instead, and the conversion back
+  # from a two's complement lost its carry where the result is exactly
+  # -(2**(limb bits * limbs)), answering 0.
+  assert_equal 16, -(2**128 + 1) & 16
+  assert_equal 23, -(2**64 + 9) & 31
+  assert_equal 0, -(2**64) & 255
+  assert_equal(-(2**128), -(2**127 - 2) & -(2**128 - 1))
 end
 
 assert 'Bigint |' do
@@ -282,6 +351,65 @@ assert 'Bigint ^' do
   assert_equal 0, n ^ n
   assert_equal(-36893488147419103233, n ^ -1)
   assert_equal(-36893488147419103231, -n ^ 1)
+
+  # The carry lost in the conversion back from a two's complement, as in the
+  # Bigint & block above.
+  assert_equal(-(2**128), (2**128 - 5) ^ -5)
+end
+
+assert 'Bigint ~' do
+  n = 1<<64
+  assert_equal(-18446744073709551617, ~n)
+  assert_equal(-18446744073709551616, ~(n - 1))
+  assert_equal(-1267650600228229401496703205377, ~(1<<100))
+  assert_equal 18446744073709551615, ~(-n)
+  assert_equal 18446744073709551616, ~(-n - 1)
+  assert_equal n, ~~n
+end
+
+assert 'Bigint >> rounds a negative number toward minus infinity' do
+  n = 1<<64
+  assert_equal(-9223372036854775808, -n >> 1)
+  assert_equal(-9223372036854775809, (-n - 1) >> 1)
+  assert_equal(-1, -n >> 64)
+  assert_equal(-2, (-n - 1) >> 64)
+  assert_equal(-2, (-n + 1) >> 63)
+  assert_equal(-1, -n >> 65)
+  assert_equal(-1, -n >> 100)
+  assert_equal(-295147905179352825857, (-(1<<70) - 3) >> 2)
+  assert_equal(-295147905179352825857, (-(1<<70) - 3) << -2)
+  assert_equal 295147905179352825856, ((1<<70) + 3) >> 2
+end
+
+assert 'A shift by a Bigint count moves every bit out' do
+  n = 1<<65
+  assert_equal 0, 5 >> n
+  assert_equal(-1, -5 >> n)
+  assert_equal 0, n >> n
+  assert_equal(-1, -n >> n)
+  assert_equal 0, 5 << -n
+  assert_equal(-1, -5 << -n)
+  assert_equal 0, 0 << n
+  assert_raise(RangeError) { 5 << n }
+  # a Bignum count that an mrb_int can hold is not wider than one
+  assert_equal 4, 8 << BigintTest.unnormalized(-1)
+  assert_equal 4, 8 >> BigintTest.unnormalized(1)
+  assert_equal 16, 8 << BigintTest.unnormalized(1)
+  assert_equal 0, BigintTest.unnormalized(0) << n
+  assert_equal 0, BigintTest.unnormalized(0) >> -n
+end
+
+assert 'Bigint size counts the bytes of the magnitude' do
+  skip unless 1.respond_to?(:size)
+  w = 1.size  # a fixnum's, which a Bignum never answers less than
+  assert_equal 9, (2**64).size
+  assert_equal 9, (-(2**64)).size
+  assert_equal [w, 8].max, (2**64 - 1).size
+  assert_equal 13, (2**100).size
+  assert_equal 10, (256**10 - 1).size
+  assert_equal 20, (256**20 - 1).size
+  assert_equal w, BigintTest.unnormalized(7).size
+  assert_equal w, BigintTest.unnormalized(0).size
 end
 
 assert 'Bigint to_s' do
@@ -342,6 +470,46 @@ assert 'Bigint Integer#remainder large operand' do
   assert_equal (3**500) % m, (3**500).remainder(m)
   assert_equal (5**500) % ((2**150) + 1), (5**500).remainder((2**150) + 1)
   assert_equal (2**400) % ((2**130) + 1), (2**400).remainder((2**130) + 1)
+  # The precondition is in bits: a modulus whose top limb holds few bits
+  # let x pass a limb-count bound while still being past 2^(2*bits(m)).
+  m = (10**30) + 7
+  x = 7**90
+  assert_equal x % m, x.remainder(m)
+  assert_equal(-(x % m), (-x).remainder(m))
+  assert_equal x % m, x.pow(1, m)
+  assert_equal (x % m).pow(5, m), x.pow(5, m)
+end
+
+assert 'Bigint Barrett reduction with a modulus near a power of two' do
+  # Barrett leaves x - q3*m below 3m and recovers it modulo a power of
+  # two; 2^(bits(m)+1) is too small for that once m passes 2/3 of
+  # 2^bits(m).  m is even so that pow takes Barrett, not Montgomery.
+  m = 2692385342303581121715657560162688559353896
+  e = 2636694112147897610634825765964664103373605
+  r = 323246457632324592119281372143493075137137
+  assert_equal r, (e * e) % m
+  assert_equal r, (e * e).remainder(m)
+  assert_equal r, e.pow(2, m)
+end
+
+assert 'Bigint Integer#remainder takes the sign of the receiver' do
+  n = 1<<70
+  assert_equal 1, n.remainder(3)
+  assert_equal 1, n.remainder(-3)
+  assert_equal(-1, (-n).remainder(3))
+  assert_equal(-1, (-n).remainder(-3))
+  assert_equal 1, (n + 1).remainder(-(1<<65))
+end
+
+assert 'Bigint Integer#pow(e, m) with a negative base or one past m**2' do
+  n = 1<<70
+  assert_equal 6, (-n).pow(3, 7)
+  assert_equal(-1, (-n).pow(3, -7))
+  assert_equal 1180591620717411303181, (-3).pow(5, n)
+  m = (2**300) + 2
+  assert_equal 729, ((2**600) + 5).pow(3, m)
+  assert_equal ((-(2**300) - 12345) ** 3) % m, (-(2**300) - 12345).pow(3, m)
+  assert_equal ((-(2**300) - 12345) ** 3) % (2**300), (-(2**300) - 12345).pow(3, 2**300)
 end
 
 assert 'Bigint Integer#remainder with a non-numeric argument' do
@@ -545,6 +713,28 @@ assert('Bigint Integer#round breaks a tie away from zero') do
   assert_equal(-big, (-big - 4).round(-1))
 end
 
+assert('Bigint Float#round, #floor and #ceil with a negative ndigits') do
+  skip unless Object.const_defined?(:Float)
+  skip if 1e39.infinite? # MRB_USE_FLOAT32
+  # Float#round answered a Float where the result did not fit in an mrb_int,
+  # and 0 for any ndigits below -17. Rounding the Float itself also left
+  # digits below the requested place: 1e25.floor(-3) kept ...905969664.
+  assert_equal 100000000000000000000, 1e20.round
+  assert_equal 100000000000000000000, 1e20.round(-2)
+  assert_equal 100000000000000000000, 1e20.round(-19)
+  assert_equal 20000000000000000000, 1.5e19.round(-19)
+  assert_equal 5000000000000000000, 4.9e18.round(-18)
+  assert_equal 123456789012345700000, 123456789012345678901.0.round(-5)
+  assert_equal 10 ** 300, 1e300.round(-300)
+  assert_equal(-10 ** 300, -1e300.round(-300))
+  assert_equal 10000000000000000905969000, 1e25.floor(-3)
+  assert_equal 10000000000000000906000000, 1e25.ceil(-6)
+  assert_equal(-10000000000000000906000000, -1e25.floor(-6))
+  assert_equal 10 ** 300, 1e300.floor(-299)
+  assert_equal 11 * 10 ** 299, 1e300.ceil(-299)
+  assert_equal 10 ** 300, 1e300.truncate(-299)
+end
+
 assert('Bigint int64 conversion covers the whole signed 64-bit range') do
   int64_min = -9223372036854775808
   int64_max = 9223372036854775807
@@ -640,4 +830,22 @@ assert('mrb_integer_to_bytes and mrb_integer_from_bytes') do
 
   assert_raise(TypeError) { BigintTest.to_bytes("1") }
   assert_raise(TypeError) { BigintTest.to_bytes(nil) }
+end
+
+assert('Bigint#remainder and #pow(e, m) with a negative operand and a mid-sized modulus') do
+  # A modulus of 4 to 16 limbs against a dividend up to twice as wide takes
+  # Barrett reduction, which was handed the signed operands: a negative x
+  # came back unreduced, and a positive x over a negative m never returned.
+  # The answers are checked against the quotient division gives, which does
+  # not take that path.
+  xs = [2**600+5, -(2**600+5), 2**400+12345, -(2**400+12345)]
+  ms = [2**300+2, -(2**300+2), 7**100, -(7**100)]
+  xs.each do |x|
+    ms.each do |m|
+      q = x.abs / m.abs
+      q = -q if (x < 0) != (m < 0)
+      assert_equal x - q * m, x.remainder(m), "#{x < 0 ? '-' : '+'}x.remainder(#{m < 0 ? '-' : '+'}m)"
+      assert_equal x - (x / m) * m, x.pow(1, m), "#{x < 0 ? '-' : '+'}x.pow(1, #{m < 0 ? '-' : '+'}m)"
+    end
+  end
 end

@@ -288,8 +288,11 @@ range_inspect(mrb_state *mrb, mrb_value range)
     str = mrb_str_new(mrb, "...", RANGE_EXCL(r) ? 3 : 2);
   }
   if (!mrb_nil_p(RANGE_END(r))) {
+    /* the end's inspect must not reach the string under construction */
+    mrb_str_ptr(str)->c = NULL; /* hide from ObjectSpace.each_object */
     mrb_value str2 = mrb_inspect(mrb, RANGE_END(r));
     mrb_str_cat_str(mrb, str, str2);
+    mrb_str_ptr(str)->c = mrb->string_class;
   }
 
   return str;
@@ -352,12 +355,32 @@ range_num_to_a(mrb_state *mrb, mrb_value range)
   struct RRange *r = mrb_range_ptr(mrb, range);
   mrb_value beg = RANGE_BEG(r);
   mrb_value end = RANGE_END(r);
+  mrb_bool excl = RANGE_EXCL(r);
 
   mrb->c->ci->mid = 0;
   if (mrb_nil_p(end)) {
     mrb_raise(mrb, E_RANGE_ERROR, "cannot convert endless range to an array");
   }
   if (mrb_integer_p(beg)) {
+#ifndef MRB_NO_FLOAT
+    if (mrb_float_p(end)) {
+      /* the Integer end that gives the same elements */
+      mrb_float f = excl ? ceil(mrb_float(end)) : floor(mrb_float(end));
+      mrb_float top = -(mrb_float)MRB_INT_MIN;  /* MRB_INT_MAX + 1, exact in any mrb_float */
+
+      if (f < (mrb_float)MRB_INT_MIN) return mrb_ary_new_capa(mrb, 0);
+      if (excl && f == top) {
+        end = mrb_int_value(mrb, MRB_INT_MAX);
+        excl = FALSE;
+      }
+      else if (f < top) {
+        end = mrb_int_value(mrb, (mrb_int)f);
+      }
+      else {
+        mrb_raise(mrb, E_RANGE_ERROR, "integer range too long");
+      }
+    }
+#endif
     if (mrb_integer_p(end)) {
       mrb_int a = mrb_integer(beg);
       mrb_int b = mrb_integer(end);
@@ -371,36 +394,22 @@ range_num_to_a(mrb_state *mrb, mrb_value range)
       too_long:
         mrb_raise(mrb, E_RANGE_ERROR, "integer range too long");
       }
-      if (!RANGE_EXCL(r)) {
+      if (!excl) {
         if (len == MRB_INT_MAX) goto too_long;
         len++;
       }
       mrb_value ary = mrb_ary_new_capa(mrb, len);
       mrb_value *ptr = RARRAY_PTR(ary);
+      int ai = mrb_gc_arena_save(mrb);
       for (mrb_int i=0; i<len; i++) {
         ptr[i] = mrb_int_value(mrb, a+i);
         ARY_SET_LEN(RARRAY(ary), i+1);
+        /* past the fixnums the element is an object, kept by the array alone */
+        mrb_field_write_barrier_value(mrb, mrb_basic_ptr(ary), ptr[i]);
+        mrb_gc_arena_restore(mrb, ai);
       }
       return ary;
     }
-#ifndef MRB_NO_FLOAT
-    if (mrb_float_p(end)) {
-      mrb_int a = mrb_integer(beg);
-      mrb_float b = mrb_float(end);
-
-      if (a > b) {
-        return mrb_ary_new_capa(mrb, 0);
-      }
-      mrb_int alen = (mrb_int)(b - a) + RANGE_EXCL(r);
-      mrb_value ary = mrb_ary_new_capa(mrb, alen);
-      mrb_value *ptr = RARRAY_PTR(ary);
-      for (mrb_int i=0; i<alen; i++) {
-        ptr[i] = mrb_int_value(mrb, a+i);
-        ARY_SET_LEN(RARRAY(ary), i);
-      }
-      return ary;
-    }
-#endif
   }
 #ifdef MRB_USE_BIGINT
   if (mrb_bigint_p(beg)) {
@@ -420,9 +429,13 @@ range_num_to_a(mrb_state *mrb, mrb_value range)
     mrb_int len = mrb_integer(lenv);
     if (!RANGE_EXCL(r)) len++;
     mrb_value ary = mrb_ary_new_capa(mrb, len);
+    int ai = mrb_gc_arena_save(mrb);
     for (mrb_int i=0; i<len; i++) {
-      RARRAY_PTR(ary)[i] = mrb_bint_add(mrb, beg, mrb_int_value(mrb, i));
+      mrb_value v = mrb_bint_add(mrb, beg, mrb_int_value(mrb, i));
+      RARRAY_PTR(ary)[i] = v;
       ARY_SET_LEN(RARRAY(ary), i+1);
+      mrb_field_write_barrier_value(mrb, mrb_basic_ptr(ary), v);
+      mrb_gc_arena_restore(mrb, ai);
     }
     return ary;
   }
@@ -558,9 +571,9 @@ mrb_range_beg_len(mrb_state *mrb, mrb_value range, mrb_int *begp, mrb_int *lenp,
   }
 
   if (end < 0) end += len;
-  if (!excl && (!trunc || end < len)) end++;  /* include end point */
-  len = end - beg;
-  if (len < 0) len = 0;
+  /* include end point; an end of MRB_INT_MAX already covers any sequence */
+  if (!excl && (!trunc || end < len) && end < MRB_INT_MAX) end++;
+  len = end > beg ? end - beg : 0;
 
   *begp = beg;
   *lenp = len;

@@ -3101,7 +3101,7 @@ assert("Regexp - lookbehind against a binary subject rewinds by bytes") do
   bin = "Āx".b
   assert_equal "x", bin.match(/(?<=Ā)x/)[0]
   assert_nil bin.match(/(?<=[Ā])x/)
-  assert_equal "x", bin.match(/(?<=[\x80])x/)[0]
+  assert_equal "x", bin.match(Regexp.new('(?<=[\x80])x'))[0]
   assert_equal "x", bin.match(/(?<=.)x/)[0]
 end
 
@@ -3117,22 +3117,26 @@ assert("Regexp - lookbehind measures bytes that spell no character") do
   # reads them, so the character rewind is asked of the build that reads none,
   # and the byte rewind below puts the same question to the same bytes in
   # either build.
+  #
+  # A regexp literal may not escape a byte that spells no character in the
+  # source encoding (a SyntaxError, as in CRuby), so the patterns that do are
+  # built with Regexp.new from the same source text.
   if __ENCODING__ == "UTF-8"
-    assert_raise(ArgumentError) { "\x80ab" =~ /(?<=\x80a)b/ }
-    assert_raise(ArgumentError) { "\x80ab" =~ /(?<!\x80a)b/ }
-    assert_raise(ArgumentError) { "\xE3\x81ab" =~ /(?<=\xE3\x81a)b/ }
+    assert_raise(ArgumentError) { "\x80ab" =~ Regexp.new('(?<=\x80a)b') }
+    assert_raise(ArgumentError) { "\x80ab" =~ Regexp.new('(?<!\x80a)b') }
+    assert_raise(ArgumentError) { "\xE3\x81ab" =~ Regexp.new('(?<=\xE3\x81a)b') }
     assert_raise(ArgumentError) { "\x80ab" =~ Regexp.new("(?<=\x80a)b") }
   else
-    assert_equal 2, ("\x80ab" =~ /(?<=\x80a)b/)
-    assert_nil ("\x80ab" =~ /(?<!\x80a)b/)
+    assert_equal 2, ("\x80ab" =~ Regexp.new('(?<=\x80a)b'))
+    assert_nil ("\x80ab" =~ Regexp.new('(?<!\x80a)b'))
     # a sequence cut short spells no character either, so each of its bytes is
     # one: E3 leads three bytes and only two follow it here
-    assert_equal 3, ("\xE3\x81ab" =~ /(?<=\xE3\x81a)b/)
+    assert_equal 3, ("\xE3\x81ab" =~ Regexp.new('(?<=\xE3\x81a)b'))
     # the same bytes written into the pattern rather than escaped
     assert_equal 2, ("\x80ab" =~ Regexp.new("(?<=\x80a)b"))
   end
   # a subject that spells characters throughout is read in either build
-  assert_nil ("ab" =~ /(?<=\x80a)b/)
+  assert_nil ("ab" =~ Regexp.new('(?<=\x80a)b'))
   # a byte-indexed subject counts the same bytes, and rewinds by them
   assert_equal 2, ("\x80ab".b =~ Regexp.new("(?<=\x80a)b"))
   assert_equal 3, ("\xE3\x81ab".b =~ Regexp.new("(?<=\xE3\x81a)b"))
@@ -3152,22 +3156,25 @@ assert("Regexp - lookbehind over a class holding a byte that spells no character
   # A subject whose bytes spell no character is refused wherever an encoding
   # reads them, so the stray byte is put to a binary subject, which rewinds by
   # bytes in either build.
-  assert_equal "x", "\xB5x".b.match(/(?<=[\xB5])x/)[0]
-  assert_equal 1, ("\xB5x".b =~ /(?<=[\xB5])x/)
+  #
+  # A regexp literal may not escape such a byte (a SyntaxError, as in CRuby),
+  # so the patterns are built with Regexp.new from the same source text.
+  assert_equal "x", "\xB5x".b.match(Regexp.new('(?<=[\xB5])x'))[0]
+  assert_equal 1, ("\xB5x".b =~ Regexp.new('(?<=[\xB5])x'))
   if __ENCODING__ == "UTF-8"
-    assert_raise(ArgumentError) { "\xB5x" =~ /(?<=[\xB5])x/ }
+    assert_raise(ArgumentError) { "\xB5x" =~ Regexp.new('(?<=[\xB5])x') }
     # the byte written into a class is still asked about a character: Ā is
     # C4 80, and the rewind steps back over the whole of it, so the class is
     # handed U+0100 rather than either of its bytes
-    assert_nil ("Āx" =~ /(?<=[\x80])x/)
-    assert_nil ("Āx" =~ /(?<=[\xC4])x/)
+    assert_nil ("Āx" =~ Regexp.new('(?<=[\x80])x'))
+    assert_nil ("Āx" =~ Regexp.new('(?<=[\xC4])x'))
     assert_equal 1, ("Āx" =~ /(?<=[Ā])x/)
   else
     # a build that reads its strings by byte has one character per byte, so
     # the same class does see the continuation byte, and only that one
-    assert_equal 1, ("\xB5x" =~ /(?<=[\xB5])x/)
-    assert_equal 2, ("\xC4\x80x" =~ /(?<=[\x80])x/)
-    assert_nil ("\xC4\x80x" =~ /(?<=[\xC4])x/)
+    assert_equal 1, ("\xB5x" =~ Regexp.new('(?<=[\xB5])x'))
+    assert_equal 2, ("\xC4\x80x" =~ Regexp.new('(?<=[\x80])x'))
+    assert_nil ("\xC4\x80x" =~ Regexp.new('(?<=[\xC4])x'))
   end
 end
 
@@ -3381,39 +3388,61 @@ assert("Regexp - \\h and \\H hex-digit shorthands") do
   assert_equal ["deadBEEF"], "deadBEEFzz".scan(/\h+/)
 end
 
-assert("Regexp - pattern too large for its jump targets is refused") do
-  # Jump targets live in a 16-bit field, so a program that outgrows the field
-  # used to wrap them and jump to an unrelated instruction: the pattern then
-  # quietly stopped matching text it describes instead of reporting anything.
-  # Each (?:abc) unit costs three instructions and the bound is on the whole
-  # program, so the two counts below sit either side of it.
-  assert_kind_of Regexp, Regexp.new("(?:abc){21844}")
-  assert_raise_with_message(RegexpError, "regexp too large: /(?:abc){21845}/") do
-    Regexp.new("(?:abc){21845}")
-  end
+assert("Regexp - a program past 16-bit jump targets matches") do
+  # Jump targets used to live in a 16-bit field, and a program that outgrew
+  # it was refused as too large; before that was checked, the targets wrapped
+  # and the pattern quietly stopped matching text it describes. The field is
+  # 32 bits now. Each (?:abc) unit costs three instructions, so these
+  # programs reach past 65535 of them, and each still matches what it says.
+  # Every pattern is anchored: a search free to start anywhere runs a thread
+  # from each offset through the whole program, which takes about a minute.
+  re = Regexp.new("\\A(?:abc){21845}")
+  assert_equal 0, re =~ "abc" * 21845
+  assert_nil re =~ "abc" * 21844
 
-  # the shapes that used to answer wrongly rather than raise: a quantifier
-  # whose skip target is patched past the bound, and an alternation whose
-  # branch and exit targets both wrap
-  assert_raise(RegexpError) { Regexp.new("(?:abc){21844}x*y") }
-  assert_raise(RegexpError) { Regexp.new("(?:abc){30000}(?:y|z)") }
+  # the shapes that used to answer wrongly: a quantifier whose skip target
+  # lies past the old bound, and an alternation whose branch and exit
+  # targets both do
+  re = Regexp.new("\\A(?:abc){21844}x*y")
+  assert_equal 0, re =~ "abc" * 21844 + "xxy"
+  assert_equal 0, re =~ "abc" * 21844 + "y"
+  re = Regexp.new("\\A(?:abc){30000}(?:y|z)")
+  assert_equal 0, re =~ "abc" * 30000 + "z"
+  assert_nil re =~ "abc" * 30000 + "w"
 
-  # a quantifier the parser still accepts reaches the bound on its own once
-  # the repeated atom costs more than one instruction
-  assert_raise(RegexpError) { Regexp.new("(?:ab){32768}") }
+  # a quantifier of an atom costing more than one instruction
+  re = Regexp.new("\\A(?:ab){32768}")
+  assert_equal 0, re =~ "ab" * 32768
+  assert_nil re =~ "ab" * 32767
 end
 
-assert("Regexp - a character property escape is refused, not read as letters") do
-  # The engine reads no character property. Left as an unknown escape,
-  # `\p{Alpha}` was the letters `p{Alpha}` and the pattern answered a request
-  # for a letter with the text of the request; inside a class it was worse,
-  # since every letter of the name became a member of the class.
+assert("Regexp - a character property escape is read, not taken as letters") do
+  # The POSIX names are the brackets under another spelling, on every build:
+  # \p{Alpha} is [[:alpha:]], and the name is read as CRuby reads it, with
+  # case, '_', '-' and ' ' making no difference.
+  assert_equal "a", "1a"[/\p{Alpha}/]
+  assert_equal "1", "a1"[/\P{Alpha}/]
+  assert_equal "1", "a1"[/\p{^Alpha}/]
+  assert_equal "a", "1a"[/\P{^Alpha}/]
+  assert_equal "a1", "a1-"[/[\p{Alpha}\p{Digit}]+/]
+  assert_equal "-", "a1-"[/[^\p{Alnum}]/]
+  assert_equal "B", "aB"[/[\p{Alpha}&&\p{Upper}]/]
+  assert_equal "_", "-_"[/\p{ w-O_r d }/]
+  assert_equal "F", "gF"[/\p{XDIGIT}/]
+  # \p{Punct} is the punctuation categories, where [[:punct:]] holds the ASCII
+  # symbols as well.
+  assert_equal "!", "$+<=>^`|~!"[/\p{Punct}/]
+  assert_equal "$", "$+<=>^`|~!"[/[[:punct:]]/]
+  assert_equal "$", "$!"[/\P{Punct}/]
+
+  # A property names a set, so it cannot end a range, and the name has to be
+  # one this engine knows; the one refused is named in the message.
   assert_raise_with_message(RegexpError,
-                            "character property is not supported: /\\p{Alpha}/") do
-    Regexp.new("\\p{Alpha}")
+                            "character property {Han} is not supported: /\\p{Han}/") do
+    Regexp.new("\\p{Han}")
   end
-  ["\\P{Alpha}", "[\\p{Han}]", "[\\P{L}]", "a\\p{Lu}b", "(?x)\\p{Space}",
-   "\\p{}", "\\p{"].each do |src|
+  ["\\p{Alphabetic}", "[\\p{Han}]", "\\p{Age=1.1}", "\\p{In_Basic_Latin}", "\\p{}",
+   "\\p{^}", "\\p{", "\\p{Alpha", "[a-\\p{Alpha}]", "[\\p{Alpha}-z]"].each do |src|
     assert_raise(RegexpError, src) { Regexp.new(src) }
   end
 
@@ -3534,16 +3563,21 @@ end
 
 assert("Regexp - the escapes this engine does not carry are refused") do
   # Each means something in CRuby that this engine does not do, and as an
-  # unknown escape each was simply its own letter: /\R/ matched an R rather
-  # than a newline.
-  assert_raise_with_message(RegexpError, "\\G is not supported: /\\G/") { Regexp.new("\\G") }
-  assert_raise_with_message(RegexpError, "\\K is not supported: /a\\Kb/") { Regexp.new("a\\Kb") }
-  ["\\R", "\\X", "x\\G", "\\K"].each do |src|
+  # unknown escape each was simply its own letter: /\X/ matched an X rather
+  # than a grapheme cluster. (\R was one of them; it is carried now.)
+  assert_raise_with_message(RegexpError, "\\X is not supported: /\\X/") { Regexp.new("\\X") }
+  ["\\X", "x\\X"].each do |src|
+    assert_raise(RegexpError, src) { Regexp.new(src) }
+  end
+  # \K is carried, but not inside a lookaround or an absent operator, nor
+  # with a \g call
+  ["(?=a\\K)", "(?<=a\\K)b", "(?~a\\K)", "(?<x>a)\\K\\g<x>"].each do |src|
     assert_raise(RegexpError, src) { Regexp.new(src) }
   end
 
   # Inside a character class CRuby reads them as the letter, and so does this
   assert_equal "G", "G"[/[\G]/]
+  assert_equal "K", "K"[/[\K]/]
   assert_equal "R", "R"[/[\R]/]
   assert_equal "X", "X"[/[\X]/]
   assert_equal "g", "g"[/[\g]/]
@@ -3675,13 +3709,12 @@ assert("Regexp - what bounds the classes a pattern nests is a table, not a stack
   # group is, so how deep one may nest is a matter of what the compiler holds
   # a level in and not of the C stack the build gets. Two things bound it and
   # the shallower answers: every level open holds an entry in the class table
-  # while it is open, 256 of which there are, and every level but the
+  # while it is open, 65535 of which there are, and every level but the
   # outermost counts against MRB_REGEXP_PARSE_DEPTH_LIMIT beside the levels
   # the pattern itself has open, of which there is one here. So a build at
-  # the default limit nests 256 classes and is told `too many character
-  # classes` at the 257th, and a build that sets the limit at or below that
-  # meets its own limit there instead.
-  deep = 256
+  # the default limit meets that limit first, and only a build that sets it
+  # past the table is told `too many character classes` at the 65536th.
+  deep = 65535
   refusal = "too many character classes"
   if Regexp::PARSE_DEPTH_LIMIT <= deep
     deep = Regexp::PARSE_DEPTH_LIMIT
@@ -3807,4 +3840,52 @@ assert("Regexp - a set cannot be an end of a range in a class") do
   assert_equal 11, members.call("[\\d-]")
   assert_equal 10, members.call("[\\d]")
   assert_equal 26, members.call("[a-z]")
+end
+
+assert("Regexp - \\G anchors where the search started") do
+  assert_equal ["foo", "foo"], "foofoo bar".scan(/\Gfoo/)
+  assert_equal "XX xfoo", "foofoo xfoo".gsub(/\Gfoo/, "X")
+  assert_equal "A1B2", "a1b2".gsub(/\G[a-z]\d/) { |m| m.upcase }
+  assert_equal ["a,", "b,", ",", "c", ""], "a,b,,c".scan(/\G[^,]*,?/)
+  assert_equal ["a", "a"], "aaXa".scan(/\Ga/)
+  assert_nil "xfoo" =~ /\Gfoo/
+  assert_equal 0, "foo" =~ /\Gfoo/
+  assert_equal 1, /\Gfoo/.match("xfoo", 1).begin(0)
+  assert_equal 1, "xfoo".index(/\Gfoo/, 1)
+  assert_equal 1, "ab" =~ /(?<=\Ga)b/
+end
+
+assert("Regexp - \\K keeps what came before it out of the match") do
+  s = "foobar foobaz"
+  r = /foo\Kba./
+  # =~ answers where the attempt began, the match itself where \K stood
+  assert_equal 0, s =~ r
+  assert_equal "bar", $~[0]
+  assert_equal [3, 6], $~.offset(0)
+  assert_equal "foo", $~.pre_match
+  assert_equal 0, r =~ s
+  assert_equal 2, :foobar =~ /o\Kb/
+  assert_equal 1, "xab" =~ /(?:a\K|x)b/
+  assert_equal "bar", s[r]
+  assert_equal "fooX foobaz", s.sub(r, "X")
+  assert_equal "fooX fooX", s.gsub(r, "X")
+  assert_equal ["bar", "baz"], s.scan(r)
+  assert_equal ["foo", "ar foo", "az"], s.split(/o\Kb/)
+  assert_equal ["foo", "bar", " foobaz"], s.partition(r)
+  assert_equal ["foobar foo", "baz", ""], s.rpartition(r)
+  assert_equal "Cee", "A::B::Cee"[/::\K[^:]+\z/]
+  assert_equal "a-aa-", "aaa".gsub(/a\K/, "-")
+  assert_equal ["b", "a", "b"], "ab".match(/(a)\K(b)/).to_a
+  assert_equal "b", "aab".match(/a+\Kb/)[0]
+  assert_equal "aXb", "aab".sub(/\Ga\Ka/, "X")
+  # start_with? and the searches tied to a position test the attempt
+  assert_true s.start_with?(r)
+  assert_false "xab".start_with?(/a\Kb/)
+  assert_equal 3, s.index(r)
+  assert_nil "foobar".index(/o\Kb/, 3)
+  assert_equal 10, s.rindex(r)
+  assert_equal 2, "aaab".rindex(/a\Ka/)
+  assert_equal 1, "aaa".rindex(/a\Ka/, 0)
+  assert_equal 4, "abcabc".rindex(/a\Kbc/, 3)
+  assert_equal 3, "abab".byterindex(/a\Kb/)
 end

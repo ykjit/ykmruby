@@ -58,6 +58,8 @@ assert('Range#last') do
 
   skip unless Object.const_defined?(:Float)
   assert_equal [18, 19, 20], (10..20).last(3.0)
+  assert_equal [2, 3], (1..3.9).last(2)
+  assert_equal [1, 2, 3], (1...3.5).last(5)
 end
 
 assert('Range#size') do
@@ -75,6 +77,36 @@ assert('Range#size') do
 
   assert_equal Float::INFINITY, (1..).size
   assert_equal Float::INFINITY, (1...).size
+end
+
+assert('Range#size of an Integer range wider than the inline Integers') do
+  # 2**30 is past what a 32-bit word carries inline and 2**62 past a 64-bit
+  # one, so one span or the other is outside it wherever this runs. A build
+  # too narrow for a value raises at the shift or the product, and that span
+  # is left out; the shift count is a variable because a constant one out of
+  # range fails the build rather than raising.
+  assert_equal 0, (5..1).size
+  assert_equal 0, (1...1).size
+  [30, 62].each do |k|
+    begin
+      big = 1 << k
+      wide = big * 2 + 1
+    rescue RangeError
+      next
+    end
+    assert_equal big + 1, (0..big).size
+    assert_equal big, (0...big).size
+    assert_equal wide, (-big..big).size
+  end
+
+  skip unless Object.const_defined?(:Float)
+  begin
+    k = 64
+    big = 1 << k
+  rescue RangeError
+    skip 'requires mruby-bigint'
+  end
+  assert_equal big, (0...big.to_f).size
 end
 
 assert('Range#max') do

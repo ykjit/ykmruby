@@ -199,3 +199,71 @@ assert("Kernel#rand integer range overflow") do
     end
   end
 end
+
+assert("Kernel#rand with a Float limit that stands for no Integer") do
+  # The limit is truncated toward zero, so a Float no `mrb_int` holds spells no
+  # limit at all and is out of range rather than whatever the C cast makes of
+  # it: the cast turned `rand(Float::INFINITY)` into a draw from an arbitrary
+  # limit, one per CPU.
+  skip unless Object.const_defined?(:Float)
+  assert_raise(RangeError) { rand(Float::INFINITY) }
+  assert_raise(RangeError) { rand(-Float::INFINITY) }
+  assert_raise(RangeError) { rand(Float::NAN) }
+
+  # a limit a Float does stand for is still truncated toward zero
+  srand(234)
+  10.times do
+    v = rand(5.9)
+    assert_kind_of(Integer, v)
+    assert_true(0 <= v && v < 5)
+  end
+end
+
+assert("Random#rand with a negative limit") do
+  # Random.rand and Random#rand reject a negative limit, as CRuby does;
+  # Kernel#rand draws from its absolute value instead.
+  assert_raise(ArgumentError) { Random.new(1).rand(-5) }
+  assert_raise(ArgumentError) { Random.rand(-5) }
+  assert_raise(ArgumentError) { Random.new(1).rand(-1) }
+  if Object.const_defined?(:Float)
+    assert_raise(ArgumentError) { Random.rand(-5.5) }
+    assert_raise(ArgumentError) { Random.new(1).rand(-0.5) }
+  end
+
+  srand(234)
+  100.times do
+    v = rand(-5)
+    assert_kind_of(Integer, v)
+    assert_true(0 <= v && v < 5)
+  end
+end
+
+assert("Random#rand with a negative big integer limit") do
+  k = 100
+  big = begin
+    1 << k  # a variable shift, so the file still compiles without bigint
+  rescue RangeError
+    skip 'requires mruby-bigint'
+  end
+  assert_raise(ArgumentError) { Random.new(1).rand(-big) }
+  assert_raise(ArgumentError) { Random.rand(-big) }
+  10.times do
+    v = rand(-big)
+    assert_true(0 <= v && v < big)
+  end
+end
+
+assert("Random#rand with a limit above 2**32") do
+  k = 40
+  big = begin
+    1 << k  # raises RangeError where Integer is 32-bit and there is no bigint
+  rescue RangeError
+    skip "requires 64-bit Integer or bigint"
+  end
+  r = Random.new(42)
+  draws = Array.new(200) { r.rand(big) }
+  # a 32-bit draw could never exceed 2**32 - 1
+  assert_true(draws.any? { |v| v > 0xffffffff })
+  assert_true(draws.all? { |v| 0 <= v && v < big })
+  assert_true(Array.new(200) { rand(-big) }.any? { |v| v > 0xffffffff })
+end

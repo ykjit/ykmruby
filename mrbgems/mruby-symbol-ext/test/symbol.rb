@@ -46,6 +46,26 @@ assert("Symbol#casecmp") do
   assert_nil :HELLO.casecmp("hEllO")
 end
 
+assert("Symbol#succ") do
+  assert_equal :b, :a.succ
+  assert_equal :ba, :az.succ
+  assert_equal :b0, :a9.succ
+  assert_equal :Ab, :Aa.next
+  assert_equal :"", :"".succ
+end
+
+assert("Range of symbols") do
+  assert_equal [:a, :b, :c], (:a..:c).to_a
+  assert_equal [:a, :b], (:a...:c).to_a
+  assert_equal [:a8, :a9, :b0], (:a8..:b0).to_a
+  assert_equal [], (:y..:ab).to_a
+  # :"".succ is :"", which must not loop
+  assert_equal [:""], (:"".. :a).to_a
+  a = []
+  (:a..).each { |s| a << s; break if a.size == 3 }
+  assert_equal [:a, :b, :c], a
+end
+
 assert("Symbol#empty?") do
   assert_false :'a'.empty?
 end
@@ -98,4 +118,20 @@ assert('Symbol#slice - the name comes from the symbol, not from #to_s') do
       alias to_s __slice_test_to_s
     end
   end
+end
+
+assert('Symbol#start_with?') do
+  assert_true :hello.start_with?("hell")
+  assert_true :hello.start_with?("heaven", "hell")
+  assert_false :hello.start_with?("heaven")
+  assert_false :hello.start_with?
+  assert_raise(TypeError) { :hello.start_with?(1) }
+end
+
+assert('Symbol#end_with?') do
+  assert_true :hello.end_with?("ello")
+  assert_true :hello.end_with?("heaven", "ello")
+  assert_false :hello.end_with?("heaven")
+  assert_false :hello.end_with?
+  assert_raise(TypeError) { :hello.end_with?(:lo) }
 end

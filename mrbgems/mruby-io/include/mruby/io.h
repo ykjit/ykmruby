@@ -51,7 +51,8 @@ struct mrb_io {
                sync:1,
                is_socket:1,
                close_fd:1,
-               close_fd2:1;
+               close_fd2:1,
+               binmode:1;
   struct mrb_io_buf *buf;
 };
 
@@ -79,6 +80,10 @@ struct mrb_io {
 #define E_EOF_ERROR             mrb_exc_get_id(mrb, MRB_ERROR_SYM(EOFError))
 
 int mrb_io_fileno(mrb_state *mrb, mrb_value io);
+
+/* A path argument as a String: the String itself, or what the object's
+   to_path answers, as a Pathname or a File stands for its path. */
+mrb_value mrb_io_path(mrb_state *mrb, mrb_value path);
 
 MRB_END_DECL
 #endif /* MRUBY_IO_H */

@@ -228,6 +228,55 @@ assert('String#+ redefined on String itself reaches the redefinition') do
   assert_equal 'hi!', 'hi' + '!'
 end
 
+assert('String#== redefined on String itself reaches the redefinition') do
+  # `OP_EQ` answers `s == t` from C for two Strings, and `mrb_equal()` does
+  # the same for the comparisons `Array#include?`, `Array#index` and their
+  # kin make in C, which they may only do while `String#==` is still the
+  # builtin and the receiver's class is exactly `String`. Both test the
+  # receiver against `mrb->idx_class[]` on the same terms as the `+` test
+  # above, so a redefinition installed on `String` itself is honored as in
+  # CRuby, and so is one on a subclass or a singleton. The results are read
+  # before the operator is put back because the assertions themselves
+  # compare strings.
+  String.class_eval do
+    alias_method :__eq_before_test, :==
+    def ==(other)
+      [:overridden, self, other]
+    end
+  end
+  begin
+    s = 'hello'
+    same = s == 'hello'
+    different = s == 'world'
+    other = s == 1
+    index = ['a', 'b'].index('b')          # `mrb_equal()` asks the redefinition
+    included = ['a', 'b'].include?('zzz')  # ... whose answer is truthy here
+  ensure
+    String.class_eval do
+      alias_method :==, :__eq_before_test
+      remove_method :__eq_before_test if respond_to?(:remove_method, true)
+    end
+  end
+  assert_equal [:overridden, 'hello', 'hello'], same
+  assert_equal [:overridden, 'hello', 'world'], different
+  assert_equal [:overridden, 'hello', 1], other
+  assert_equal 0, index
+  assert_true included
+  assert_true 'hello' == 'hello'
+  assert_false 'hello' == 'world'
+  assert_false 'hello' == 1
+  assert_equal 1, ['a', 'b'].index('b')
+  assert_false ['a', 'b'].include?('zzz')
+
+  sub = Class.new(String) { def ==(other) [:subclass, self, other] end }.new('hi')
+  assert_equal [:subclass, 'hi', 'hi'], sub == 'hi'
+  assert_equal 0, [sub].index('hi')
+  single = 'hi'
+  def single.==(other) [:singleton, self, other] end
+  assert_equal [:singleton, 'hi', 'hi'], single == 'hi'
+  assert_true 'hi' == 'hi'
+end
+
 assert('String#[]= redefined on String itself reaches the redefinition') do
   # `OP_SETIDX` answers `s[0] = 'X'` from C whenever the receiver's class is
   # exactly `String`, on the same terms as the `[]` test above: it tests the
@@ -1427,6 +1476,33 @@ assert('String#to_f', '15.2.10.5.38') do
   assert_operator(Float::INFINITY, :eql?, ('9' * 200000).to_f)
 end if Object.const_defined?(:Float)
 
+assert('String#to_f with long digit strings', '#7846') do
+  assert_operator(1.0, :eql?, ('0' * 78 + '1').to_f)
+  assert_operator(1.0, :eql?, ('0' * 79 + '1').to_f)
+  assert_operator(1.0, :eql?, ('0' * 80 + '1').to_f)
+  assert_operator(1.0, :eql?, ('0' * 81 + '1').to_f)
+  assert_operator(1.0, :eql?, ('0' * 100 + '1').to_f)
+  assert_operator(0.0, :eql?, ('0' * 100).to_f)
+  assert_operator(0.0, :eql?, ('0' * 1000).to_f)
+  assert_operator(-5.0, :eql?, ('-' + '0' * 100 + '5').to_f)
+  assert_operator(5.0, :eql?, ('+' + '0' * 100 + '5').to_f)
+  assert_operator(100000.0, :eql?, ('1.' + '0' * 80 + 'e5').to_f)
+  assert_operator(100000.0, :eql?, ('1.' + '0' * 100 + 'E+5').to_f)
+  assert_operator(1.0e-05, :eql?, ('1.' + '0' * 100 + 'e-5').to_f)
+  assert_operator(1.0e-81, :eql?, ('0.' + '0' * 80 + '1').to_f)
+  assert_operator(1.0e+101, :eql?, ('1_' + '0' * 100 + '0').to_f)
+  assert_operator(0.0, :eql?, ('a' * 100).to_f)
+  assert_operator(1.2, :eql?, ("\t" + '0' * 100 + '1.2  junk').to_f)
+end if Object.const_defined?(:Float)
+
+assert('String#to_f on a shared substring', '#7846') do
+  s = '1' * 30 + '5' * 30
+  t = s[0, 30]
+  assert_operator(('1' * 30).to_f, :eql?, t.to_f)
+  u = ('9' * 40 + 'e5')[0, 40]
+  assert_operator(('9' * 40).to_f, :eql?, u.to_f)
+end if Object.const_defined?(:Float)
+
 assert('String#to_i', '15.2.10.5.39') do
   assert_operator 0, :eql?, ''.to_i
   assert_operator 32143, :eql?, '32143'.to_i
@@ -1735,6 +1811,13 @@ assert('String#bytesplice') do
   # idx, len, replace, idx, len (len1<len2)
   a = "0123456789"
   assert_equal "0cd23456789", a.bytesplice(1, 1, b, 2, 2)
+
+  # the receiver spliced into itself, from past the range it replaces
+  a = "0123456789"
+  assert_equal "02345678923456789", a.bytesplice(1, 1, a, 2, 8)
+
+  a = "0123456789"
+  assert_equal "034567893456789", a.bytesplice(1..2, a, 3..9)
 
   # check the object type to replace
   assert_raise(TypeError) { "0123456789".bytesplice(1, 1, Object.new) }

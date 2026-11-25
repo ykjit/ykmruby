@@ -69,6 +69,7 @@ typedef struct mrb_task {
   mrb_value result;                /* Task return value */
 
   struct mrb_context c;            /* Execution context (stack, callinfo, etc) */
+  struct mrb_context *parked;      /* Fiber the last slice stopped in, else NULL */
 } mrb_task;
 
 /* Normalize a freshly computed wakeup deadline so it can never equal the
@@ -131,6 +132,33 @@ MRB_API mrb_value mrb_task_run_once(mrb_state *mrb);
  * Must be cheap, never sleep, never re-enter the scheduler. */
 MRB_API void mrb_task_set_scheduler_hook(mrb_state *mrb, void (*fn)(mrb_state *mrb, void *ud), void *ud);
 
+#ifdef MRB_USE_TASK_TRACE
+/* Register a hook called on each task's context switches and state
+ * changes, from the VM's thread only (tick wakeups show up as the next
+ * SWITCH_IN). May run in the scheduler's critical section or the GC:
+ * must be cheap, never allocate, raise, or call into the VM.
+ * One hook per mrb_state -- setting replaces, fn == NULL clears. */
+enum mrb_task_trace_event {
+  MRB_TASK_TRACE_CREATE     = 0, /* created and queued */
+  MRB_TASK_TRACE_SWITCH_IN  = 1, /* about to run */
+  MRB_TASK_TRACE_SWITCH_OUT = 2, /* returned; t->status / t->reason say why */
+  MRB_TASK_TRACE_STATE      = 3, /* status changed by another context */
+  MRB_TASK_TRACE_FREE       = 4, /* about to be freed */
+};
+
+typedef void (*mrb_task_trace_func)(mrb_state *mrb, const mrb_task *t, int event, void *ud);
+
+MRB_API void mrb_task_set_trace_hook(mrb_state *mrb, mrb_task_trace_func fn, void *ud);
+
+#define MRB_TASK_TRACE(mrb, t, ev) do { \
+  if ((mrb)->task.trace_hook) { \
+    (mrb)->task.trace_hook((mrb), (t), (ev), (mrb)->task.trace_hook_ud); \
+  } \
+} while (0)
+#else
+#define MRB_TASK_TRACE(mrb, t, ev) ((void)0)
+#endif
+
 /*
  * Task creation API
  */
@@ -175,8 +203,11 @@ MRB_API void mrb_task_proc_set(mrb_state *mrb, mrb_value task, struct RProc *pro
 #define wakeup_tick_ (mrb->task.wakeup_tick)
 #define switching_   (mrb->task.switching)
 
-/* Recover the mrb_task that owns the current mruby context */
-#define MRB2TASK(mrb) ((mrb_task *)((uint8_t *)(mrb)->c - offsetof(mrb_task, c)))
+/* Recover the mrb_task that owns a context. The context must be a task's
+   own, not a fiber's: mrb->c is a fiber's while a task runs a fiber, so the
+   running task is read through mrb_task_running() rather than this. */
+#define MRB2TASK_C(ctx) ((mrb_task *)((uint8_t *)(ctx) - offsetof(mrb_task, c)))
+#define MRB2TASK(mrb) MRB2TASK_C((mrb)->c)
 
 /* Raise if the scheduler is locked (synchronous execution in progress) */
 static inline void
@@ -188,6 +219,9 @@ task_check_scheduler_lock(mrb_state *mrb)
 }
 
 /* Priority-queue insert/delete - defined in task.c */
+/* The task whose slice is running: mrb->c's own task, or the task running
+   the fiber mrb->c is; NULL on the root context (task.c). */
+mrb_task *mrb_task_running(mrb_state *mrb);
 void mrb_task_q_insert(mrb_state *mrb, mrb_task *t);
 void mrb_task_q_delete(mrb_state *mrb, mrb_task *t);
 

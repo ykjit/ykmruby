@@ -4,25 +4,57 @@ class File < IO
 
   #
   # call-seq:
+  #   file.to_path    -> filepath
+  #
+  # The path of the file, as File#path gives it: a File stands for its path
+  # where an object with to_path is taken for one.
+  #
+  alias to_path path
+
+  #
+  # call-seq:
   #   File.new(filename, mode="r")            -> file
   #   File.new(filename [, mode [, perm]])    -> file
   #   File.new(fd [, mode])                   -> file
+  #   File.new(path_or_fd, **options)         -> file
   #
   # Opens the file named by filename according to the given mode and returns
   # a new File object. If a file descriptor is given instead of a filename,
   # the new File object will be associated with that descriptor.
   #
+  # The keyword options are those of IO.new: +mode:+ in place of the
+  # positional mode, +perm:+ in place of the positional permission,
+  # +autoclose:+ for a descriptor, and +path:+ for the path that File#path
+  # reports for a descriptor. Other keywords are ignored.
+  #
   #   f = File.new("testfile", "r")
   #   f = File.new("newfile",  "w+")
   #   f = File.new("tmpfile",  "a")
+  #   f = File.new(fd, autoclose: false, path: "/dev/stdout")
   #
-  def initialize(fd_or_path, mode = "r", perm = 0666)
+  def initialize(fd_or_path, mode = "r", perm = nil, **opts)
+    mode = opts[:mode] if opts[:mode]
+    # a nil perm: stands for no keyword, as a nil positional one does
+    unless opts[:perm].nil?
+      raise ArgumentError, "perm specified twice" unless perm.nil?
+      perm = opts[:perm]
+    end
+    perm ||= 0666
     if Integer === fd_or_path
-      super(fd_or_path, mode)
+      @path = opts[:path]
+      super(fd_or_path, mode, opts)
     else
+      # a Pathname or a File stands for its path
+      fd_or_path = fd_or_path.to_path if !(String === fd_or_path) && fd_or_path.respond_to?(:to_path)
       @path = fd_or_path
       fd = IO.sysopen(@path, mode, perm)
-      super(fd, mode)
+      begin
+        super(fd, mode, opts)
+      rescue Exception
+        # the stream did not open on the descriptor, which is ours to close
+        IO._sysclose(fd)
+        raise
+      end
     end
   end
 
@@ -69,6 +101,45 @@ class File < IO
 
   #
   # call-seq:
+  #   File.atime(file_name)  -> time
+  #
+  # Returns the last access time of the named file (or of an IO), as
+  # File#atime does.
+  #
+  #   File.atime("testfile")   #=> Wed Apr 09 08:51:48 CDT 2003
+  #
+  def self.atime(file_name)
+    Time.at(__atime(file_name))
+  end
+
+  #
+  # call-seq:
+  #   File.ctime(file_name)  -> time
+  #
+  # Returns the change time of the named file (or of an IO), as
+  # File#ctime does.
+  #
+  #   File.ctime("testfile")   #=> Wed Apr 09 08:53:13 CDT 2003
+  #
+  def self.ctime(file_name)
+    Time.at(__ctime(file_name))
+  end
+
+  #
+  # call-seq:
+  #   File.mtime(file_name)  -> time
+  #
+  # Returns the modification time of the named file (or of an IO), as
+  # File#mtime does.
+  #
+  #   File.mtime("testfile")   #=> Wed Apr 09 08:53:14 CDT 2003
+  #
+  def self.mtime(file_name)
+    Time.at(__mtime(file_name))
+  end
+
+  #
+  # call-seq:
   #   file.inspect  -> string
   #
   # Return a string describing this File object.
@@ -76,7 +147,9 @@ class File < IO
   #   File.new("testfile").inspect   #=> "#<File:testfile>"
   #
   def inspect
-    "<#{self.class}:#{@path}>"
+    desc = @path || (closed? ? nil : "fd #{fileno}")
+    desc = desc ? "#{desc} (closed)" : "(closed)" if closed?
+    "#<#{self.class}:#{desc}>"
   end
 
 
@@ -94,14 +167,45 @@ class File < IO
   #   GOT This is line three
   #   GOT And so on...
   #
-  def self.foreach(file)
+  def self.foreach(file, *args, **opts)
     if block_given?
-      self.open(file) do |f|
-        f.each {|l| yield l}
+      self.open(file, **opts) do |f|
+        f.each(*args) {|l| yield l}
       end
     else
-      return self.new(file)
+      return self.new(file, **opts)
     end
+  end
+
+  #
+  # call-seq:
+  #   File.split(file_name)   -> array
+  #
+  # Splits the given string into a directory and a file component and
+  # returns them in a two-element array. See also File.dirname and
+  # File.basename.
+  #
+  #   File.split("/home/gumby/.profile")   #=> ["/home/gumby", ".profile"]
+  #
+  def self.split(path)
+    [dirname(path), basename(path)]
+  end
+
+  #
+  # call-seq:
+  #   File.utime(atime, mtime, file_name, ...)   -> integer
+  #
+  # Sets the access and modification times of each named file. A time is
+  # a Time or a number of seconds since the Epoch; nil stands for the
+  # current time. Returns the number of file names.
+  #
+  #   File.utime(0, Time.now, "testfile")   #=> 1
+  #
+  def self.utime(atime, mtime, *paths)
+    # a Time is read here, so that the C side never calls back into Ruby
+    atime = [atime.to_i, atime.usec] if atime.respond_to?(:usec)
+    mtime = [mtime.to_i, mtime.usec] if mtime.respond_to?(:usec)
+    __utime(atime, mtime, *paths)
   end
 
 

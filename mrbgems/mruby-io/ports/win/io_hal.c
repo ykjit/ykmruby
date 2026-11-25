@@ -10,6 +10,7 @@
 #include <mruby.h>
 #include "io_hal.h"
 
+#include <winsock2.h>
 #include <windows.h>
 #include <io.h>
 #include <fcntl.h>
@@ -19,6 +20,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <direct.h>
+#include <sys/utime.h>
+#include <time.h>
 #include <stdint.h>
 
 /* Maximum path length */
@@ -61,8 +64,8 @@ perm_from_hal(mrb_int m)
 static void
 convert_stat(const struct _stat64 *src, mrb_io_stat *dst)
 {
-  dst->st_dev = (mrb_int)src->st_dev;
-  dst->st_ino = (mrb_int)src->st_ino;
+  dst->st_dev = (uint64_t)src->st_dev;
+  dst->st_ino = (uint64_t)src->st_ino;
   /* The kind is tested with the runtime's own names and written in the
      HAL's terms; _stat64() names a regular file, a directory and a
      character device and nothing else, and a kind it cannot name leaves
@@ -88,6 +91,28 @@ convert_stat(const struct _stat64 *src, mrb_io_stat *dst)
   dst->st_ctime = (mrb_int)src->st_ctime;
   dst->st_blksize = 512;
   dst->st_blocks = (dst->st_size + 511) / 512;
+}
+
+/* Test the last path character without mistaking a DBCS trail byte for '\\'. */
+static int
+path_has_trailing_separator(const char *path)
+{
+  const unsigned char *p = (const unsigned char*)path;
+  UINT codepage = GetACP();
+  int trailing_separator = 0;
+
+  while (*p) {
+    if (IsDBCSLeadByteEx(codepage, *p) && p[1] != '\0') {
+      p += 2;
+      trailing_separator = 0;
+    }
+    else {
+      trailing_separator = (*p == '/' || *p == '\\');
+      p++;
+    }
+  }
+
+  return trailing_separator;
 }
 
 /* Convert errno to Windows errno */
@@ -127,7 +152,40 @@ mrb_hal_io_stat(mrb_state *mrb, const char *path, mrb_io_stat *st)
   struct _stat64 s;
   (void)mrb;
 
-  if (_stat64(path, &s) == -1) {
+  if (path_has_trailing_separator(path)) {
+    size_t path_len = strlen(path);
+    char *stat_path;
+    int ret;
+    int saved_errno;
+
+    if (path_len > SIZE_MAX - 2) {
+      errno = ENOMEM;
+      return -1;
+    }
+    /* Keep roots and separators intact so the final component is ".". */
+    stat_path = (char*)malloc(path_len + 2);
+    if (stat_path == NULL) {
+      errno = ENOMEM;
+      return -1;
+    }
+    memcpy(stat_path, path, path_len);
+    stat_path[path_len] = '.';
+    stat_path[path_len + 1] = '\0';
+
+    ret = _stat64(stat_path, &s);
+    saved_errno = errno;
+    free(stat_path);
+    errno = saved_errno;
+    if (ret == -1) {
+      return -1;
+    }
+    /* Some CRTs ignore "/." on regular files, so enforce directory semantics. */
+    if ((s.st_mode & _S_IFMT) != _S_IFDIR) {
+      errno = ENOTDIR;
+      return -1;
+    }
+  }
+  else if (_stat64(path, &s) == -1) {
     return -1;
   }
   convert_stat(&s, st);
@@ -159,6 +217,45 @@ mrb_hal_io_chmod(mrb_state *mrb, const char *path, mrb_int mode)
 {
   (void)mrb;
   return _chmod(path, perm_from_hal(mode));
+}
+
+int
+mrb_hal_io_access(mrb_state *mrb, const char *path, int mode)
+{
+  int amode = 0;
+
+  if (mode & MRB_IO_ACCESS_R) amode |= 4;
+  if (mode & MRB_IO_ACCESS_W) amode |= 2;
+  if (_access(path, amode) != 0) return -1;
+  if (mode & MRB_IO_ACCESS_X) {
+    /* no execute permission here: _stat() gives a directory, and a file
+       by its extension (.exe, .bat and the like), the owner's execute bit */
+    mrb_io_stat st;
+
+    if (mrb_hal_io_stat(mrb, path, &st) != 0) return -1;
+    if (!MRB_IO_S_ISDIR(st.st_mode) && !(st.st_mode & MRB_IO_S_IXUSR)) {
+      errno = EACCES;
+      return -1;
+    }
+  }
+  return 0;
+}
+
+int
+mrb_hal_io_utime(mrb_state *mrb, const char *path,
+                 const mrb_io_timeval *atime,
+                 const mrb_io_timeval *mtime)
+{
+  struct _utimbuf t;
+  time_t now;
+
+  (void)mrb;
+  if (!atime && !mtime) return _utime(path, NULL);
+  now = time(NULL);
+  /* _utime keeps whole seconds */
+  t.actime = atime ? (time_t)atime->tv_sec : now;
+  t.modtime = mtime ? (time_t)mtime->tv_sec : now;
+  return _utime(path, &t);
 }
 
 mrb_int

@@ -185,7 +185,7 @@ typedef struct {
   union {
     struct REnv *env;
     struct RClass *target_class;
-    const void *keep_context;   /* if NULL, it means that the fiber has switched; for internal use */
+    const void *keep_context;   /* NULL, read where a C function returns, means it switched the context; for internal use */
   } u;
 } mrb_callinfo;
 
@@ -312,7 +312,8 @@ typedef void (*mrb_atexit_func)(mrb_state*);
 /**
  * Slots of `mrb_state.idx_class`, one per builtin the inline index opcodes
  * (`OP_GETIDX`, `OP_GETIDX0`, `OP_SETIDX`) reimplement in C, plus one for
- * `String#+`, which `OP_ADD` guards the same way.
+ * `String#+`, which `OP_ADD` guards the same way, and one for `String#==`,
+ * which `OP_EQ` and `mrb_equal()` guard the same way.
  */
 enum mrb_idx_op_slot {
   MRB_IDX_OP_ARY_AREF,          /* Array#[]  */
@@ -322,6 +323,7 @@ enum mrb_idx_op_slot {
   MRB_IDX_OP_HASH_ASET,         /* Hash#[]=  */
   MRB_IDX_OP_STR_ASET,          /* String#[]= */
   MRB_IDX_OP_STR_ADD,           /* String#+  */
+  MRB_IDX_OP_STR_EQ,            /* String#== */
   MRB_IDX_OP_SLOT_COUNT
 };
 
@@ -373,6 +375,10 @@ typedef struct mrb_task_state {
   mrb_bool exception_as_result;     /* Return unhandled task exceptions as values */
   void (*scheduler_hook)(struct mrb_state *mrb, void *ud); /* Pre-scheduling servicing hook */
   void *scheduler_hook_ud;            /* Opaque argument for scheduler_hook */
+#ifdef MRB_USE_TASK_TRACE
+  void (*trace_hook)(struct mrb_state *mrb, const struct mrb_task *t, int event, void *ud); /* Task trace hook */
+  void *trace_hook_ud;                /* Opaque argument for trace_hook */
+#endif
 } mrb_task_state;
 #endif
 
@@ -382,6 +388,7 @@ struct mrb_state {
   struct mrb_context *c;
   struct mrb_context *root_c;
   struct iv_tbl *globals;                 /* global variable table */
+  struct kh_giv *giv;                     /* instance variables of objects without an iv slot (variable.c) */
 
   struct RObject *exc;                    /* exception */
 
@@ -410,6 +417,11 @@ struct mrb_state {
      mrb_ci_svar() are not made: a build with a gem that registers a virtual
      global still pays nothing until a program actually writes through it. */
   mrb_bool svar_used;
+
+  /* Whether Module#autoload has been called in this state.  Until it has,
+     no constant can be a pending autoload, so a constant lookup takes what
+     it finds without asking. */
+  mrb_bool autoload_used;
 
 #ifdef MRB_USE_REFINEMENTS
   struct RClass *refinement_class;
@@ -530,6 +542,12 @@ struct mrb_state {
 
 #ifdef MRB_USE_TASK_SCHEDULER
   mrb_task_state task;                    /* Task scheduler state */
+#endif
+
+#ifdef MRB_USE_C_STACK_CHECK
+  /* The address the machine stack may not pass while the VM runs, or
+     NULL for no check. See mrb_c_stack_limit_set(). */
+  void *c_stack_limit;
 #endif
 };
 
@@ -1821,6 +1839,47 @@ MRB_API mrb_value mrb_fiber_alive_p(mrb_state *mrb, mrb_value fib);
  */
 #define E_FIBER_ERROR mrb_exc_get_id(mrb, MRB_ERROR_SYM(FiberError))
 MRB_API void mrb_stack_extend(mrb_state*, mrb_int);
+
+#ifdef MRB_USE_C_STACK_CHECK
+/**
+ * Sets the address the machine (C) stack may not pass while the VM runs.
+ * The VM checks it where C enters it (mrb_funcall, mrb_yield and their
+ * kin, and mrb_vm_run): an entry that finds the stack past the limit
+ * raises SystemStackError ("stack level too deep"), as a call past
+ * MRB_CALL_LEVEL_MAX does, instead of running off the stack. A send from
+ * Ruby to Ruby runs in the same VM loop and is not checked: it grows no
+ * machine stack. What reaches the limit is nesting through C, such as a
+ * block called from a C method that calls a block from a C method again,
+ * or a C method that recurses itself. Those are the paths that overrun a
+ * small fixed stack on an MCU.
+ *
+ * Built only with MRB_USE_C_STACK_CHECK; without it the check and this
+ * function compile to nothing. NULL, the default, turns the check off.
+ * The stack is taken to grow downward, so the limit is a floor; with
+ * MRB_C_STACK_GROWS_UP it grows upward and the limit is a ceiling. Leave
+ * headroom past the limit: the raise itself, and any interrupt handler
+ * that shares the stack, run past the point the check saw. A host whose
+ * stack region is known from the linker sets, for example,
+ * `mrb_c_stack_limit_set(mrb, &__StackLimit + 2048)`.
+ *
+ * @param mrb The mruby state.
+ * @param limit The address the stack may not pass, or NULL.
+ */
+MRB_API void mrb_c_stack_limit_set(mrb_state *mrb, void *limit);
+
+/**
+ * The check the VM makes before a call, for a C function that recurses
+ * without calling back into the VM. Raises SystemStackError when the
+ * machine stack is below the limit set by mrb_c_stack_limit_set(); does
+ * nothing when no limit is set.
+ *
+ * @param mrb The mruby state.
+ */
+MRB_API void mrb_c_stack_check(mrb_state *mrb);
+#else
+#define mrb_c_stack_limit_set(mrb, limit) ((void)(mrb), (void)(limit))
+#define mrb_c_stack_check(mrb) ((void)(mrb))
+#endif
 
 /* temporary memory allocation, only effective while GC arena is kept */
 MRB_API void* mrb_temp_alloc(mrb_state *mrb, size_t);

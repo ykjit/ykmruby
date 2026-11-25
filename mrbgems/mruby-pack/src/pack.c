@@ -18,6 +18,30 @@
 #define INT_OVERFLOW_P(n)  ((n) < MRB_INT_MIN || (n) > MRB_INT_MAX)
 #define UINT_OVERFLOW_P(n) ((n) > MRB_INT_MAX)
 
+/* The bits of an integer element. A big integer keeps its low 64 bits, as
+   CRuby keeps the low 8*size bits of every element, so that a value past
+   mrb_int (an unsigned 32-bit field on MRB_INT32, such as an NTP timestamp)
+   packs instead of raising while it is narrowed to mrb_int. */
+static uint64_t
+pack_int_bits(mrb_state *mrb, mrb_value o)
+{
+#ifdef MRB_USE_BIGINT
+  if (mrb_bigint_p(o)) {
+    /* Integer#& with a 64-bit mask answers the low bits, two's complement
+       for a negative value, as a non-negative value below 2**64 that
+       mrb_bint_as_uint64() takes without a range check. The mask and the
+       result are short-lived objects, so the arena is given back. */
+    int ai = mrb_gc_arena_save(mrb);
+    mrb_value low = mrb_bint_and(mrb, o, mrb_bint_new_uint64(mrb, UINT64_MAX));
+    uint64_t bits = mrb_bigint_p(low) ? mrb_bint_as_uint64(mrb, low)
+                                      : (uint64_t)mrb_integer(low);
+    mrb_gc_arena_restore(mrb, ai);
+    return bits;
+  }
+#endif
+  return (uint64_t)mrb_integer(o);
+}
+
 #ifndef EOF
 # define EOF (-1) /* for MRB_NO_STDIO */
 #endif
@@ -342,7 +366,7 @@ static int
 pack_char(mrb_state *mrb, mrb_value o, mrb_value str, mrb_int sidx, unsigned int flags)
 {
   str = str_len_ensure(mrb, str, sidx + 1);
-  RSTRING_PTR(str)[sidx] = (char)mrb_integer(o);
+  RSTRING_PTR(str)[sidx] = (char)pack_int_bits(mrb, o);
   return 1;
 }
 
@@ -360,7 +384,7 @@ static int
 pack_short(mrb_state *mrb, mrb_value o, mrb_value str, mrb_int sidx, unsigned int flags)
 {
   str = str_len_ensure(mrb, str, sidx + 2);
-  uint16_t n = (uint16_t)mrb_integer(o);
+  uint16_t n = (uint16_t)pack_int_bits(mrb, o);
   char *dptr = RSTRING_PTR(str) + sidx;
 
   /* use lookup tables to eliminate branching */
@@ -389,7 +413,7 @@ static int
 pack_long(mrb_state *mrb, mrb_value o, mrb_value str, mrb_int sidx, unsigned int flags)
 {
   str = str_len_ensure(mrb, str, sidx + 4);
-  uint32_t n = (uint32_t)mrb_integer(o);
+  uint32_t n = (uint32_t)pack_int_bits(mrb, o);
   char *dptr = RSTRING_PTR(str) + sidx;
 
   /* use lookup tables to eliminate branching */
@@ -402,7 +426,7 @@ pack_long(mrb_state *mrb, mrb_value o, mrb_value str, mrb_int sidx, unsigned int
   return 4;
 }
 
-#ifndef MRB_INT64
+#if !defined(MRB_INT64) && !defined(MRB_USE_BIGINT)
 static void
 u32tostr(char *buf, size_t len, uint32_t n)
 {
@@ -433,12 +457,12 @@ u32tostr(char *buf, size_t len, uint32_t n)
   snprintf(buf, len, "%" PRIu32, n);
 #endif /* MRB_NO_STDIO */
 }
-#endif /* MRB_INT64 */
+#endif /* !MRB_INT64 && !MRB_USE_BIGINT */
 
 static int
 unpack_long(mrb_state *mrb, const unsigned char *src, mrb_int srclen, mrb_value ary, unsigned int flags)
 {
-#ifndef MRB_INT64
+#if !defined(MRB_INT64) && !defined(MRB_USE_BIGINT)
   char msg[60];
 #endif
   uint32_t ul;
@@ -457,8 +481,17 @@ unpack_long(mrb_state *mrb, const unsigned char *src, mrb_int srclen, mrb_value 
   else {
 #ifndef MRB_INT64
     if (UINT_OVERFLOW_P(ul)) {
+#ifdef MRB_USE_BIGINT
+      /* Past mrb_int on a 32-bit build: answered as a big integer. The
+         array keeps it; the arena entry would pile up over a "*" count. */
+      int ai = mrb_gc_arena_save(mrb);
+      mrb_ary_push(mrb, ary, mrb_bint_new_uint64(mrb, ul));
+      mrb_gc_arena_restore(mrb, ai);
+      return 4;
+#else
       u32tostr(msg, sizeof(msg), ul);
       mrb_raisef(mrb, E_RANGE_ERROR, "cannot unpack to Integer: %s", msg);
+#endif
     }
 #endif
     n = ul;
@@ -471,7 +504,7 @@ static int
 pack_quad(mrb_state *mrb, mrb_value o, mrb_value str, mrb_int sidx, unsigned int flags)
 {
   str = str_len_ensure(mrb, str, sidx + 8);
-  uint64_t n = (uint64_t)mrb_integer(o);
+  uint64_t n = pack_int_bits(mrb, o);
   char *dptr = RSTRING_PTR(str) + sidx;
 
   /* use lookup tables to eliminate branching */
@@ -488,6 +521,7 @@ pack_quad(mrb_state *mrb, mrb_value o, mrb_value str, mrb_int sidx, unsigned int
   return 8;
 }
 
+#ifndef MRB_USE_BIGINT
 static void
 u64tostr(char *buf, size_t len, uint64_t n)
 {
@@ -515,8 +549,9 @@ u64tostr(char *buf, size_t len, uint64_t n)
   snprintf(buf, len, "%" PRIu64, n);
 #endif /* MRB_NO_STDIO */
 }
+#endif /* MRB_USE_BIGINT */
 
-#ifndef MRB_INT64
+#if !defined(MRB_INT64) && !defined(MRB_USE_BIGINT)
 static void
 i64tostr(char *buf, size_t len, int64_t n)
 {
@@ -534,12 +569,14 @@ i64tostr(char *buf, size_t len, int64_t n)
   snprintf(buf, len, "%" PRId64, n);
 #endif /* MRB_NO_STDIO */
 }
-#endif /* MRB_INT64 */
+#endif /* !MRB_INT64 && !MRB_USE_BIGINT */
 
 static int
 unpack_quad(mrb_state *mrb, const unsigned char *src, mrb_int srclen, mrb_value ary, unsigned int flags)
 {
+#ifndef MRB_USE_BIGINT
   char msg[60];
+#endif
   mrb_int n;
 
   /* use lookup tables to eliminate branching */
@@ -557,16 +594,31 @@ unpack_quad(mrb_state *mrb, const unsigned char *src, mrb_int srclen, mrb_value 
     int64_t sll = ull;
 #ifndef MRB_INT64
     if (INT_OVERFLOW_P(sll)) {
+#ifdef MRB_USE_BIGINT
+      int ai = mrb_gc_arena_save(mrb);
+      mrb_ary_push(mrb, ary, mrb_bint_new_int64(mrb, sll));
+      mrb_gc_arena_restore(mrb, ai);
+      return 8;
+#else
       i64tostr(msg, sizeof(msg), sll);
       mrb_raisef(mrb, E_RANGE_ERROR, "cannot unpack to Integer: %s", msg);
+#endif
     }
 #endif
     n = (mrb_int)sll;
   }
   else {
     if (UINT_OVERFLOW_P(ull)) {
+#ifdef MRB_USE_BIGINT
+      /* Past mrb_int: answered as a big integer. */
+      int ai = mrb_gc_arena_save(mrb);
+      mrb_ary_push(mrb, ary, mrb_bint_new_uint64(mrb, ull));
+      mrb_gc_arena_restore(mrb, ai);
+      return 8;
+#else
       u64tostr(msg, sizeof(msg), ull);
       mrb_raisef(mrb, E_RANGE_ERROR, "cannot unpack to Integer: %s", msg);
+#endif
     }
     n = (mrb_int)ull;
   }
@@ -577,7 +629,8 @@ unpack_quad(mrb_state *mrb, const unsigned char *src, mrb_int srclen, mrb_value 
 static int
 pack_BER(mrb_state *mrb, mrb_value o, mrb_value str, mrb_int sidx, unsigned int flags)
 {
-  mrb_int n = mrb_integer(o);
+  /* A big integer has no spelling here and is refused, as before. */
+  mrb_int n = mrb_integer(mrb_ensure_int_type(mrb, o));
 
   if (n < 0) {
     mrb_raise(mrb, E_ARGUMENT_ERROR, "can't compress negative numbers");
@@ -745,7 +798,8 @@ unpack_float(mrb_state *mrb, const unsigned char * src, mrb_int srclen, mrb_valu
 static int
 pack_utf8(mrb_state *mrb, mrb_value o, mrb_value str, mrb_int sidx, int count, unsigned int flags)
 {
-  mrb_int c = mrb_integer(o);
+  /* A big integer has no spelling here and is refused, as before. */
+  mrb_int c = mrb_integer(mrb_ensure_int_type(mrb, o));
 
   /* Every value up to 0x7FFFFFFF has a spelling here, over up to six bytes,
      as CRuby writes it: a value past U+10FFFF as well as a surrogate. A
@@ -856,7 +910,7 @@ unpack_utf8(mrb_state *mrb, const unsigned char *src, mrb_int srclen, mrb_value 
   return p - src;
 }
 
-static int
+static mrb_int
 pack_str(mrb_state *mrb, mrb_value src, mrb_value dst, mrb_int didx, int count, unsigned int flags)
 {
   const char *sptr = RSTRING_PTR(src);
@@ -903,7 +957,7 @@ pack_str(mrb_state *mrb, mrb_value src, mrb_value dst, mrb_int didx, int count, 
     dptr += padlen;
   }
 
-  return (int)(dptr - dptr0);
+  return dptr - dptr0;
 }
 
 #define CHECK_UNPACK_LEN(mrb, slen, ary) do {\
@@ -913,23 +967,32 @@ pack_str(mrb_state *mrb, mrb_value src, mrb_value dst, mrb_int didx, int count, 
   }\
 } while (0)
 
-static int
+/* The string a, A, Z, m, M or u has just pushed holds bytes, as CRuby's
+   ASCII-8BIT one does: index it by bytes, not by UTF-8 characters. */
+static void
+unpacked_binary(mrb_state *mrb, mrb_value ary)
+{
+  mrb_value s = mrb_ary_entry(ary, -1);
+  if (mrb_string_p(s)) RSTR_ENCODING_SET(mrb_str_ptr(s), MRB_STR_ENCODING_BINARY);
+}
+
+static mrb_int
 unpack_str(mrb_state *mrb, const void *src, mrb_int slen, mrb_value ary, int count, unsigned int flags)
 {
   CHECK_UNPACK_LEN(mrb, slen, ary);
 
   const char *sptr = (const char*)src;
-  int copylen;
+  mrb_int copylen;
 
   if (count != -1 && count < slen) {
     slen = count;
   }
-  copylen = (int)slen;
+  copylen = slen;
 
   if (slen >= 0 && flags & PACK_FLAG_Z) {  /* "Z" format */
     const char *cp = (const char*)memchr(sptr, '\0', slen);
     if (cp != NULL) {
-      copylen = (int)(cp - sptr);
+      copylen = cp - sptr;
       if (count == -1) {
         slen = copylen + 1;
       }
@@ -945,17 +1008,17 @@ unpack_str(mrb_state *mrb, const void *src, mrb_int slen, mrb_value ary, int cou
 
   if (copylen < 0) copylen = 0;
 
-  mrb_value dst = mrb_str_new(mrb, sptr, (mrb_int)copylen);
+  mrb_value dst = mrb_str_new(mrb, sptr, copylen);
   mrb_ary_push(mrb, ary, dst);
-  return (int)slen;
+  return slen;
 }
 
 
-static int
+static mrb_int
 pack_hex(mrb_state *mrb, mrb_value src, mrb_value dst, mrb_int didx, int count, unsigned int flags)
 {
   char *sptr = RSTRING_PTR(src);
-  long slen = (long)RSTRING_LEN(src);
+  mrb_int slen = RSTRING_LEN(src);
 
   unsigned int ashift, bshift;
   if (flags & PACK_FLAG_LSB) {
@@ -967,16 +1030,17 @@ pack_hex(mrb_state *mrb, mrb_value src, mrb_value dst, mrb_int didx, int count, 
     bshift = 0;
   }
 
+  mrb_int nchars = count;
   if (count == -1) {
-    count = slen;
+    nchars = slen;
   }
   else if (slen > count) {
     slen = count;
   }
 
   /* calculate output buffer size needed - one byte per two hex chars */
-  /* use count/2 + (count&1) to avoid overflow when count == INT_MAX */
-  int output_bytes = count / 2 + (count & 1);
+  /* use nchars/2 + (nchars&1) to avoid overflow when nchars == MRB_INT_MAX */
+  mrb_int output_bytes = nchars / 2 + (nchars & 1);
   dst = str_len_ensure(mrb, dst, didx + output_bytes);
   char *dptr = RSTRING_PTR(dst) + didx;
   char *dptr0 = dptr;
@@ -1000,10 +1064,10 @@ pack_hex(mrb_state *mrb, mrb_value src, mrb_value dst, mrb_int didx, int count, 
     }
   }
 
-  return (int)(dptr - dptr0);
+  return dptr - dptr0;
 }
 
-static int
+static mrb_int
 unpack_hex(mrb_state *mrb, const void *src, mrb_int slen, mrb_value ary, int count, unsigned int flags)
 {
   CHECK_UNPACK_LEN(mrb, slen, ary);
@@ -1021,51 +1085,47 @@ unpack_hex(mrb_state *mrb, const void *src, mrb_int slen, mrb_value ary, int cou
   const char *sptr = (const char*)src;
   const char *sptr0 = sptr;
 
-  if (count == -1)
-    count = (int)(slen * 2);
+  mrb_int nchars = count == -1 ? slen * 2 : count;
 
-  mrb_value dst = mrb_str_new(mrb, NULL, count);
+  mrb_value dst = mrb_str_new(mrb, NULL, nchars);
   char *dptr = RSTRING_PTR(dst);
   char *dptr0 = dptr;
 
   const char hexadecimal[] = "0123456789abcdef";
 
   /* process full bytes when we need pairs of hex characters */
-  while (slen > 0 && count >= 2) {
+  while (slen > 0 && nchars >= 2) {
     unsigned char byte = *sptr++;
     slen--;
 
     *dptr++ = hexadecimal[(byte >> ashift) & 0x0f];
     *dptr++ = hexadecimal[(byte >> bshift) & 0x0f];
-    count -= 2;
+    nchars -= 2;
   }
 
   /* handle remaining single character if count is odd */
-  if (slen > 0 && count > 0) {
+  if (slen > 0 && nchars > 0) {
     unsigned char byte = *sptr++;
     *dptr++ = hexadecimal[(byte >> ashift) & 0x0f];
   }
 
   dst = mrb_str_resize(mrb, dst, (mrb_int)(dptr - dptr0));
   mrb_ary_push(mrb, ary, dst);
-  return (int)(sptr - sptr0);
+  return sptr - sptr0;
 }
 
-static int
+static mrb_int
 pack_bstr(mrb_state *mrb, mrb_value src, mrb_value dst, mrb_int didx, int count, unsigned int flags)
 {
   const char *sptr = RSTRING_PTR(src);
-  int slen = (int)RSTRING_LEN(src);
+  mrb_int slen = RSTRING_LEN(src);
 
-  if (count == -1) {
-    count = slen;
-  }
-  else if (slen > count) {
+  if (count != -1 && slen > count) {
     slen = count;
   }
 
   /* calculate exact output size: (slen + 7) / 8 */
-  int output_bytes = (slen + 7) / 8;
+  mrb_int output_bytes = (slen + 7) / 8;
   dst = str_len_ensure(mrb, dst, didx + output_bytes);
   char *dptr = RSTRING_PTR(dst) + didx;
   char *dptr0 = dptr;
@@ -1074,14 +1134,14 @@ pack_bstr(mrb_state *mrb, mrb_value src, mrb_value dst, mrb_int didx, int count,
   uint8_t (*pack_func)(const char *) = (flags & PACK_FLAG_LSB) ? pack_8_bits_lsb : pack_8_bits_msb;
 
   /* process 8 characters at a time */
-  int full_bytes = slen / 8;
-  for (int i = 0; i < full_bytes; i++) {
+  mrb_int full_bytes = slen / 8;
+  for (mrb_int i = 0; i < full_bytes; i++) {
     *dptr++ = (char)pack_func(sptr);
     sptr += 8;
   }
 
   /* handle remaining bits (partial byte) */
-  int remaining_bits = slen % 8;
+  int remaining_bits = (int)(slen % 8);
   if (remaining_bits > 0) {
     char temp_chars[8] = {'0', '0', '0', '0', '0', '0', '0', '0'};
     /* copy remaining characters, padding with '0' */
@@ -1091,10 +1151,10 @@ pack_bstr(mrb_state *mrb, mrb_value src, mrb_value dst, mrb_int didx, int count,
     *dptr++ = (char)pack_func(temp_chars);
   }
 
-  return (int)(dptr - dptr0);
+  return dptr - dptr0;
 }
 
-static int
+static mrb_int
 unpack_bstr(mrb_state *mrb, const void *src, mrb_int slen, mrb_value ary, int count, unsigned int flags)
 {
   CHECK_UNPACK_LEN(mrb, slen, ary);
@@ -1102,11 +1162,12 @@ unpack_bstr(mrb_state *mrb, const void *src, mrb_int slen, mrb_value ary, int co
   const char *sptr0 = (const char*)src;
   const char *sptr = sptr0;
 
+  mrb_int nbits = count;
   if (count == -1 || count > slen * 8)
-    count = (int)(slen * 8);
+    nbits = slen * 8;
 
   /* pre-allocate exact output size */
-  mrb_value dst = mrb_str_new(mrb, NULL, count);
+  mrb_value dst = mrb_str_new(mrb, NULL, nbits);
   char *dptr = RSTRING_PTR(dst);
   char *dptr0 = dptr;
 
@@ -1114,14 +1175,14 @@ unpack_bstr(mrb_state *mrb, const void *src, mrb_int slen, mrb_value ary, int co
   void (*unpack_func)(uint8_t, char *) = (flags & PACK_FLAG_LSB) ? unpack_8_bits_lsb : unpack_8_bits_msb;
 
   /* process 8 bits (1 byte) at a time */
-  int full_bytes = count / 8;
-  for (int i = 0; i < full_bytes; i++) {
+  mrb_int full_bytes = nbits / 8;
+  for (mrb_int i = 0; i < full_bytes; i++) {
     unpack_func((uint8_t)*sptr++, dptr);
     dptr += 8;
   }
 
   /* handle remaining bits (partial byte) */
-  int remaining_bits = count % 8;
+  int remaining_bits = (int)(nbits % 8);
   if (remaining_bits > 0) {
     char temp_chars[8];
     unpack_func((uint8_t)*sptr++, temp_chars);
@@ -1134,10 +1195,10 @@ unpack_bstr(mrb_state *mrb, const void *src, mrb_int slen, mrb_value ary, int co
   /* ensure string is properly sized */
   dst = mrb_str_resize(mrb, dst, (mrb_int)(dptr - dptr0));
   mrb_ary_push(mrb, ary, dst);
-  return (int)(sptr - sptr0);
+  return sptr - sptr0;
 }
 
-static int
+static mrb_int
 pack_base64(mrb_state *mrb, mrb_value src, mrb_value dst, mrb_int didx, int count)
 {
   char *srcptr = RSTRING_PTR(src);
@@ -1179,7 +1240,7 @@ pack_base64(mrb_state *mrb, mrb_value src, mrb_value dst, mrb_int didx, int coun
   }
   else {
     /* line wrapping path */
-    mrb_int column = 3;
+    mrb_int column = 0;
     while (srclen >= 3) {
       unsigned long l = (unsigned char)*srcptr++ << 16;
       l += (unsigned char)*srcptr++ << 8;
@@ -1191,11 +1252,11 @@ pack_base64(mrb_state *mrb, mrb_value src, mrb_value dst, mrb_int didx, int coun
       *dstptr++ = base64chars[(l >> 6) & 0x3f];
       *dstptr++ = base64chars[l & 0x3f];
 
+      column += 3;
       if (column == count) {
         *dstptr++ = '\n';
         column = 0;
       }
-      column += 3;
     }
 
     /* handle remaining 1-2 bytes */
@@ -1220,7 +1281,7 @@ pack_base64(mrb_state *mrb, mrb_value src, mrb_value dst, mrb_int didx, int coun
     if (column > 0) {
       *dstptr++ = '\n';
     }
-    return (int)(dstptr - dstptr0);
+    return dstptr - dstptr0;
   }
 
   /* handle remaining 1-2 bytes for fast path */
@@ -1240,10 +1301,10 @@ pack_base64(mrb_state *mrb, mrb_value src, mrb_value dst, mrb_int didx, int coun
     *dstptr++ = '=';
   }
 
-  return (int)(dstptr - dstptr0);
+  return dstptr - dstptr0;
 }
 
-static int
+static mrb_int
 unpack_base64(mrb_state *mrb, const void *src, mrb_int slen, mrb_value ary)
 {
   CHECK_UNPACK_LEN(mrb, slen, ary);
@@ -1252,21 +1313,22 @@ unpack_base64(mrb_state *mrb, const void *src, mrb_int slen, mrb_value ary)
   const char *sptr = sptr0;
 
   /* estimate buffer size - may be shorter due to padding/whitespace */
-  int dlen = (int)(slen / 4 * 3);
+  mrb_int dlen = (slen / 4 + 1) * 3;
   mrb_value dst = mrb_str_new(mrb, NULL, dlen);
   char *dptr0 = RSTRING_PTR(dst);
   char *dptr = dptr0;
 
   int padding = 0;
-  while (slen >= 4) {
-    unsigned char ch[4];
-
+  int i = 0;
+  unsigned char ch[4];
+  while (slen > 0) {
     /* collect 4 valid base64 characters */
-    for (int i = 0; i < 4; i++) {
+    padding = 0;
+    for (i = 0; i < 4; i++) {
       unsigned char c;
       do {
         if (slen-- == 0)
-          goto done;
+          goto partial;
         c = *sptr++;
         if (c >= sizeof(base64_dec_tab))
           continue;
@@ -1297,13 +1359,22 @@ unpack_base64(mrb_state *mrb, const void *src, mrb_int slen, mrb_value ary)
     }
   }
 
+  goto done;
+
+partial:
+  /* input ended inside a group: keep the bytes its leading characters hold */
+  if (i - padding >= 2) {
+    unsigned long l = (ch[0] << 18) + (ch[1] << 12) + (i - padding > 2 ? ch[2] << 6 : 0);
+    *dptr++ = (l >> 16) & 0xff;
+    if (i - padding > 2) *dptr++ = (l >> 8) & 0xff;
+  }
 done:
   dst = mrb_str_resize(mrb, dst, (mrb_int)(dptr - dptr0));
   mrb_ary_push(mrb, ary, dst);
-  return (int)(sptr - sptr0);
+  return sptr - sptr0;
 }
 
-static int
+static mrb_int
 pack_qenc(mrb_state *mrb, mrb_value src, mrb_value dst, mrb_int didx, int count)
 {
   static const char hex_table[] = "0123456789ABCDEF";
@@ -1311,7 +1382,7 @@ pack_qenc(mrb_state *mrb, mrb_value src, mrb_value dst, mrb_int didx, int count)
   char *s = RSTRING_PTR(src);
   char *send = s + RSTRING_LEN(src);
   int i = 0, n = 0, prev = EOF;
-  int dlen = 0;
+  mrb_int dlen = 0;
 
   if (count <= 1) count = 72;
 
@@ -1390,7 +1461,7 @@ pack_qenc(mrb_state *mrb, mrb_value src, mrb_value dst, mrb_int didx, int count)
   return dlen;
 }
 
-static int
+static mrb_int
 unpack_qenc(mrb_state *mrb, const void *src, mrb_int slen, mrb_value ary)
 {
   CHECK_UNPACK_LEN(mrb, slen, ary);
@@ -1432,16 +1503,16 @@ unpack_qenc(mrb_state *mrb, const void *src, mrb_int slen, mrb_value ary)
 
   buf = mrb_str_resize(mrb, buf, (mrb_int)(ptr - RSTRING_PTR(buf)));
   mrb_ary_push(mrb, ary, buf);
-  return (int)slen;
+  return slen;
 }
 
-static int
+static mrb_int
 pack_uu(mrb_state *mrb, mrb_value src, mrb_value dst, mrb_int didx, int count)
 {
   char *s = RSTRING_PTR(src);
-  int slen = (int)RSTRING_LEN(src);
-  int lines_written = 0;
-  int dlen = 0;
+  mrb_int slen = RSTRING_LEN(src);
+  mrb_int lines_written = 0;
+  mrb_int dlen = 0;
 
   /* The leading length character holds `count` in six bits, so a line can
    * carry at most 63 bytes, and encoding works on whole 3-byte groups. */
@@ -1469,7 +1540,7 @@ pack_uu(mrb_state *mrb, mrb_value src, mrb_value dst, mrb_int didx, int count)
   char *dptr = RSTRING_PTR(dst) + didx;
 
   while (slen > 0) {
-    int line_len = (slen > count) ? count : slen;
+    int line_len = (slen > count) ? count : (int)slen;
 
     /* Write line length character */
     *dptr++ = uu_encode_table[line_len & 0x3F];
@@ -1517,7 +1588,7 @@ pack_uu(mrb_state *mrb, mrb_value src, mrb_value dst, mrb_int didx, int count)
   return dlen;
 }
 
-static int
+static mrb_int
 unpack_uu(mrb_state *mrb, const void *src, mrb_int slen, mrb_value ary)
 {
   const unsigned char *s = (const unsigned char*)src;
@@ -1585,7 +1656,7 @@ unpack_uu(mrb_state *mrb, const void *src, mrb_int slen, mrb_value ary)
 
   result = mrb_str_resize(mrb, result, (mrb_int)(dptr - dptr_start));
   mrb_ary_push(mrb, ary, result);
-  return (int)slen;
+  return slen;
 }
 
 static int
@@ -1816,10 +1887,17 @@ mrb_pack_pack(mrb_state *mrb, mrb_value ary)
   memset(RSTRING_PTR(result), 0, 128);
   mrb_int aidx = 0;
   mrb_int ridx = 0;
+  /* As in CRuby, the result holds bytes (ASCII-8BIT) once a directive other
+     than U, m, M and u is used; with only those it is text. */
+  mrb_bool binary = FALSE;
   while (has_tmpl(&tmpl)) {
     dir = read_tmpl(mrb, &tmpl, &type, &size, &count, &flags);
 
     if (dir == PACK_DIR_NONE) break;
+    if (dir != PACK_DIR_UTF8 && dir != PACK_DIR_BASE64 &&
+        dir != PACK_DIR_QENC && dir != PACK_DIR_UU) {
+      binary = TRUE;
+    }
     if (dir == PACK_DIR_NUL) {
     grow:
       if (ridx > INT_MAX - count) goto overflow;
@@ -1847,9 +1925,15 @@ mrb_pack_pack(mrb_state *mrb, mrb_value ary)
       if (count == 0 && !(flags & PACK_FLAG_WIDTH))
         break;
 
+      /* What converting and packing one element allocates (a Float turned
+         into a big integer, a boxed Float) is of no use past the element,
+         so the arena is given back after each one. */
+      int ai = mrb_gc_arena_save(mrb);
       o = RARRAY_PTR(ary)[aidx];
       if (type == PACK_TYPE_INTEGER) {
-        o = mrb_ensure_int_type(mrb, o);
+        /* Kept whole: a big integer is reduced to the bits of its directive
+           by pack_int_bits(), not narrowed to mrb_int here. */
+        o = mrb_ensure_integer_type(mrb, o);
       }
 #ifndef MRB_NO_FLOAT
       else if (type == PACK_TYPE_FLOAT) {
@@ -1923,6 +2007,7 @@ mrb_pack_pack(mrb_state *mrb, mrb_value ary)
       default:
         break;
       }
+      mrb_gc_arena_restore(mrb, ai);
       if (flags & PACK_FLAG_COUNT2) {
         /* always consumes 1 entry */
         aidx++;
@@ -1939,6 +2024,7 @@ mrb_pack_pack(mrb_state *mrb, mrb_value ary)
   }
 
   mrb_str_resize(mrb, result, ridx);
+  if (binary) RSTR_ENCODING_SET(mrb_str_ptr(result), MRB_STR_ENCODING_BINARY);
   return result;
 }
 
@@ -1996,20 +2082,24 @@ pack_unpack(mrb_state *mrb, mrb_value str, mrb_bool single)
       continue;
     case PACK_DIR_STR:
       srcidx += unpack_str(mrb, sptr, srclen - srcidx, result, (int)count, flags);
+      unpacked_binary(mrb, result);
       if (single) goto single_return;
       continue;
 
     /* String formats without flags - (mrb, sptr, len, result) */
     case PACK_DIR_BASE64:
       srcidx += unpack_base64(mrb, sptr, srclen - srcidx, result);
+      unpacked_binary(mrb, result);
       if (single) goto single_return;
       continue;
     case PACK_DIR_UU:
       srcidx += unpack_uu(mrb, sptr, srclen - srcidx, result);
+      unpacked_binary(mrb, result);
       if (single) goto single_return;
       continue;
     case PACK_DIR_QENC:
       srcidx += unpack_qenc(mrb, sptr, srclen - srcidx, result);
+      unpacked_binary(mrb, result);
       if (single) goto single_return;
       continue;
 

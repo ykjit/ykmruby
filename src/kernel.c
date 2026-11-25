@@ -56,6 +56,10 @@ inspect_i(mrb_state *mrb, mrb_sym sym, mrb_value v, void *p)
   if (mrb_nil_p(a->str)) {
     const char *cn = mrb_obj_classname(mrb, a->obj);
     a->str = mrb_str_new_capa(mrb, 30);
+    /* Each value's inspect runs Ruby, which must not reach the string
+       through ObjectSpace: it could swap in a shared buffer, and the first
+       byte below is written in place. mrb_obj_inspect() sets the class back. */
+    mrb_str_ptr(a->str)->c = NULL; /* hide from ObjectSpace.each_object */
 
     mrb_str_cat_lit(mrb, a->str, "-<");
     mrb_str_cat_cstr(mrb, a->str, cn);
@@ -111,6 +115,7 @@ mrb_obj_inspect(mrb_state *mrb, mrb_value obj)
     if (!mrb_nil_p(a.str)) {
       mrb_assert(mrb_string_p(a.str));
       mrb_str_cat_lit(mrb, a.str, ">");
+      mrb_str_ptr(a.str)->c = mrb->string_class;
       return a.str;
     }
   }
@@ -267,7 +272,7 @@ mrb_obj_method_recursive_p(mrb_state *mrb, mrb_value obj)
 mrb_value
 mrb_obj_id_m(mrb_state *mrb, mrb_value self)
 {
-  return mrb_fixnum_value(mrb_obj_id(self));
+  return mrb_int_value(mrb, mrb_obj_id(self));
 }
 
 static int
@@ -542,16 +547,39 @@ mrb_false(mrb_state *mrb, mrb_value self)
  *
  *     raise "Failed to create socket"
  *     raise ArgumentError, "No parameters", caller
+ *
+ *  The exception being handled (`$!`) becomes the cause of the one raised;
+ *  `cause:` gives another, or with nil none.
+ *
+ *     raise ArgumentError, "bad value", cause: original_error
  */
 mrb_value
 mrb_f_raise(mrb_state *mrb, mrb_value self)
 {
   mrb_value exc, mesg;
-  mrb_int argc = mrb_get_args(mrb, "|oo", &exc, &mesg);
+  mrb_sym kw_names[] = { MRB_SYM(cause) };
+  mrb_value cause = mrb_undef_value(), opts = mrb_nil_value();
+  mrb_kwargs kw = { 1, 0, kw_names, &cause, &opts };
+  /* the keyword form allocates a Hash for the rest even when there are none */
+  mrb_int argc = mrb->c->ci->kw ? mrb_get_args(mrb, "|oo:", &exc, &mesg, &kw)
+                                : mrb_get_args(mrb, "|oo", &exc, &mesg);
+
+  /* keywords other than cause: are a Hash argument, as in CRuby */
+  if (mrb_hash_p(opts) && !mrb_hash_empty_p(mrb, opts)) {
+    switch (argc) {
+    case 0: exc = opts; break;
+    case 1: mesg = opts; break;
+    default: mrb_argnum_error(mrb, argc + 1, 0, 2);
+    }
+    argc++;
+  }
 
   mrb->c->ci->mid = 0;
   switch (argc) {
   case 0:
+    if (!mrb_undef_p(cause)) {
+      mrb_raise(mrb, E_ARGUMENT_ERROR, "only cause is given with no arguments");
+    }
     /* Re-raise what a rescue clause is running, which is what `$!` names.
        Outside one it is nil, and there being nothing to re-raise is itself
        the RuntimeError.  `!` is not a word, so MRB_GVSYM() cannot spell the
@@ -573,7 +601,7 @@ mrb_f_raise(mrb_state *mrb, mrb_value self)
     /* fall through */
   default:
     exc = mrb_make_exception(mrb, exc, mesg);
-    mrb_exc_raise(mrb, exc);
+    mrb_exc_raise_with_cause(mrb, exc, cause);
     break;
   }
   return mrb_nil_value();            /* not reached */
@@ -832,13 +860,59 @@ mrb_f_defined_super(mrb_state *mrb, mrb_value self)
   return mrb_nil_value();
 }
 
+/* The module Kernel#autoload registers on: the caller's cref, as in CRuby */
+static struct RClass*
+autoload_cref_class(mrb_state *mrb)
+{
+  mrb_callinfo *ci = &mrb->c->ci[-1];
+  struct RClass *c = NULL;
+
+  if (ci >= mrb->c->cibase && ci->proc) c = mrb_vm_cref_class(mrb, ci);
+  if (!c || c->tt == MRB_TT_SCLASS) c = mrb->object_class;
+  return c;
+}
+
+/*
+ *  call-seq:
+ *     autoload(const, path)   -> nil
+ *
+ *  Module#autoload on the module the call is written in, Object at the
+ *  top level.
+ */
+static mrb_value
+mrb_f_autoload(mrb_state *mrb, mrb_value self)
+{
+  mrb_value *argv;
+  mrb_int argc;
+
+  mrb_get_args(mrb, "*", &argv, &argc);
+  return mrb_funcall_argv(mrb, mrb_obj_value(autoload_cref_class(mrb)), MRB_SYM(autoload), argc, argv);
+}
+
+/*
+ *  call-seq:
+ *     autoload?(const, inherit = true)   -> String or nil
+ *
+ *  Module#autoload? on the module the call is written in.
+ */
+static mrb_value
+mrb_f_autoload_p(mrb_state *mrb, mrb_value self)
+{
+  mrb_value *argv;
+  mrb_int argc;
+
+  mrb_get_args(mrb, "*", &argv, &argc);
+  return mrb_funcall_argv(mrb, mrb_obj_value(autoload_cref_class(mrb)), MRB_SYM_Q(autoload), argc, argv);
+}
+
 /* `path` holds the names of a constant path from its root down, and `start`
    says where to look the first one up: nil for the caller's lexical scope
    (`A::B::C`), or the module the path is rooted at (`Object` for `::A::B`).
    Each name below the root resolves the way reading `outer::NAME` resolves
    it, so a constant Object holds is out of reach through any other module,
    and `const_missing` is not asked.  A name that is missing, or an outer
-   value that is not a module, ends the walk at nil rather than raising. */
+   value that is not a module, ends the walk at nil rather than raising.
+   A pending autoload is loaded for every name but the last, as in CRuby. */
 static mrb_value
 mrb_f_defined_const_path(mrb_state *mrb, mrb_value self)
 {
@@ -853,20 +927,22 @@ mrb_f_defined_const_path(mrb_state *mrb, mrb_value self)
   if (mrb_nil_p(start)) {
     mrb_callinfo *ci = &mrb->c->ci[-1];
     if (ci < mrb->c->cibase || ci->proc == NULL) return mrb_nil_value();
-    outer = mrb_vm_const_get_noraise(mrb, ci, mrb_symbol(RARRAY_PTR(path)[0]));
+    outer = mrb_vm_const_get_noraise(mrb, ci, mrb_symbol(RARRAY_PTR(path)[0]), len > 1);
     if (mrb_undef_p(outer)) return mrb_nil_value();
     i = 1;
   }
   else {
     outer = start;
   }
-  for (; i < len; i++) {
+  /* An autoload runs Ruby, which can reach `path` through ObjectSpace and
+     shrink it, so its length is read afresh each turn. */
+  for (; i < RARRAY_LEN(path); i++) {
     enum mrb_vtype t = mrb_type(outer);
     if (t != MRB_TT_CLASS && t != MRB_TT_MODULE && t != MRB_TT_SCLASS) {
       return mrb_nil_value();
     }
     if (!mrb_symbol_p(RARRAY_PTR(path)[i])) return mrb_nil_value();
-    outer = mrb_const_get_noraise(mrb, mrb_class_ptr(outer), mrb_symbol(RARRAY_PTR(path)[i]));
+    outer = mrb_const_get_noraise(mrb, mrb_class_ptr(outer), mrb_symbol(RARRAY_PTR(path)[i]), i < RARRAY_LEN(path) - 1);
     if (mrb_undef_p(outer)) return mrb_nil_value();
   }
   return mrb_str_new_lit_frozen(mrb, "constant");
@@ -926,7 +1002,9 @@ obj_pat_values(mrb_state *mrb, mrb_value self)
   return mrb_nil_value();       /* not reached */
 }
 
-MRB_YK_STATIC const mrb_mt_entry kernel_rom_entries[] = {
+/* The helpers `defined?` compiles to, sent to self: on BasicObject, so that
+   an object that is no Object has them too. */
+MRB_YK_STATIC const mrb_mt_entry defined_rom_entries[] = {
   MRB_MT_ENTRY(mrb_f_defined_const_path, MRB_SYM_Q(__defined_const_path), MRB_ARGS_REQ(2) | MRB_MT_PRIVATE),
   MRB_MT_ENTRY(mrb_f_defined_method, MRB_SYM_Q(__defined_method), MRB_ARGS_REQ(1) | MRB_MT_PRIVATE),
   MRB_MT_ENTRY(mrb_f_defined_method_on, MRB_SYM_Q(__defined_method_on), MRB_ARGS_REQ(2) | MRB_MT_PRIVATE),
@@ -936,9 +1014,14 @@ MRB_YK_STATIC const mrb_mt_entry kernel_rom_entries[] = {
   MRB_MT_ENTRY(mrb_f_defined_gvar,   MRB_SYM_Q(__defined_gvar),   MRB_ARGS_REQ(1) | MRB_MT_PRIVATE),
   MRB_MT_ENTRY(mrb_f_defined_cvar,   MRB_SYM_Q(__defined_cvar),   MRB_ARGS_REQ(1) | MRB_MT_PRIVATE),
   MRB_MT_ENTRY(mrb_f_defined_super,  MRB_SYM_Q(__defined_super),  MRB_ARGS_NONE() | MRB_MT_PRIVATE),
+};
+
+MRB_YK_STATIC const mrb_mt_entry kernel_rom_entries[] = {
   MRB_MT_ENTRY(mrb_eqq_m,                        MRB_OPSYM(eqq),        MRB_ARGS_REQ(1)),  /* 15.3.1.3.2  */
   MRB_MT_ENTRY(mrb_obj_not_match,                MRB_OPSYM(nmatch),      MRB_ARGS_REQ(1)),  /* 11.4.4 c) */
   MRB_MT_ENTRY(mrb_cmp_m,                        MRB_OPSYM(cmp),         MRB_ARGS_REQ(1)),
+  MRB_MT_ENTRY(mrb_f_autoload,                   MRB_SYM(autoload),                  MRB_ARGS_REQ(2) | MRB_MT_PRIVATE),
+  MRB_MT_ENTRY(mrb_f_autoload_p,                 MRB_SYM_Q(autoload),                MRB_ARGS_ARG(1,1) | MRB_MT_PRIVATE),
   MRB_MT_ENTRY(mrb_f_block_given_p_m,    MRB_SYM_Q(block_given),                           MRB_ARGS_NONE() | MRB_MT_PRIVATE),  /* 15.3.1.3.6  */
   MRB_MT_ENTRY(mrb_obj_class_m,                  MRB_SYM(class),                     MRB_ARGS_NONE()),  /* 15.3.1.3.7  */
   MRB_MT_ENTRY(mrb_obj_clone,                    MRB_SYM(clone),                     MRB_ARGS_NONE()),  /* 15.3.1.3.8  */
@@ -956,7 +1039,7 @@ MRB_YK_STATIC const mrb_mt_entry kernel_rom_entries[] = {
   MRB_MT_ENTRY(mrb_obj_is_kind_of_m,             MRB_SYM_Q(kind_of),      MRB_ARGS_REQ(1)),  /* 15.3.1.3.26 */
   MRB_MT_ENTRY(mrb_false,                        MRB_SYM_Q(nil),                     MRB_ARGS_NONE()),  /* 15.3.1.3.32 */
   MRB_MT_ENTRY(mrb_obj_id_m,                     MRB_SYM(object_id),                 MRB_ARGS_NONE()),  /* 15.3.1.3.33 */
-  MRB_MT_ENTRY(mrb_f_raise,              MRB_SYM(raise),                       MRB_ARGS_OPT(2) | MRB_MT_PRIVATE),  /* 15.3.1.3.40 */
+  MRB_MT_ENTRY(mrb_f_raise,              MRB_SYM(raise),                       MRB_ARGS_OPT(2) | MRB_ARGS_KEY(1,1) | MRB_MT_PRIVATE),  /* 15.3.1.3.40 */
   MRB_MT_ENTRY(mrb_obj_remove_instance_variable, MRB_SYM(remove_instance_variable), MRB_ARGS_REQ(1)),  /* 15.3.1.3.41 */
   MRB_MT_ENTRY(obj_respond_to,                   MRB_SYM_Q(respond_to), MRB_ARGS_ARG(1,1)),  /* 15.3.1.3.43 */
   MRB_MT_ENTRY(mrb_any_to_s,                     MRB_SYM(to_s),                      MRB_ARGS_NONE()),  /* 15.3.1.3.46 */
@@ -976,7 +1059,7 @@ MRB_YK_STATIC const mrb_mt_entry kernel_rom_entries[] = {
 MRB_YK_STATIC const mrb_mt_entry kernel_module_function_entries[] = {
   MRB_MT_ENTRY(mrb_f_block_given_p_m, MRB_SYM_Q(block_given), MRB_ARGS_NONE()),  /* 15.3.1.2.2  */
   MRB_MT_ENTRY(mrb_f_block_given_p_m, MRB_SYM_Q(iterator),    MRB_ARGS_NONE()),  /* 15.3.1.2.5  */
-  MRB_MT_ENTRY(mrb_f_raise,           MRB_SYM(raise),      MRB_ARGS_OPT(2)),  /* 15.3.1.2.12 */
+  MRB_MT_ENTRY(mrb_f_raise,           MRB_SYM(raise),      MRB_ARGS_OPT(2) | MRB_ARGS_KEY(1,1)),  /* 15.3.1.2.12 */
 #ifndef HAVE_MRUBY_IO_GEM
   MRB_MT_ENTRY(mrb_p_m,               MRB_SYM(p),          MRB_ARGS_ANY()),
   MRB_MT_ENTRY(mrb_print_m,           MRB_SYM(print),      MRB_ARGS_ANY()),
@@ -990,6 +1073,7 @@ mrb_init_kernel(mrb_state *mrb)
 
   mrb->kernel_module = krn = mrb_define_module_id(mrb, MRB_SYM(Kernel));                                                    /* 15.3.1 */
 
+  MRB_MT_INIT_ROM(mrb, mrb_class_get_id(mrb, MRB_SYM(BasicObject)), defined_rom_entries);
   MRB_MT_INIT_ROM(mrb, krn, kernel_rom_entries);
   MRB_MT_INIT_ROM(mrb, mrb_singleton_class_ptr(mrb, mrb_obj_value(krn)),
                   kernel_module_function_entries);

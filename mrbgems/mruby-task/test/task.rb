@@ -193,6 +193,28 @@ assert("Task without name returns (noname)") do
   assert_equal "(noname)", task.name
 end
 
+class TaskGetClosingName
+  def initialize(task)
+    @task = task
+  end
+
+  def ==(other)
+    @task.close
+    true
+  end
+end
+
+assert("Task.get does not call a name's == while walking the queues") do
+  task = Task.new(name: "task_get_target") { }
+  task.name = TaskGetClosingName.new(task)
+  assert_nil Task.get("task_get_other")
+  assert_equal :READY, task.status
+  task.close
+  found = Task.new(name: "task_get_found") { }
+  assert_same found, Task.get("task_get_found")
+  found.close
+end
+
 # Edge cases
 
 assert("Task.new with block doesn't execute immediately") do
@@ -263,6 +285,41 @@ assert("sleep() no-arg suspends the calling task, not another") do
   assert_equal [:high_start, :low_runs, :high_resume], order
 end
 
+assert("join inside a block called from C fails instead of running on") do
+  # A C caller cannot be switched away from. join used to park the task,
+  # set the switch flag and return at once, so the statement after join
+  # ran before the target had ended.
+  target = Task.new(priority: 200) { :target }
+  err = nil
+  Task.new(priority: 50) do
+    begin
+      TaskTest.yield_from_c { target.join }
+    rescue => e
+      err = e
+    end
+  end
+  Task.run
+  assert_kind_of RuntimeError, err
+  assert_equal "can't join across C function boundary", err.message
+  assert_equal :target, target.value
+end
+
+assert("join of a finished task inside a block called from C returns its value") do
+  target = Task.new { :done }
+  Task.run
+  got = nil
+  Task.new { got = TaskTest.yield_from_c { target.join } }
+  Task.run
+  assert_equal :done, got
+end
+
+assert("join inside a synchronously executed proc fails instead of stalling") do
+  target = Task.new { :never_joined }
+  assert_kind_of RuntimeError, TaskTest.run_sync { target.join }
+  Task.run
+  assert_equal :never_joined, target.value
+end
+
 assert("exception raised from C after blocking past the timeslice is rescuable") do
   # TaskTest.block_then_raise busy-blocks longer than a timeslice before
   # raising, so task.switching is pending when the exception dispatches.
@@ -284,6 +341,126 @@ assert("exception raised from C after blocking past the timeslice is rescuable")
   Task.run
 
   assert_equal "caught raised after blocking", result
+end
+
+# A fiber is a point a task cannot be switched away from: Fiber#resume runs
+# it under a nested mrb_vm_exec, and the scheduler resumes a task at the
+# task's own context. A switch honored inside the fiber returned early from
+# that exec, so resume answered nil and the task died without a trace.
+# TaskTest.block(50) outlasts the timeslice, so a switch is pending after it.
+
+assert("a fiber body that outlives the timeslice runs to its end") do
+  skip unless Object.const_defined?(:Fiber)
+  result = nil
+  Task.new do
+    result = Fiber.new { TaskTest.block(50); :done }.resume
+  end
+  Task.run
+  assert_equal :done, result
+end
+
+assert("a fiber resumed with a switch pending runs to its end") do
+  skip unless Object.const_defined?(:Fiber)
+  result = nil
+  Task.new do
+    TaskTest.block(50)
+    result = Fiber.new { :done }.resume
+  end
+  Task.run
+  assert_equal :done, result
+end
+
+assert("a fiber resumed under a C frame with a switch pending runs to its end") do
+  skip unless Object.const_defined?(:Fiber)
+  result = nil
+  Task.new do
+    TaskTest.block(50)
+    result = TaskTest.yield_from_c { Fiber.new { :done }.resume }
+  end
+  Task.run
+  assert_equal :done, result
+end
+
+assert("Fiber.yield and a second resume across pending switches") do
+  skip unless Object.const_defined?(:Fiber)
+  seen = []
+  Task.new do
+    f = Fiber.new { Fiber.yield :first; TaskTest.block(50); :second }
+    seen << f.resume
+    TaskTest.block(50)
+    seen << f.resume
+    seen << f.alive?
+  end
+  Task.run
+  assert_equal [:first, :second, false], seen
+end
+
+assert("a switch pending inside a fiber is honored once the fiber returns") do
+  skip unless Object.const_defined?(:Fiber)
+  order = []
+  Task.new do
+    Fiber.new { TaskTest.block(50) }.resume
+    order << :first_task
+  end
+  Task.new { order << :second_task }
+  Task.run
+  assert_equal [:second_task, :first_task], order
+end
+
+assert("sleep inside a fiber parks the task and lets the others run") do
+  skip unless Object.const_defined?(:Fiber)
+  order = []
+  Task.new do
+    order << Fiber.new { usleep(20_000); order << :woke; :slept }.resume
+  end
+  Task.new { order << :other }
+  Task.run
+  assert_equal [:other, :woke, :slept], order
+end
+
+assert("Task.current inside a fiber resumed outside any task is the main task") do
+  skip unless Object.const_defined?(:Fiber)
+  assert_equal Task.current, Fiber.new { Task.current }.resume
+end
+
+assert("Task.current and Task.pass inside a fiber") do
+  skip unless Object.const_defined?(:Fiber)
+  current = nil
+  order = []
+  task = Task.new do
+    order << Fiber.new do
+      current = Task.current
+      Task.pass
+      order << :passed
+      :returned
+    end.resume
+  end
+  Task.new { order << :other }
+  Task.run
+  assert_equal task, current
+  assert_equal [:other, :passed, :returned], order
+end
+
+# Resuming a fiber writes RESUMED, then RUNNING, over the CREATED status of
+# the task's own context. The end of the task body was told from the end of
+# a fiber body by that status, so it went to fiber_terminate(), which freed
+# the task's stacks; a task run again on its context (as picoruby-sandbox
+# runs each irb line) then stopped without running its new body.
+assert("a task that resumed a fiber runs a new body after reset_context") do
+  skip unless Object.const_defined?(:Fiber)
+  t = Task.new { Fiber.new { :fiber }.resume }
+  Task.run
+  assert_equal :fiber, t.value
+  TaskTest.rerun(t) { :second }
+  Task.run
+  assert_equal :second, t.value
+  # a fiber left suspended is abandoned by the reset, not resumed
+  TaskTest.rerun(t) { f = Fiber.new { Fiber.yield 1; 2 }; f.resume }
+  Task.run
+  assert_equal 1, t.value
+  TaskTest.rerun(t) { :fourth }
+  Task.run
+  assert_equal :fourth, t.value
 end
 
 assert("exception raised from C after blocking is not leaked into Task#value") do
@@ -358,6 +535,92 @@ assert("scheduler hook cleared with NULL stops firing") do
   Task.pass
   assert_true 1 <= fired
   assert_equal fired, TaskTest.probe_count(0)
+end
+
+# Trace hook tests (mrb_task_set_trace_hook, MRB_USE_TASK_TRACE builds only)
+
+assert("trace hook records the switches of two tasks joined by join") do
+  skip "requires MRB_USE_TASK_TRACE" unless TaskTest.respond_to?(:trace_start)
+  TaskTest.trace_start
+  a = Task.new(name: "trace_a") { Task.pass; :a }
+  b = Task.new(name: "trace_b") { a.join; :b }
+  Task.run
+  TaskTest.trace_stop
+  assert_equal [
+    [0, :create,     :ready,   :none],
+    [1, :create,     :ready,   :none],
+    [0, :switch_in,  :running, :none],
+    [0, :switch_out, :ready,   :none],  # Task.pass
+    [1, :switch_in,  :running, :none],
+    [1, :switch_out, :waiting, :join],
+    [0, :switch_in,  :running, :none],
+    [0, :switch_out, :dormant, :none],  # finished
+    [1, :state,      :ready,   :none],  # woken by the join target
+    [1, :switch_in,  :running, :none],
+    [1, :switch_out, :dormant, :none],
+  ], TaskTest.trace_log([a, b])
+end
+
+assert("trace hook records a queue wakeup made by another task") do
+  skip "requires MRB_USE_TASK_TRACE" unless TaskTest.respond_to?(:trace_start)
+  q = Task::Queue.new
+  TaskTest.trace_start
+  c = Task.new(name: "trace_c") { q.pop }
+  d = Task.new(name: "trace_d") { q.push 1 }
+  Task.run
+  TaskTest.trace_stop
+  assert_equal [
+    [0, :create,     :ready,   :none],
+    [1, :create,     :ready,   :none],
+    [0, :switch_in,  :running, :none],
+    [0, :switch_out, :waiting, :queue],
+    [1, :switch_in,  :running, :none],
+    [0, :state,      :ready,   :none],  # woken by q.push, reported from d
+    [1, :switch_out, :ready,   :none],  # the push hands the CPU over
+    [0, :switch_in,  :running, :none],
+    [0, :switch_out, :dormant, :none],
+    [1, :switch_in,  :running, :none],
+    [1, :switch_out, :dormant, :none],
+  ], TaskTest.trace_log([c, d])
+end
+
+assert("trace hook reports suspend, resume and terminate as state changes") do
+  skip "requires MRB_USE_TASK_TRACE" unless TaskTest.respond_to?(:trace_start)
+  q = Task::Queue.new
+  TaskTest.trace_start
+  e = Task.new(name: "trace_e") { q.pop }
+  f = Task.new(name: "trace_f") { q.pop }
+  Task.pass  # e parks in q.pop
+  Task.pass  # f parks in q.pop
+  e.suspend
+  e.resume
+  f.terminate
+  q.push 1
+  Task.run
+  TaskTest.trace_stop
+  assert_equal [
+    [0, :create,     :ready,     :none],
+    [1, :create,     :ready,     :none],
+    [0, :switch_in,  :running,   :none],
+    [0, :switch_out, :waiting,   :queue],
+    [1, :switch_in,  :running,   :none],
+    [1, :switch_out, :waiting,   :queue],
+    [0, :state,      :suspended, :queue],
+    [0, :state,      :waiting,   :queue],
+    [1, :state,      :dormant,   :queue],
+    [0, :state,      :ready,     :none],   # woken by q.push from the root
+    [0, :switch_in,  :running,   :none],
+    [0, :switch_out, :dormant,   :none],
+  ], TaskTest.trace_log([e, f])
+end
+
+assert("trace hook cleared with NULL stops recording") do
+  skip "requires MRB_USE_TASK_TRACE" unless TaskTest.respond_to?(:trace_start)
+  TaskTest.trace_start
+  TaskTest.trace_stop
+  Task.new(name: "trace_untraced") { Task.pass }
+  Task.run
+  assert_equal 0, TaskTest.trace_count
 end
 
 # Envs on a task stack must be detached before the stack is freed
@@ -465,4 +728,358 @@ assert("a pending task switch does not stall a synchronous execution") do
   assert_equal :ok, TaskTest.run_sync { :ok }
   Task.run
   assert_equal [7], got
+end
+
+assert("a block run by instance_eval on an immediate does not end the task") do
+  # The block's frame has no target class (an Integer, a Float and a Symbol
+  # have no singleton class). Returning from it used to leave mrb_vm_exec()
+  # as if the task had switched contexts: the task ended early, and a
+  # later slice resumed it on a frame already gone.
+  recvs = [1, :sym]
+  recvs << 1.5 if Object.const_defined?(:Float)
+  got = []
+  recvs.each do |recv|
+    Task.new do
+      r = recv.instance_eval { 7 }
+      got << [recv, r]
+      r = recv.instance_eval { Task.pass; 8 }
+      got << [recv, r]
+    end
+  end
+  Task.run
+  assert_equal recvs.size * 2, got.size
+  recvs.each do |recv|
+    assert_include got, [recv, 7]
+    assert_include got, [recv, 8]
+  end
+
+  assert_equal [7, :after], TaskTest.run_sync { [1.instance_eval { 7 }, :after] }
+end
+
+assert("def in instance_eval on an immediate still raises in a task") do
+  err = nil
+  Task.new do
+    begin
+      1.instance_eval { def u2_never_defined; end }
+    rescue TypeError => e
+      err = e
+    end
+  end
+  Task.run
+  assert_kind_of TypeError, err
+  assert_false Integer.method_defined?(:u2_never_defined)
+end
+
+# Fiber.current gives a task's own context a Fiber object. That context is part
+# of the mrb_task, so the object must neither free it nor outlive it unawares.
+assert("Fiber.current in a task") do
+  skip unless Object.const_defined?(:Fiber)
+  fib = nil
+  same = nil
+  alive = nil
+  Task.new do
+    fib = Fiber.current
+    same = fib == Fiber.current
+    alive = fib.alive?
+  end
+  Task.run
+  assert_kind_of Fiber, fib
+  assert_true same
+  assert_true alive
+  assert_false fib.alive?
+  assert_raise(FiberError) { fib.resume }
+end
+
+assert("a Fiber from Fiber.current outlives its closed task") do
+  skip unless Object.const_defined?(:Fiber)
+  fib = nil
+  task = Task.new { fib = Fiber.current }
+  Task.run
+  task.close
+  GC.start
+  assert_false fib.alive?
+  assert_raise(FiberError) { fib.resume }
+  assert_raise(FiberError) { fib.transfer }
+  assert_kind_of String, fib.inspect
+  assert_raise(RuntimeError) { fib.__send__(:initialize) {} }
+end
+
+assert("a Fiber from Fiber.current outlives a synchronous execution") do
+  skip unless Object.const_defined?(:Fiber)
+  fib = TaskTest.run_sync { Fiber.current }
+  GC.start
+  assert_kind_of Fiber, fib
+  assert_false fib.alive?
+end
+
+assert("a fiber transfers back to Fiber.current of its own task") do
+  skip unless Object.const_defined?(:Fiber)
+  got = nil
+  Task.new do
+    task_fiber = Fiber.current
+    got = Fiber.new { task_fiber.transfer(:back) }.transfer
+  end
+  Task.run
+  assert_equal :back, got
+end
+
+assert("a task cannot switch to Fiber.current of another task") do
+  skip unless Object.const_defined?(:Fiber)
+  fib = nil
+  done = false
+  errs = []
+  Task.new do
+    fib = Fiber.current
+    Task.pass until done
+  end
+  Task.new do
+    Task.pass until fib
+    begin
+      fib.resume
+    rescue FiberError => e
+      errs << e
+    end
+    begin
+      fib.transfer
+    rescue FiberError => e
+      errs << e
+    end
+    done = true
+  end
+  Task.run
+  assert_equal 2, errs.size
+end
+
+assert("a task cannot resume Fiber.current of the root context") do
+  skip unless Object.const_defined?(:Fiber)
+  root = Fiber.current
+  err = nil
+  Task.new do
+    begin
+      root.resume
+    rescue FiberError => e
+      err = e
+    end
+  end
+  Task.run
+  assert_kind_of FiberError, err
+end
+
+# The svars array goes with the context; LeakSanitizer catches one left behind.
+assert("a task frees its special variables") do
+  closed = Task.new { TaskTest.set_svar }
+  Task.new { TaskTest.set_svar }  # freed with the heap
+  Task.run
+  closed.close
+  assert_nil TaskTest.run_sync { TaskTest.set_svar }
+end
+
+# Fiber.current gives a task's own context a Fiber object without making the
+# task a fiber: it stays preemptible, and its cooperative calls still park it.
+assert("a task that asked for Fiber.current is still preempted") do
+  skip unless Object.const_defined?(:Fiber)
+  order = []
+  Task.new do
+    Fiber.current
+    TaskTest.block(50)
+    order << :first_task
+  end
+  Task.new { order << :second_task }
+  Task.run
+  assert_equal [:second_task, :first_task], order
+end
+
+assert("Task.current and Task.pass after Fiber.current in a task") do
+  skip unless Object.const_defined?(:Fiber)
+  current = nil
+  passed = false
+  task = Task.new do
+    Fiber.current
+    current = Task.current
+    Task.pass
+    passed = true
+  end
+  Task.run
+  assert_equal task, current
+  assert_true passed
+end
+
+assert("Task.current after Fiber.current on the root context") do
+  skip unless Object.const_defined?(:Fiber)
+  main = Task.current
+  Fiber.current
+  assert_equal main, Task.current
+end
+
+assert("Task#join and Queue#pop inside a fiber") do
+  skip unless Object.const_defined?(:Fiber)
+  order = []
+  q = Task::Queue.new
+  worker = Task.new { usleep(10_000); order << :worker; q.push(:item) }
+  Task.new do
+    order << Fiber.new do
+      worker.join
+      q.pop
+    end.resume
+  end
+  Task.run
+  assert_equal [:worker, :item], order
+end
+
+assert("a task parked in nested fibers comes back through them") do
+  skip unless Object.const_defined?(:Fiber)
+  order = []
+  Task.new do
+    outer = Fiber.new do
+      inner = Fiber.new do
+        usleep(10_000)
+        Fiber.yield :yielded
+        :inner_done
+      end
+      order << inner.resume
+      Task.pass
+      order << inner.resume
+      :outer_done
+    end
+    order << outer.resume
+  end
+  Task.new { order << :other }
+  Task.run
+  assert_equal [:other, :yielded, :inner_done, :outer_done], order
+end
+
+assert("an exception raised after a fiber was parked reaches its resumer") do
+  skip unless Object.const_defined?(:Fiber)
+  err = nil
+  Task.new do
+    begin
+      Fiber.new { Task.pass; raise "after park" }.resume
+    rescue => e
+      err = e.message
+    end
+  end
+  Task.new {}
+  Task.run
+  assert_equal "after park", err
+end
+
+assert("what a parked fiber holds survives a GC") do
+  skip unless Object.const_defined?(:Fiber)
+  got = nil
+  Task.new do
+    got = Fiber.new do
+      s = "kept" * 10
+      usleep(10_000)
+      s
+    end.resume
+  end
+  Task.new do
+    100.times { "garbage" * 10 }
+    GC.start
+  end
+  Task.run
+  assert_equal "kept" * 10, got
+end
+
+assert("a fiber left parked by a closed task is over") do
+  skip unless Object.const_defined?(:Fiber)
+  fib = nil
+  pr = nil
+  task = Task.new do
+    fib = Fiber.new do
+      v = 42
+      pr = lambda { v }
+      Task.pass while true
+    end
+    fib.resume
+  end
+  Task.new do
+    Task.pass until pr
+    task.terminate
+  end
+  Task.run
+  task.close
+  GC.start
+  assert_false fib.alive?
+  assert_raise(FiberError) { fib.resume }
+  assert_equal 42, pr.call
+end
+
+assert("a task that terminates itself inside a fiber stops") do
+  skip unless Object.const_defined?(:Fiber)
+  fib = nil
+  after = false
+  task = Task.new do
+    fib = Fiber.new { Task.current.terminate; Task.pass; after = true }
+    fib.resume
+    after = true
+  end
+  Task.run
+  task.close
+  GC.start
+  assert_false after
+  assert_false fib.alive?
+end
+
+assert("a fiber under a C frame or entered by transfer stays unswitchable") do
+  skip unless Object.const_defined?(:Fiber)
+  order = []
+  raised = []
+  Task.new do
+    TaskTest.yield_from_c do
+      Fiber.new do
+        usleep(10_000)
+        order << :c_frame_slept
+        begin
+          Task.pass
+        rescue RuntimeError => e
+          raised << e.class
+        end
+      end.resume
+    end
+    back = Fiber.current
+    Fiber.new do
+      begin
+        Task.pass
+      rescue RuntimeError => e
+        raised << e.class
+      end
+      back.transfer
+    end.transfer
+  end
+  Task.new { order << :other }
+  Task.run
+  assert_equal [:c_frame_slept, :other], order
+  assert_equal [RuntimeError, RuntimeError], raised
+end
+
+# The symbol GC walks objects and the running context. A waiting task's
+# stack, and the name and value a task keeps in C, are reached by neither.
+assert("symbol GC keeps the symbols a task holds") do
+  stress
+  q = Task::Queue.new
+  local = nil
+  waiter = Task.new { v = "gc-task-local-#{1}".to_sym; q.pop; local = v.to_s }
+  named = Task.new { "gc-task-value-#{1}".to_sym }
+  named.name = "gc-task-name-#{1}".to_sym
+  Task.new do
+    6000.times { |i| "gc-filler-task-#{i}".to_sym }
+    GC.start
+    q.push 1
+  end
+  Task.run
+  assert_equal "gc-task-local-1", local
+  assert_equal "gc-task-name-1", named.name.to_s
+  assert_equal "gc-task-value-1", named.value.to_s
+
+  main = Task.current
+  saved = main.name
+  begin
+    main.name = "gc-task-main-name-#{1}".to_sym
+    6000.times { |i| "gc-filler-task-main-#{i}".to_sym }
+    GC.start
+    assert_equal "gc-task-main-name-1", main.name.to_s
+  ensure
+    main.name = saved
+  end
 end

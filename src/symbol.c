@@ -24,6 +24,7 @@
 #include <mruby/gc.h>
 #include <mruby/range.h>
 #include <mruby/error.h>
+#include <mruby/debug.h>
 #include <mruby/internal.h>
 
 #ifndef MRB_PRESYM_SCANNING
@@ -227,7 +228,7 @@ sym_check(mrb_state *mrb, const char *name, size_t len, mrb_sym i)
   else {
     /* length in BER */
     const uint8_t *p = (const uint8_t*)symname;
-    symlen = mrb_packed_int_decode(p, &p);
+    symlen = mrb_packed_int_decode(p, NULL, &p);
     symname = (const char*)p;
   }
   if (len == symlen && memcmp(symname, name, len) == 0) {
@@ -335,7 +336,7 @@ migrate_to_hash_table(mrb_state *mrb)
     else {
       /* This is a packed length string */
       const uint8_t *p = (const uint8_t*)name;
-      len = mrb_packed_int_decode(p, &p);
+      len = mrb_packed_int_decode(p, NULL, &p);
       name = (const char*)p;
     }
 
@@ -667,7 +668,7 @@ sym2name_len(mrb_state *mrb, mrb_sym sym, char *buf, mrb_int *lenp)
 
   if (!symtbl_is_literal(tagged_ptr)) {
     const uint8_t *p = (const uint8_t*)symname;
-    uint32_t len = mrb_packed_int_decode(p, &p);
+    uint32_t len = mrb_packed_int_decode(p, NULL, &p);
     symname = (const char*)p;
     if (lenp) *lenp = (mrb_int)len;
   }
@@ -770,14 +771,32 @@ sym_gc_mark_hash_entry(mrb_state *mrb, mrb_value key, mrb_value val, void *p)
   return 0;
 }
 
+#ifdef MRB_USE_SET
+/* Callback: mark a symbol element of a Set */
+static void
+sym_gc_mark_set_elem(mrb_state *mrb, mrb_value v, void *p)
+{
+  if (mrb_symbol_p(v)) sym_gc_mark(mrb, mrb_symbol(v));
+}
+#endif
+
+#if defined(MRB_USE_TASK_SCHEDULER) || defined(MRB_USE_GC_WEAK)
+static void
+sym_gc_mark_value(mrb_state *mrb, mrb_value v)
+{
+  if (mrb_symbol_p(v)) sym_gc_mark(mrb, mrb_symbol(v));
+}
+#endif
+
 /* `sym_gc_mark_object` reaches a suspended fiber, whose stack this walks. */
 static void sym_gc_mark_context(mrb_state *mrb, struct mrb_context *c);
 
 /* Mark the symbols an irep holds: the pool the bytecode loads them from, the
-   local variable names, and the same for every irep nested inside it.  An
-   irep is not an object, so the sweep below never reaches one on its own, and
-   a symbol whose only holder is bytecode that has not run yet would be freed
-   out from under the instruction that is going to load it. */
+   local variable names, the file names of its debug info, and the same for
+   every irep nested inside it.  An irep is not an object, so the sweep below
+   never reaches one on its own, and a symbol whose only holder is bytecode
+   that has not run yet would be freed out from under the instruction that is
+   going to load it. */
 static void
 sym_gc_mark_irep(mrb_state *mrb, const mrb_irep *irep)
 {
@@ -788,6 +807,11 @@ sym_gc_mark_irep(mrb_state *mrb, const mrb_irep *irep)
   if (irep->lv) {
     for (int i = 0; i + 1 < irep->nlocals; i++) {
       sym_gc_mark(mrb, irep->lv[i]);
+    }
+  }
+  if (irep->debug_info) {
+    for (int i = 0; i < irep->debug_info->flen; i++) {
+      sym_gc_mark(mrb, irep->debug_info->files[i]->filename_sym);
     }
   }
   for (int i = 0; i < irep->rlen; i++) {
@@ -884,6 +908,22 @@ sym_gc_mark_object(mrb_state *mrb, struct RBasic *obj, void *data)
       if (mrb_symbol_p(v)) sym_gc_mark(mrb, mrb_symbol(v));
     }
     break;
+  case MRB_TT_BACKTRACE:
+    {
+      /* A location keeps the method name and the irep it reports, whose
+         file names may have no other holder once the method is gone. */
+      struct RBacktrace *bt = (struct RBacktrace*)obj;
+      for (size_t i = 0; i < bt->len; i++) {
+        sym_gc_mark(mrb, bt->locations[i].method_id);
+        sym_gc_mark_irep(mrb, bt->locations[i].irep);
+      }
+    }
+    break;
+#ifdef MRB_USE_SET
+  case MRB_TT_SET:
+    mrb_set_foreach(mrb, obj, sym_gc_mark_set_elem, NULL);
+    break;
+#endif
   default:
     break;
   }
@@ -937,6 +977,16 @@ mrb_symbol_gc(mrb_state *mrb)
   if (mrb->c != mrb->root_c) {
     sym_gc_mark_context(mrb, mrb->c);
   }
+#ifdef MRB_USE_TASK_SCHEDULER
+  /* the contexts of the other tasks, and the values a task keeps */
+  mrb_task_foreach(mrb, sym_gc_mark_context, sym_gc_mark_value);
+#endif
+#ifdef MRB_USE_GC_WEAK
+  /* the keys and values of tables that hold objects weakly */
+  for (struct mrb_gc_weak *w = mrb->gc.weaks; w; w = w->next) {
+    if (w->syms) w->syms(mrb, w, sym_gc_mark_value);
+  }
+#endif
 
   /* Mark symbols from global variable table.
      `mrb->globals` is a table of its own, not the instance variables of
@@ -971,7 +1021,7 @@ mrb_symbol_gc(mrb_state *mrb)
       }
       else {
         const uint8_t *p = (const uint8_t*)name;
-        len = mrb_packed_int_decode(p, &p);
+        len = mrb_packed_int_decode(p, NULL, &p);
         name = (const char*)p;
       }
       uint8_t hash = mrb_byte_hash((const uint8_t*)name, len);

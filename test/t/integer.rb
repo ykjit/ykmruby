@@ -76,9 +76,13 @@ assert('Integer#%', '15.2.8.3.5') do
   assert_equal 0, g
   assert_equal 0, h
   assert_equal 0, i
+  assert_raise(ZeroDivisionError) { 0%0 }
   skip unless Object.const_defined?(:Float)
   j = 1%1.0
   assert_equal 0.0, j
+  assert_equal 0.0, 0%2.5
+  assert_kind_of Float, 0%2.5
+  assert_raise(ZeroDivisionError) { 0%0.0 }
 end
 
 assert('Integer#<=>', '15.2.9.3.6') do
@@ -433,6 +437,28 @@ assert('Integer#to_s', '15.2.8.3.25') do
   assert_raise(ArgumentError) { 10.to_s(0) }
   assert_raise(ArgumentError) { 10.to_s(1) }
   assert_raise(ArgumentError) { 10.to_s(37) }
+end
+
+assert('Integer#to_s with a radix that is not an Integer') do
+  assert_raise(TypeError) { 1.to_s("F") }
+  assert_raise(TypeError) { 1.to_s(nil) }
+  assert_equal "1", 1.to_s(2.0) if Object.const_defined?(:Float)
+end
+
+assert('Integer#to_s(2) with the smallest Integer') do
+  # The magnitude of the smallest Integer spends every bit an mrb_int has, so
+  # base 2 is the one conversion that writes MRB_INT_BIT digits and still
+  # takes a sign in front of them. Both widths are asked, so that this
+  # build's is among them; the other one names a value that fits, or one out
+  # of range without mruby-bigint, which is skipped.
+  [31, 63].each do |e|
+    begin
+      min = -(1 << (e - 1)) * 2
+    rescue RangeError
+      next
+    end
+    assert_equal "-1" + "0" * e, min.to_s(2)
+  end
 end
 
 assert('Integer#truncate', '15.2.8.3.26') do

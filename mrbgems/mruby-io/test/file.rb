@@ -26,6 +26,27 @@ assert('File#initialize', '15.2.21.4.1') do
   assert_nil io.close
 end
 
+assert('File.new with keyword options') do
+  io = File.new($mrbtest_io_rfname, mode: "r")
+  assert_equal $mrbtest_io_msg, io.read
+  io.close
+
+  # a descriptor with autoclose: false stays open behind the File
+  io = File.open($mrbtest_io_rfname, "r")
+  dup = File.new(io.fileno, autoclose: false, path: "given")
+  assert_equal "given", dup.path
+  assert_false dup.autoclose?
+  dup.close
+  assert_true dup.closed?
+  assert_equal $mrbtest_io_msg, io.read
+  io.close
+
+  # an unknown keyword is accepted
+  io = File.new($mrbtest_io_rfname, "r", binmode: true)
+  assert_equal $mrbtest_io_msg, io.read
+  io.close
+end
+
 assert('File#path', '15.2.21.4.2') do
   io = File.open($mrbtest_io_rfname, "r")
   assert_equal $mrbtest_io_msg, io.read
@@ -35,12 +56,30 @@ assert('File#path', '15.2.21.4.2') do
   assert_true io.closed?
 end
 
+assert('File#to_path') do
+  File.open($mrbtest_io_rfname, "r") do |io|
+    assert_equal $mrbtest_io_rfname, io.to_path
+  end
+  io = File.new(IO.sysopen($mrbtest_io_rfname), path: "given")
+  assert_equal "given", io.to_path
+  io.close
+end
+
 assert('File.basename') do
+  assert_equal '', File.basename('')
   assert_equal '/', File.basename('//')
   assert_equal 'a', File.basename('/a/')
   assert_equal 'b', File.basename('/a/b')
   assert_equal 'b', File.basename('../a/b')
   assert_raise(ArgumentError) { File.basename("/a/b\0") }
+end
+
+assert('File.split') do
+  assert_equal ['/home/gumby', '.profile'], File.split('/home/gumby/.profile')
+  assert_equal ['.', 'foo'], File.split('foo')
+  assert_equal ['/', '/'], File.split('/')
+  assert_equal ['/a', 'b'], File.split('/a/b/')
+  assert_equal ['.', ''], File.split('')
 end
 
 assert('File.basename with suffix') do
@@ -53,6 +92,27 @@ assert('File.basename with suffix') do
   assert_equal 'foo', File.basename('foo', '')
   assert_equal 'foo.rb', File.basename('foo.rb', '')
   assert_equal 'foo.rb', File.basename('foo.rb', '.RB') # case-sensitive
+end
+
+assert('File.basename with .* suffix') do
+  assert_equal 'foo', File.basename('foo.rb', '.*')
+  assert_equal 'foo.tar', File.basename('foo.tar.gz', '.*')
+  assert_equal 'foo', File.basename('foo', '.*')
+  assert_equal 'foo', File.basename('foo.', '.*')
+  assert_equal 'foo.', File.basename('foo..', '.*')
+  assert_equal 'foo', File.basename('foo.*', '.*')
+  assert_equal '.profile', File.basename('.profile', '.*')
+  assert_equal '.a', File.basename('.a.rb', '.*')
+  assert_equal '..foo', File.basename('..foo', '.*')
+  assert_equal '..foo', File.basename('..foo.rb', '.*')
+  assert_equal '.', File.basename('.', '.*')
+  assert_equal '..', File.basename('..', '.*')
+  assert_equal '...', File.basename('...', '.*')
+  assert_equal '', File.basename('', '.*')
+  assert_equal '/', File.basename('/', '.*')
+  assert_equal '/', File.basename('///', '.*')
+  assert_equal 'foo', File.basename('/a.b/foo.rb/', '.*')
+  assert_equal 'foo', File.basename('/a.b/foo/', '.*')
 end
 
 if MRubyIOTestUtil.win?
@@ -211,6 +271,39 @@ assert('File#mtime') do
   end
 end
 
+assert('File.utime') do
+  path = "#{$mrbtest_io_wfname}.utime"
+  File.write(path, "")
+  begin
+    assert_equal 1, File.utime(1000000000, 1234567890, path)
+    File.open(path) { |f| assert_equal 1234567890, f.mtime.to_i }
+    assert_equal 1, File.utime(Time.at(1300000000), Time.at(1400000000, 500000), path)
+    File.open(path) { |f| assert_equal 1400000000, f.mtime.to_i }
+    if Object.const_defined?(:Float)
+      File.utime(0, 1500000000.75, path)
+      File.open(path) { |f| assert_equal 1500000000, f.mtime.to_i }
+      # before the Epoch: -1.5 is 2 seconds back plus half a second;
+      # _utime() on Windows refuses a time before the Epoch
+      unless MRubyIOTestUtil.win?
+        File.utime(0, -1.5, path)
+        File.open(path) { |f| assert_equal(-2, f.mtime.to_i) }
+      end
+    end
+    now = Time.now.to_i
+    File.utime(nil, nil, path)
+    File.open(path) { |f| assert_true now - 1 <= f.mtime.to_i }
+    File.utime(0, 1234567890, path)
+    File.utime(0, nil, path)
+    File.open(path) { |f| assert_true now - 1 <= f.mtime.to_i }
+    assert_equal 2, File.utime(0, 0, path, path)
+    assert_equal 0, File.utime(0, 0)
+    assert_raise(Errno::ENOENT) { File.utime(0, 0, "#{path}.none") }
+    assert_raise(TypeError) { File.utime("0", 0, path) }
+  ensure
+    File.delete(path)
+  end
+end
+
 assert('File#size and File#truncate') do
   fname = "#{$mrbtest_io_wfname}.resize"
   begin
@@ -246,6 +339,17 @@ assert('File.join') do
   b = ["b"]
   b << [b]
   assert_raise(ArgumentError) { File.join("x", b) }
+end
+
+class MRubyIOTestGrowingPath
+  def initialize(ary); @ary = ary; end
+  def to_path; 8.times { @ary << "c" }; "a"; end
+end
+
+assert('File.join with a to_path that grows the array being joined') do
+  ary = ["b"]
+  ary.unshift(MRubyIOTestGrowingPath.new(ary))
+  assert_equal "a/b" + "/c" * 8, File.join(ary)
 end
 
 assert('File.realpath') do
@@ -435,6 +539,49 @@ assert('File.open - a mode with an execute bit') do
   end
 end
 
+assert('File#inspect') do
+  f = File.new($mrbtest_io_rfname)
+  assert_equal "#<File:#{$mrbtest_io_rfname}>", f.inspect
+  f.close
+  assert_equal "#<File:#{$mrbtest_io_rfname} (closed)>", f.inspect
+
+  fd = IO.sysopen($mrbtest_io_rfname)
+  f = File.new(fd)
+  assert_equal "#<File:fd #{fd}>", f.inspect
+  f.close
+  assert_equal "#<File:(closed)>", f.inspect
+end
+
+assert('File.new with perm:') do
+  path = "#{$mrbtest_io_wfname}.perm-test"
+  probe = "#{$mrbtest_io_wfname}.perm-probe"
+  begin
+    # where the caller writes whatever the bits say (root), a read-only
+    # file tells nothing; see File.umask below
+    File.open(probe, 'w') {}
+    File.chmod(0400, probe)
+    enforced = begin
+      File.open(probe, 'w') {}
+      false
+    rescue Errno::EACCES
+      true
+    end
+
+    f = File.new(path, File::WRONLY | File::CREAT | File::EXCL, perm: 0400)
+    f.write "a"
+    f.close
+    assert_equal "a", File.read(path)
+    assert_raise(Errno::EACCES) { File.open(path, 'w') {} } if enforced
+    assert_raise(ArgumentError) { File.new(path, "r", 0644, perm: 0600) }
+    File.new(path, "r", 0644, perm: nil).close
+  ensure
+    File.chmod(0600, path) rescue nil
+    File.chmod(0600, probe) rescue nil
+    File.delete(path) rescue nil
+    File.delete(probe) rescue nil
+  end
+end
+
 assert('File.umask') do
   path = "#{$mrbtest_io_wfname}.umask-test"
   probe = "#{$mrbtest_io_wfname}.umask-probe"
@@ -497,6 +644,117 @@ assert('File.open with "x" mode') do
   assert_raise(ArgumentError) do
     File.open($mrbtest_io_wfname, "ax") {}
   end
+end
+
+assert('File.atime, File.mtime and File.ctime') do
+  path = "#{$mrbtest_io_wfname}.times"
+  File.open(path, "w") {}
+  begin
+    File.utime(1000000000, 1100000000, path)
+    assert_equal Time, File.atime(path).class
+    assert_equal 1000000000, File.atime(path).to_i
+    assert_equal 1100000000, File.mtime(path).to_i
+    assert_equal Time, File.ctime(path).class
+    File.open(path) do |f|
+      assert_equal f.mtime, File.mtime(path)
+      assert_equal f.ctime, File.ctime(path)
+      # an IO is asked for its file's times
+      assert_equal 1100000000, File.mtime(f).to_i
+    end
+  ensure
+    File.delete(path)
+  end
+  assert_raise(Errno::ENOENT) { File.mtime(path) }
+  assert_raise(Errno::ENOENT) { File.atime(path) }
+  assert_raise(Errno::ENOENT) { File.ctime(path) }
+end
+
+# an object that stands for a path, as a Pathname does
+class MRubyIOTestPath
+  def initialize(path)
+    @path = path
+  end
+
+  def to_path
+    @path
+  end
+end
+
+assert('File methods take an object with to_path for a path') do
+  rfname = $mrbtest_io_rfname
+  path = MRubyIOTestPath.new(rfname)
+  assert_equal rfname, File.path(path)
+  assert_true File.exist?(path)
+  assert_true File.file?(path)
+  assert_false File.directory?(path)
+  assert_equal $mrbtest_io_msg.size, File.size(path)
+  assert_equal File.basename(rfname), File.basename(path)
+  assert_equal File.basename(rfname, ".*"), File.basename(path, ".*")
+  assert_equal File.dirname(rfname), File.dirname(path)
+  assert_equal File.extname(rfname), File.extname(path)
+  assert_equal File.split(rfname), File.split(path)
+  assert_equal File.expand_path(rfname), File.expand_path(path)
+  # an absolute directory the platform spells its own way
+  dir = File.dirname(File.expand_path(rfname))
+  assert_equal File.expand_path("x", dir), File.expand_path("x", MRubyIOTestPath.new(dir))
+  assert_equal File.realpath(rfname), File.realpath(path)
+  assert_equal "a/b/c", File.join(MRubyIOTestPath.new("a"), ["b", MRubyIOTestPath.new("c")])
+  assert_true File.absolute_path?(MRubyIOTestPath.new(dir))
+  assert_raise(TypeError) { File.exist?(Object.new) }
+  assert_raise(TypeError) { File.path(1) }
+end
+
+assert('File.open takes an object with to_path for a path') do
+  path = MRubyIOTestPath.new($mrbtest_io_rfname)
+  File.open(path) do |f|
+    assert_equal $mrbtest_io_rfname, f.path
+    assert_equal $mrbtest_io_msg, f.read
+  end
+  assert_equal $mrbtest_io_msg, File.read(path)
+  # a File stands for its path
+  File.open($mrbtest_io_rfname) do |f|
+    assert_equal $mrbtest_io_rfname, File.path(f)
+    File.open(f) { |g| assert_equal $mrbtest_io_msg, g.read }
+  end
+end
+
+assert('File.chmod, File.rename and File.delete take an object with to_path') do
+  wfname = $mrbtest_io_wfname
+  moved = wfname + ".moved"
+  File.open(wfname, "w") {}
+  assert_equal 1, File.chmod(0644, MRubyIOTestPath.new(wfname))
+  assert_equal 0, File.rename(MRubyIOTestPath.new(wfname), MRubyIOTestPath.new(moved))
+  assert_true File.exist?(moved)
+  assert_equal 1, File.delete(MRubyIOTestPath.new(moved))
+  assert_false File.exist?(moved)
+end
+
+# a path whose to_path runs a block first
+class MRubyIOTestPathHook < MRubyIOTestPath
+  def initialize(path, &hook)
+    super(path)
+    @hook = hook
+  end
+
+  def to_path
+    @hook.call
+    super
+  end
+end
+
+assert('File.expand_path, File.absolute_path and File.basename read a string argument after to_path') do
+  # to_path moves the other argument out of its embedded buffer, so a pointer
+  # taken before it no longer points at the string's bytes
+  long = "/" + "b" * 100
+  dir = "/a"
+  assert_equal File.expand_path("x", long),
+               File.expand_path(MRubyIOTestPathHook.new("x") { dir.replace(long) }, dir)
+  dir = "/a"
+  assert_equal File.absolute_path("x", long),
+               File.absolute_path(MRubyIOTestPathHook.new("x") { dir.replace(long) }, dir)
+  sfx = ".rb"
+  ext = "g" * 100
+  assert_equal "foo", File.basename(MRubyIOTestPathHook.new("d/foo" + ext) { sfx.replace(ext) }, sfx)
 end
 
 MRubyIOTestUtil.io_test_cleanup

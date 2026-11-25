@@ -22,6 +22,7 @@
    reports a child's exit. */
 #if defined(_WIN32)
   #include <winsock.h>    /* getsockopt(), to tell a socket from a descriptor */
+  #include <io.h>         /* _setmode() */
   #include <stdlib.h>
   #define WEXITSTATUS(x) (x)
 
@@ -56,6 +57,8 @@ struct mrb_data_type mrb_io_type = { "IO", io_free };
 
 static int io_modestr_to_flags(mrb_state *mrb, const char *modestr);
 static int io_mode_to_flags(mrb_state *mrb, mrb_value mode);
+static int io_fill_buf_comp(mrb_state *mrb, struct mrb_io *fptr);
+static void io_buf_shift(struct mrb_io_buf *buf, mrb_int n);
 static void fptr_finalize(mrb_state *mrb, struct mrb_io *fptr, int quiet);
 
 /* Every method that touches the stream starts here; only the ones that give a
@@ -152,13 +155,107 @@ io_modestr_to_flags(mrb_state *mrb, const char *mode)
         flags = (flags & ~OPEN_ACCESS_MODE_FLAGS) | O_RDWR;
         break;
       case ':':
-        /* XXX: PASSTHROUGH*/
+        /* the encoding follows ("r:UTF-8"); io_mode_binary_p() reads it */
+        return flags;
       default:
         mode_error(mrb, mode);
     }
   }
 
   return flags;
+}
+
+/* whether `p` (`len` bytes) spells `name`, letter case aside */
+static mrb_bool
+io_enc_name_p(const char *p, mrb_int len, const char *name)
+{
+  mrb_int i;
+
+  for (i = 0; i < len && name[i]; i++) {
+    if (TOLOWER(p[i]) != TOLOWER(name[i])) return FALSE;
+  }
+  return i == len && name[i] == '\0';
+}
+
+/* An encoding, as a mode names it after its ':' ("r:UTF-8",
+   "rb:BOM|UTF-8:UTF-8") or the encoding: and external_encoding: options do.
+   mruby reads UTF-8 and binary only: ASCII-8BIT and BINARY make the stream
+   binary, and "BOM|" has a UTF-8 byte order mark at the start skipped. Any
+   other name reads as UTF-8; CRuby too ignores a name it does not know. The
+   part after a second ':', the internal encoding, is mruby's own anyway.
+   `*named` is set, since a named encoding decides what a read answers. */
+static void
+io_enc_parse(const char *p, mrb_int len, mrb_bool *named, mrb_bool *binary, mrb_bool *bom)
+{
+  const char *colon = (const char*)memchr(p, ':', len);
+  if (colon) len = colon - p;
+  if (len >= 4 && io_enc_name_p(p, 4, "BOM|")) {
+    *bom = TRUE;
+    p += 4;
+    len -= 4;
+  }
+  if (len == 0) return;
+  *named = TRUE;
+  *binary = io_enc_name_p(p, len, "BINARY") || io_enc_name_p(p, len, "ASCII-8BIT");
+}
+
+/* Does the stream read binary strings? The mode ("rb", "wb+", ... or
+   File::BINARY) or the binmode: option says so, unless an encoding is named
+   ("r:BINARY", "rb:UTF-8", or the encoding: or external_encoding: option),
+   which decides, as in CRuby. `*fd_binary` tells whether the descriptor
+   itself is put in binary mode (no newline conversion), which "b" and a
+   binary encoding do, and `*bom` whether a byte order mark is skipped. */
+static mrb_bool
+io_mode_binary_p(mrb_state *mrb, mrb_value mode, mrb_value opt, mrb_bool *fd_binary, mrb_bool *bom)
+{
+  mrb_bool binary = FALSE, named = FALSE, enc_binary = FALSE;
+
+  *bom = FALSE;
+  if (mrb_string_p(mode)) {
+    const char *p = RSTRING_PTR(mode);
+    mrb_int len = RSTRING_LEN(mode);
+    const char *colon = (const char*)memchr(p, ':', len);
+    mrb_int flen = colon ? colon - p : len;
+
+    binary = memchr(p, 'b', flen) != NULL;
+    if (colon) io_enc_parse(colon + 1, len - flen - 1, &named, &enc_binary, bom);
+  }
+  else if (mrb_integer_p(mode)) {
+    binary = (mrb_integer(mode) & MRB_O_BINARY) != 0;
+  }
+  if (!mrb_nil_p(opt)) {
+    static const mrb_sym keys[] = { MRB_SYM(encoding), MRB_SYM(external_encoding) };
+    mrb_value v = mrb_hash_get(mrb, opt, mrb_symbol_value(MRB_SYM(binmode)));
+    if (mrb_test(v)) binary = TRUE;
+    for (int i = 0; i < 2; i++) {
+      v = mrb_hash_get(mrb, opt, mrb_symbol_value(keys[i]));
+      if (mrb_string_p(v)) io_enc_parse(RSTRING_PTR(v), RSTRING_LEN(v), &named, &enc_binary, bom);
+    }
+  }
+  *fd_binary = binary || enc_binary;
+  return named ? enc_binary : binary;
+}
+
+/* On Windows the CRT turns CRLF into LF on a descriptor left in text mode,
+   which is what a mode without "b" leaves it in: binary mode is the
+   descriptor's to keep, not only a flag of ours. */
+static void
+io_fd_binmode(struct mrb_io *fptr)
+{
+#ifdef _WIN32
+  /* a Winsock handle is no CRT descriptor, and IO#initialize runs before
+     the socket says it is one */
+  DWORD err;
+  int len = sizeof(err);
+  if (fptr->is_socket ||
+      getsockopt(fptr->fd, SOL_SOCKET, SO_ERROR, (char*)&err, &len) == 0) {
+    return;
+  }
+  if (fptr->fd >= 0) _setmode(fptr->fd, _O_BINARY);
+  if (fptr->fd2 >= 0) _setmode(fptr->fd2, _O_BINARY);
+#else
+  (void)fptr;
+#endif
 }
 
 static int
@@ -316,6 +413,11 @@ option_to_fd(mrb_state *mrb, mrb_value v)
     case MRB_TT_CDATA: /* IO */
       return mrb_io_fileno(mrb, v);
     case MRB_TT_INTEGER:
+#if MRB_INT_MAX > INT_MAX
+      if (mrb_integer(v) < INT_MIN || mrb_integer(v) > INT_MAX) {
+        mrb_raisef(mrb, E_RANGE_ERROR, "file descriptor out of range: %v", v);
+      }
+#endif
       return (int)mrb_integer(v);
     default:
       mrb_raise(mrb, E_ARGUMENT_ERROR, "wrong exec redirect action");
@@ -478,6 +580,7 @@ io_init_copy(mrb_state *mrb, mrb_value copy)
   fptr_copy->writable = fptr_orig->writable;
   fptr_copy->sync = fptr_orig->sync;
   fptr_copy->is_socket = fptr_orig->is_socket;
+  fptr_copy->binmode = fptr_orig->binmode;
 
   io_init_buf(mrb, fptr_copy);
 
@@ -577,6 +680,26 @@ check_file_descriptor(mrb_state *mrb, mrb_int fd)
   if (errno == EBADF) badfd_error(mrb);
 }
 
+/* "BOM|UTF-8": a UTF-8 byte order mark at the start is no text, and is
+   skipped as the stream opens, as CRuby does. A read may hand over less than
+   the whole mark, as a pipe's may, so reading goes on while what is there
+   could still be one. */
+static mrb_value
+io_skip_bom(mrb_state *mrb, void *p)
+{
+  static const char bom[] = "\xEF\xBB\xBF";
+  struct mrb_io *fptr = (struct mrb_io*)p;
+  struct mrb_io_buf *buf = fptr->buf;
+
+  while (buf->len < 3 && memcmp(buf->mem + buf->start, bom, buf->len) == 0) {
+    if (io_fill_buf_comp(mrb, fptr) == 0) break;  /* the end, or no room */
+  }
+  if (buf->len >= 3 && memcmp(buf->mem + buf->start, bom, 3) == 0) {
+    io_buf_shift(buf, 3);
+  }
+  return mrb_nil_value();
+}
+
 static mrb_value
 io_init(mrb_state *mrb, mrb_value io)
 {
@@ -588,19 +711,39 @@ io_init(mrb_state *mrb, mrb_value io)
     mrb_warn(mrb, "File.new() does not take block; use File.open() instead");
   }
   mrb_get_args(mrb, "i|oH", &fd, &mode, &opt);
-  switch (fd) {
-    case 0: /* STDIN_FILENO */
-    case 1: /* STDOUT_FILENO */
-    case 2: /* STDERR_FILENO */
-      break;
-    default:
-      check_file_descriptor(mrb, fd);
-      break;
+  if (mrb_hash_p(mode) && mrb_nil_p(opt)) {
+    /* IO.new(fd, autoclose: false): the keywords without a mode */
+    opt = mode;
+    mode = mrb_nil_value();
+  }
+  if (mrb_nil_p(mode) && !mrb_nil_p(opt)) {
+    mode = mrb_hash_get(mrb, opt, mrb_symbol_value(MRB_SYM(mode)));
   }
   int flags = io_mode_to_flags(mrb, mode);
+  /* the keyword options: autoclose: false keeps the descriptor open
+   * after close and binmode: true sets binary mode; the others (path:,
+   * ...) are accepted and left to the caller */
+  mrb_bool autoclose = TRUE;
+  if (!mrb_nil_p(opt)) {
+    mrb_value v = mrb_hash_get(mrb, opt, mrb_symbol_value(MRB_SYM(autoclose)));
+    if (!mrb_nil_p(v)) autoclose = mrb_test(v);
+  }
+  /* the lookups can run a Hash's default proc, which can initialize io
+     again: ask them all before the struct below is freed and replaced */
+  mrb_bool fd_binary, bom;
+  mrb_bool binmode = io_mode_binary_p(mrb, mode, opt, &fd_binary, &bom);
+  /* after the lookups: one of them may have closed the descriptor */
+  if (fd < 0 || fd > 2) check_file_descriptor(mrb, fd);
 
   struct mrb_io *fptr = (struct mrb_io*)DATA_PTR(io);
   if (fptr != NULL) {
+    /* the old stream would close the descriptor it is asked to adopt,
+       leaving io on a number the next open() hands out again */
+    if (fd > 2 && ((fptr->fd == fd && fptr->close_fd) ||
+                   (fptr->fd2 == fd && fptr->close_fd2))) {
+      errno = EBADF;
+      badfd_error(mrb);
+    }
     fptr_finalize(mrb, fptr, TRUE);
     mrb_free(mrb, fptr);
   }
@@ -612,7 +755,22 @@ io_init(mrb_state *mrb, mrb_value io)
   fptr->fd = (int)fd;
   fptr->readable = OPEN_READABLE_P(flags);
   fptr->writable = OPEN_WRITABLE_P(flags);
+  fptr->close_fd = autoclose;
+  fptr->close_fd2 = autoclose;
+  fptr->binmode = binmode;
+  if (fd_binary) io_fd_binmode(fptr);
   io_init_buf(mrb, fptr);
+  if (bom && fptr->readable) {
+    mrb_bool error;
+    mrb_value exc = mrb_protect_error(mrb, io_skip_bom, fptr, &error);
+    if (error) {
+      /* the stream did not open: the descriptor stays the caller's to
+         close, as it is when IO.new raises before taking it */
+      fptr->fd = -1;
+      fptr->fd2 = -1;
+      mrb_exc_raise(mrb, exc);
+    }
+  }
   return io;
 }
 
@@ -784,9 +942,12 @@ io_s_sysopen(mrb_state *mrb, mrb_value klass)
 {
   mrb_value path = mrb_nil_value();
   mrb_value mode = mrb_nil_value();
-  mrb_int perm = -1;
+  mrb_value perm_v = mrb_nil_value();
 
-  mrb_get_args(mrb, "S|oi", &path, &mode, &perm);
+  /* a nil permission is the default one, as an omitted one is */
+  mrb_get_args(mrb, "o|oo", &path, &mode, &perm_v);
+  path = mrb_io_path(mrb, path);
+  mrb_int perm = mrb_nil_p(perm_v) ? -1 : mrb_as_int(mrb, perm_v);
   if (perm < 0) {
     perm = 0666;
   }
@@ -801,6 +962,32 @@ static void
 eof_error(mrb_state *mrb)
 {
   mrb_raise(mrb, E_EOF_ERROR, "end of file reached");
+}
+
+/* What a read hands back is binary (ASCII-8BIT in CRuby) when it was read
+   by its length in bytes, as #read(length), #sysread and #pread read, or
+   from a stream in binary mode; otherwise it keeps the default encoding. */
+static mrb_value
+io_str_binary(mrb_value str)
+{
+  if (mrb_string_p(str)) {
+    RSTR_ENCODING_SET(mrb_str_ptr(str), MRB_STR_ENCODING_BINARY);
+  }
+  return str;
+}
+
+static mrb_value
+io_str_read(struct mrb_io *fptr, mrb_value str)
+{
+  return fptr->binmode ? io_str_binary(str) : str;
+}
+
+/* A read by length is binary, but a buffer the caller hands in keeps its
+   own encoding, as in CRuby. */
+static mrb_value
+io_str_bytes(mrb_value str, mrb_bool outbuf_given)
+{
+  return outbuf_given ? str : io_str_binary(str);
 }
 
 /* The unbuffered readers (#sysread, #pread) hand the descriptor a string of
@@ -854,11 +1041,12 @@ io_sysread(mrb_state *mrb, mrb_value io)
 
   mrb_get_args(mrb, "i|S", &maxlen, &buf);
 
+  mrb_bool given = !mrb_nil_p(buf);
   buf = io_sysread_buf(mrb, buf, maxlen);
-  if (maxlen == 0) return buf;
+  if (maxlen == 0) return io_str_binary(buf);
   struct mrb_io *fptr = io_get_read_fptr(mrb, io);
   mrb_int n = mrb_hal_io_read(mrb, fptr->fd, RSTRING_PTR(buf), (size_t)maxlen);
-  return io_sysread_done(mrb, fptr, buf, n);
+  return io_str_bytes(io_sysread_done(mrb, fptr, buf, n), given);
 }
 
 static mrb_value
@@ -957,13 +1145,6 @@ fd_write_buf(mrb_state *mrb, int fd, const char *ptr, mrb_int len)
   return len;
 }
 
-static mrb_int
-fd_write(mrb_state *mrb, int fd, mrb_value str)
-{
-  str = mrb_obj_as_string(mrb, str);
-  return fd_write_buf(mrb, fd, RSTRING_PTR(str), RSTRING_LEN(str));
-}
-
 #define FD_WRITE_LIT(mrb, fd, s) fd_write_buf(mrb, fd, "" s "", sizeof(s) - 1)
 
 /* Writing to a stream that has read ahead of what the caller consumed puts
@@ -990,17 +1171,35 @@ io_prepare_write(mrb_state *mrb, struct mrb_io *fptr)
   fptr->buf->start = fptr->buf->len = 0;
 }
 
+/* The descriptor to write to, valid only until Ruby runs again: an
+   argument's #to_s can close or reopen the stream, and the number a close
+   frees goes to the next file opened, so every writer below looks it up
+   again after each conversion. */
+static int
+io_write_fd(mrb_state *mrb, mrb_value io)
+{
+  struct mrb_io *fptr = io_get_write_fptr(mrb, io);
+
+  io_prepare_write(mrb, fptr);
+  return io_get_write_fd(fptr);
+}
+
+static mrb_int
+io_write_obj(mrb_state *mrb, mrb_value io, mrb_value obj)
+{
+  mrb_value str = mrb_obj_as_string(mrb, obj);
+  return fd_write_buf(mrb, io_write_fd(mrb, io), RSTRING_PTR(str), RSTRING_LEN(str));
+}
+
 static mrb_value
 io_write(mrb_state *mrb, mrb_value io)
 {
-  struct mrb_io *fptr = io_get_write_fptr(mrb, io);
-  int fd = io_get_write_fd(fptr);
-
-  io_prepare_write(mrb, fptr);
+  /* A stream that cannot be written fails before any argument is converted. */
+  io_write_fd(mrb, io);
 
   mrb_int len = 0;
   if (mrb_get_argc(mrb) == 1) {
-    len = fd_write(mrb, fd, mrb_get_arg1(mrb));
+    len = io_write_obj(mrb, io, mrb_get_arg1(mrb));
   }
   else {
     mrb_value *argv;
@@ -1008,7 +1207,7 @@ io_write(mrb_state *mrb, mrb_value io)
 
     mrb_get_args(mrb, "*", &argv, &argc);
     while (argc--) {
-      len += fd_write(mrb, fd, *argv++);
+      len += io_write_obj(mrb, io, *argv++);
     }
   }
   return mrb_int_value(mrb, len);
@@ -1016,14 +1215,15 @@ io_write(mrb_state *mrb, mrb_value io)
 
 /* Helper function to write a string followed by newline if needed */
 static void
-io_puts_str(mrb_state *mrb, int fd, mrb_value str)
+io_puts_str(mrb_state *mrb, mrb_value io, mrb_value str)
 {
   str = mrb_obj_as_string(mrb, str);
   const char *ptr = RSTRING_PTR(str);
   mrb_int len = RSTRING_LEN(str);
+  int fd = io_write_fd(mrb, io);
 
   /* Write the original string */
-  fd_write(mrb, fd, str);
+  fd_write_buf(mrb, fd, ptr, len);
 
   /* Add newline if string doesn't end with one */
   if (len == 0 || ptr[len-1] != '\n') {
@@ -1037,10 +1237,10 @@ io_puts_str(mrb_state *mrb, int fd, mrb_value str)
 
 /* Recursive helper for puts with arrays */
 static void
-io_puts_ary(mrb_state *mrb, int fd, mrb_value ary, int depth)
+io_puts_ary(mrb_state *mrb, mrb_value io, mrb_value ary, int depth)
 {
   if (depth >= IO_PUTS_MAX_DEPTH) {
-    FD_WRITE_LIT(mrb, fd, "[...]\n");
+    FD_WRITE_LIT(mrb, io_write_fd(mrb, io), "[...]\n");
     return;
   }
 
@@ -1048,7 +1248,7 @@ io_puts_ary(mrb_state *mrb, int fd, mrb_value ary, int depth)
 
   if (len == 0) {
     /* Empty array - write a single newline */
-    FD_WRITE_LIT(mrb, fd, "\n");
+    FD_WRITE_LIT(mrb, io_write_fd(mrb, io), "\n");
     return;
   }
 
@@ -1059,10 +1259,16 @@ io_puts_ary(mrb_state *mrb, int fd, mrb_value ary, int depth)
   for (mrb_int i = 0; i < len && i < RARRAY_LEN(ary); i++) {
     mrb_value elem = RARRAY_PTR(ary)[i];
     if (mrb_array_p(elem)) {
-      io_puts_ary(mrb, fd, elem, depth + 1);
+      /* Nothing but this walk holds a nested array once an element's #to_s
+         drops it from `ary`, so it stays on the arena until the walk is done
+         with it. */
+      int ai = mrb_gc_arena_save(mrb);
+      mrb_gc_protect(mrb, elem);
+      io_puts_ary(mrb, io, elem, depth + 1);
+      mrb_gc_arena_restore(mrb, ai);
     }
     else {
-      io_puts_str(mrb, fd, elem);
+      io_puts_str(mrb, io, elem);
     }
   }
 }
@@ -1070,11 +1276,7 @@ io_puts_ary(mrb_state *mrb, int fd, mrb_value ary, int depth)
 static mrb_value
 io_puts(mrb_state *mrb, mrb_value io)
 {
-  struct mrb_io *fptr = io_get_write_fptr(mrb, io);
-  int fd = io_get_write_fd(fptr);
-
-  /* Prepare IO for writing (handle read buffer adjustment) */
-  io_prepare_write(mrb, fptr);
+  int fd = io_write_fd(mrb, io);
 
   mrb_value *argv;
   mrb_int argc;
@@ -1090,10 +1292,10 @@ io_puts(mrb_state *mrb, mrb_value io)
   for (mrb_int i = 0; i < argc; i++) {
     mrb_value arg = argv[i];
     if (mrb_array_p(arg)) {
-      io_puts_ary(mrb, fd, arg, 0);
+      io_puts_ary(mrb, io, arg, 0);
     }
     else {
-      io_puts_str(mrb, fd, arg);
+      io_puts_str(mrb, io, arg);
     }
   }
 
@@ -1111,11 +1313,7 @@ io_puts(mrb_state *mrb, mrb_value io)
 static mrb_value
 io_print(mrb_state *mrb, mrb_value io)
 {
-  struct mrb_io *fptr = io_get_write_fptr(mrb, io);
-  int fd = io_get_write_fd(fptr);
-
-  /* Prepare IO for writing (handle read buffer adjustment) */
-  io_prepare_write(mrb, fptr);
+  io_write_fd(mrb, io);         /* fail before converting, as #write does */
 
   mrb_value *argv;
   mrb_int argc;
@@ -1123,8 +1321,7 @@ io_print(mrb_state *mrb, mrb_value io)
 
   /* Convert each argument to string and write it */
   for (mrb_int i = 0; i < argc; i++) {
-    mrb_value str = mrb_obj_as_string(mrb, argv[i]);
-    fd_write(mrb, fd, str);
+    io_write_obj(mrb, io, argv[i]);
   }
 
   return mrb_nil_value();
@@ -1141,13 +1338,10 @@ io_print(mrb_state *mrb, mrb_value io)
 static mrb_value
 io_putc(mrb_state *mrb, mrb_value io)
 {
-  struct mrb_io *fptr = io_get_write_fptr(mrb, io);
-  int fd = io_get_write_fd(fptr);
+  int fd = io_write_fd(mrb, io);
   mrb_value c = mrb_get_arg1(mrb);
   const char *ptr;
   mrb_int write_len;
-
-  io_prepare_write(mrb, fptr);
 
   if (mrb_integer_p(c)) {
     unsigned char byte = (unsigned char)(mrb_integer(c) & 0xff);
@@ -1165,6 +1359,7 @@ io_putc(mrb_state *mrb, mrb_value io)
   }
   else {
     str = mrb_obj_as_string(mrb, c);
+    fd = io_write_fd(mrb, io);
   }
 
   ptr = RSTRING_PTR(str);
@@ -1202,16 +1397,8 @@ io_putc(mrb_state *mrb, mrb_value io)
 static mrb_value
 io_lshift(mrb_state *mrb, mrb_value io)
 {
-  struct mrb_io *fptr = io_get_write_fptr(mrb, io);
-  int fd = io_get_write_fd(fptr);
-
-  /* Prepare IO for writing (handle read buffer adjustment) */
-  io_prepare_write(mrb, fptr);
-
-  mrb_value str = mrb_get_arg1(mrb);
-  str = mrb_obj_as_string(mrb, str);
-  fd_write(mrb, fd, str);
-
+  io_write_fd(mrb, io);         /* fail before converting, as #write does */
+  io_write_obj(mrb, io, mrb_get_arg1(mrb));
   return io;
 }
 
@@ -1370,7 +1557,11 @@ time2timeval(mrb_state *mrb, mrb_value time)
 
 #ifndef MRB_NO_FLOAT
     case MRB_TT_FLOAT:
-      t.tv_sec = (mrb_int)mrb_float(time);
+      /* The seconds go through the checked conversion: a Float no mrb_int
+         holds, Infinity and NaN among them, is out of range rather than
+         whatever the cast makes of it.  The microseconds are the fraction
+         left over, which is bounded once the seconds are. */
+      t.tv_sec = mrb_as_int(mrb, time);
       t.tv_usec = (mrb_int)((mrb_float(time) - t.tv_sec) * 1000000.0);
       break;
 #endif
@@ -1781,6 +1972,40 @@ io_sync(mrb_state *mrb, mrb_value io)
   return mrb_bool_value(fptr->sync);
 }
 
+/*
+ * call-seq:
+ *   ios.binmode -> ios
+ *
+ * Puts the stream into binary mode and returns it.  Strings are bytes,
+ * so what changes is that a platform translating line endings in text
+ * mode (Windows) stops doing so.
+ *
+ *   f = File.new("testfile")
+ *   f.binmode.binmode?   #=> true
+ */
+static mrb_value
+io_binmode(mrb_state *mrb, mrb_value io)
+{
+  struct mrb_io *fptr = io_get_open_fptr(mrb, io);
+  fptr->binmode = 1;
+  io_fd_binmode(fptr);
+  return io;
+}
+
+/*
+ * call-seq:
+ *   ios.binmode? -> true or false
+ *
+ * Returns whether the stream is in binary mode: opened with a "b" mode,
+ * File::BINARY or binmode: true, or put into it by #binmode.
+ */
+static mrb_value
+io_binmode_p(mrb_state *mrb, mrb_value io)
+{
+  struct mrb_io *fptr = io_get_open_fptr(mrb, io);
+  return mrb_bool_value(fptr->binmode);
+}
+
 #ifndef MRB_USE_IO_PREAD_PWRITE
 # define io_pread   mrb_notimplement_m
 # define io_pwrite  mrb_notimplement_m
@@ -1806,11 +2031,12 @@ io_pread(mrb_state *mrb, mrb_value io)
   mrb_get_args(mrb, "io|S!", &maxlen, &off, &buf);
 
   off_t offset = (off_t)mrb_as_int(mrb, off);
+  mrb_bool given = !mrb_nil_p(buf);
   buf = io_sysread_buf(mrb, buf, maxlen);
-  if (maxlen == 0) return buf;
+  if (maxlen == 0) return io_str_binary(buf);
   struct mrb_io *fptr = io_get_read_fptr(mrb, io);
   mrb_int n = (mrb_int)pread(fptr->fd, RSTRING_PTR(buf), (size_t)maxlen, offset);
-  return io_sysread_done(mrb, fptr, buf, n);
+  return io_str_bytes(io_sysread_done(mrb, fptr, buf, n), given);
 }
 
 /*
@@ -1907,6 +2133,9 @@ io_ungetbyte(mrb_state *mrb, mrb_value io)
   mrb_value c = mrb_get_arg1(mrb);
   unsigned char byte_val;
 
+  if (mrb_nil_p(c)) {
+    return mrb_nil_value(); /* nil pushes nothing back, as in CRuby */
+  }
   if (mrb_string_p(c)) {
     if (RSTRING_LEN(c) == 0) {
       return mrb_nil_value(); /* Empty string, do nothing */
@@ -1914,7 +2143,7 @@ io_ungetbyte(mrb_state *mrb, mrb_value io)
     byte_val = (unsigned char)RSTRING_PTR(c)[0];
   }
   else {
-    mrb_int val = mrb_integer(c);
+    mrb_int val = mrb_as_int(mrb, c);
     byte_val = (unsigned char)(val & 0xff);
   }
 
@@ -2049,6 +2278,7 @@ io_read(mrb_state *mrb, mrb_value io)
   struct mrb_io *fptr = io_get_read_fptr(mrb, io);
 
   mrb_get_args(mrb, "|o?S", &len, &length_given, &outbuf);
+  mrb_bool given = !mrb_nil_p(outbuf);
   if (length_given) {
     if (mrb_nil_p(len)) {
       length_given = FALSE;
@@ -2059,14 +2289,14 @@ io_read(mrb_state *mrb, mrb_value io)
         mrb_raisef(mrb, E_ARGUMENT_ERROR, "negative length %i given", length);
       }
       if (length == 0) {
-        return io_reset_outbuf(mrb, outbuf, 0);
+        return io_str_bytes(io_reset_outbuf(mrb, outbuf, 0), given);
       }
     }
   }
 
   outbuf = io_reset_outbuf(mrb, outbuf, MRB_IO_BUF_SIZE);
   if (!length_given) {          /* read as much as possible */
-    return io_read_all(mrb, fptr, outbuf);
+    return io_str_read(fptr, io_read_all(mrb, fptr, outbuf));
   }
 
   struct mrb_io_buf *buf = fptr->buf;
@@ -2076,7 +2306,7 @@ io_read(mrb_state *mrb, mrb_value io)
     if (fptr->eof || length == 0) {
       if (RSTRING_LEN(outbuf) == 0)
         return mrb_nil_value();
-      return outbuf;
+      return io_str_bytes(outbuf, given);
     }
     if (buf->len < length) {
       length -= buf->len;
@@ -2084,7 +2314,7 @@ io_read(mrb_state *mrb, mrb_value io)
     }
     else {
       io_buf_cat(mrb, outbuf, buf, length);
-      return outbuf;
+      return io_str_bytes(outbuf, given);
     }
   }
 }
@@ -2107,7 +2337,7 @@ io_find_index(struct mrb_io *fptr, const char *rs, mrb_int rslen)
 }
 
 static mrb_value
-io_gets(mrb_state *mrb, mrb_value io)
+io_gets_str(mrb_state *mrb, mrb_value io)
 {
   mrb_value rs = mrb_nil_value();
   mrb_bool rs_given = FALSE;    /* newline break */
@@ -2120,16 +2350,10 @@ io_gets(mrb_state *mrb, mrb_value io)
 
   if (limit_given == FALSE) {
     if (rs_given) {
-      if (mrb_nil_p(rs)) {
-        rs_given = FALSE;
-      }
-      else if (mrb_integer_p(rs)) {
-        limit = mrb_integer(rs);
+      if (!mrb_nil_p(rs) && !mrb_string_p(rs)) {
+        limit = mrb_as_int(mrb, rs);
         limit_given = TRUE;
         rs = mrb_nil_value();
-      }
-      else if (!mrb_string_p(rs)) {
-        mrb_ensure_int_type(mrb, rs);
       }
     }
   }
@@ -2150,12 +2374,12 @@ io_gets(mrb_state *mrb, mrb_value io)
   }
 
   /* from now on rs_given==FALSE means no RS */
+  io_fill_buf(mrb, fptr);
+  if (fptr->eof) return mrb_nil_value();
+
   if (mrb_nil_p(rs) && !limit_given) {
     return io_read_all(mrb, fptr, mrb_str_new_capa(mrb, MRB_IO_BUF_SIZE));
   }
-
-  io_fill_buf(mrb, fptr);
-  if (fptr->eof) return mrb_nil_value();
 
   mrb_value outbuf;
   if (limit_given) {
@@ -2214,6 +2438,13 @@ io_gets(mrb_state *mrb, mrb_value io)
 }
 
 static mrb_value
+io_gets(mrb_state *mrb, mrb_value io)
+{
+  mrb_value str = io_gets_str(mrb, io);
+  return io_str_read(io_get_read_fptr(mrb, io), str);
+}
+
+static mrb_value
 io_readline(mrb_state *mrb, mrb_value io)
 {
   mrb_value result = io_gets(mrb, io);
@@ -2246,7 +2477,7 @@ io_getc(mrb_state *mrb, mrb_value io)
   if (fptr->eof) return mrb_nil_value();
 #ifdef MRB_UTF8_STRING
   const char *p = &buf->mem[buf->start];
-  if ((*p) & 0x80) {
+  if (!fptr->binmode && ((*p) & 0x80)) {   /* binary mode reads bytes */
     len = mrb_utf8len(p, p+buf->len);
     if (len == 1 && buf->len < 4) { /* partial UTF-8 */
       io_fill_buf_comp(mrb, fptr);
@@ -2257,7 +2488,7 @@ io_getc(mrb_state *mrb, mrb_value io)
 #endif
   mrb_value str = mrb_str_new(mrb, buf->mem+buf->start, len);
   io_buf_shift(buf, len);
-  return str;
+  return io_str_read(fptr, str);
 }
 
 static mrb_value
@@ -2390,6 +2621,8 @@ MRB_YK_STATIC const mrb_mt_entry io_rom_entries[] = {
   MRB_MT_ENTRY(io_readchar,          MRB_SYM(readchar),      MRB_ARGS_NONE()),  /* 15.2.20.5.15 */
   MRB_MT_ENTRY(io_readline,          MRB_SYM(readline), MRB_ARGS_OPT(2)),  /* 15.2.20.5.16 */
   MRB_MT_ENTRY(io_readlines,         MRB_SYM(readlines), MRB_ARGS_OPT(2)),  /* 15.2.20.5.17 */
+  MRB_MT_ENTRY(io_binmode,           MRB_SYM(binmode),       MRB_ARGS_NONE()),
+  MRB_MT_ENTRY(io_binmode_p,         MRB_SYM_Q(binmode),     MRB_ARGS_NONE()),
   MRB_MT_ENTRY(io_sync,              MRB_SYM(sync),          MRB_ARGS_NONE()),  /* 15.2.20.5.18 */
   MRB_MT_ENTRY(io_set_sync,          MRB_SYM_E(sync), MRB_ARGS_REQ(1)),  /* 15.2.20.5.19 */
   MRB_MT_ENTRY(io_sysread,           MRB_SYM(sysread), MRB_ARGS_ARG(1,1)),

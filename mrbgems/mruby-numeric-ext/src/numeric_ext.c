@@ -68,6 +68,9 @@ int_remainder(mrb_state *mrb, mrb_value x)
     return flo_remainder(mrb, mrb_float_value(mrb, mrb_as_float(mrb, x)));
 #endif
   }
+  if (mrb_bigint_p(y)) {
+    return mrb_bint_rem(mrb, mrb_as_bint(mrb, x), y);
+  }
 #endif
   a = mrb_integer(x);
   if (mrb_integer_p(y)) {
@@ -132,8 +135,17 @@ int_gcd(mrb_state *mrb, mrb_value x)
   }
   mrb_int g = mrb_int_gcd(mrb_integer(x), mrb_integer(y));
   /* g < 0 only when the mathematical result is 2^63 (= |MRB_INT_MIN|),
-     which does not fit in mrb_int. */
-  if (g < 0) mrb_int_overflow(mrb, "gcd");
+     which does not fit in mrb_int. That is the gcd spilling out of the type,
+     a bigint and not an error, so take the same bigint path the branch above
+     takes for a bigint operand. */
+  if (g < 0) {
+#ifdef MRB_USE_BIGINT
+    return mrb_bint_gcd(mrb, mrb_bint_new_int(mrb, mrb_integer(x)),
+                        mrb_bint_new_int(mrb, mrb_integer(y)));
+#else
+    mrb_int_overflow(mrb, "gcd");
+#endif
+  }
   return mrb_int_value(mrb, g);
 }
 
@@ -170,19 +182,26 @@ int_lcm(mrb_state *mrb, mrb_value x)
 
   if (a == 0 || b == 0) return mrb_int_value(mrb, 0);
 
-  /* Negation of MRB_INT_MIN is UB and the lcm with any non-zero
-     operand would not fit in mrb_int anyway. */
-  if (a == MRB_INT_MIN || b == MRB_INT_MIN) mrb_int_overflow(mrb, "lcm");
-
-  gcd_val = mrb_int_gcd(a, b);
-  if (a < 0) a = -a;
-  if (b < 0) b = -b;
-
-  mrb_int lcm_val;
-  if (mrb_int_mul_overflow(a / gcd_val, b, &lcm_val)) {
-    mrb_int_overflow(mrb, "lcm");
+  /* MRB_INT_MIN cannot be negated in mrb_int, and a product past MRB_INT_MAX
+     overflows: both are the lcm spilling out of the type, a bigint and not an
+     error, so fall through to the bigint path the branch above takes for a
+     bigint operand. */
+  if (a != MRB_INT_MIN && b != MRB_INT_MIN) {
+    mrb_int lcm_val;
+    gcd_val = mrb_int_gcd(a, b);
+    if (a < 0) a = -a;
+    if (b < 0) b = -b;
+    if (!mrb_int_mul_overflow(a / gcd_val, b, &lcm_val)) {
+      return mrb_int_value(mrb, lcm_val);
+    }
   }
-  return mrb_int_value(mrb, lcm_val);
+
+#ifdef MRB_USE_BIGINT
+  return mrb_bint_lcm(mrb, mrb_bint_new_int(mrb, mrb_integer(x)),
+                      mrb_bint_new_int(mrb, mrb_integer(y)));
+#else
+  mrb_int_overflow(mrb, "lcm");
+#endif
 }
 
 /*
@@ -222,6 +241,14 @@ int_powm(mrb_state *mrb, mrb_value x)
   if (!mrb_integer_p(m)) mrb_raise(mrb, E_TYPE_ERROR, "int.pow(n,m): m must be integer");
   mod = mrb_integer(m);
   if (mod == 0) mrb_int_zerodiv(mrb);
+  if (mod == MRB_INT_MIN) {
+    /* -mod does not fit in mrb_int */
+#ifdef MRB_USE_BIGINT
+    return mrb_bint_powm(mrb, mrb_bint_new_int(mrb, mrb_integer(x)), e, m);
+#else
+    mrb_int_overflow(mrb, "pow");
+#endif
+  }
   if (mod < 0) {
     neg_mod = TRUE;
     mod = -mod;
@@ -263,6 +290,10 @@ int_powm(mrb_state *mrb, mrb_value x)
     }
     base = tmp % mod;
   }
+
+  /* A negative base leaves a negative result (C's % keeps the sign of the
+     dividend): bring it into [0, mod) */
+  if (result < 0) result += mod;
 
   /* Apply signed modulo adjustment for negative modulus */
   /* Ruby: result + m for non-zero result when m is negative */
@@ -355,13 +386,14 @@ int_digits(mrb_state *mrb, mrb_value self)
  *  call-seq:
  *     int.size -> int
  *
- * Returns the number of bytes in the machine representation of int
+ * Returns the number of bytes in the machine representation of int: a
+ * fixnum's size, or the bytes of a big integer's magnitude
  * (machine dependent).
  *
  *   1.size               #=> 8
  *   -1.size              #=> 8
  *   2147483647.size      #=> 8
- *   (256**10 - 1).size   #=> 12
+ *   (256**10 - 1).size   #=> 10
  *   (256**20 - 1).size   #=> 20
  *   (256**40 - 1).size   #=> 40
  */
@@ -372,7 +404,9 @@ int_size(mrb_state *mrb, mrb_value self)
   size_t size = sizeof(mrb_int);
 #ifdef MRB_USE_BIGINT
   if (mrb_bigint_p(self)) {
-    size = mrb_bint_memsize(self);
+    /* the magnitude's bytes, never less than a fixnum's, as CRuby answers */
+    size_t bytes = mrb_bint_abs_bytes(self);
+    if (bytes > size) size = bytes;
   }
 #endif
   return mrb_fixnum_value((mrb_int)size);
@@ -429,7 +463,7 @@ flo_remainder(mrb_state *mrb, mrb_value self)
   mrb_get_args(mrb, "f", &b);
   if (b == 0) mrb_int_zerodiv(mrb);
   if (isinf(b)) return mrb_float_value(mrb, a);
-  return mrb_float_value(mrb, a-b*trunc(a/b));
+  return mrb_float_value(mrb, fmod(a, b));
 }
 #endif
 
@@ -445,7 +479,8 @@ isqrt(mrb_int n)
   if (n < 2) return n;
 
   mrb_int x = n;
-  mrb_int y = (x + 1) / 2;
+  /* (x + 1) / 2, without the x + 1 that overflows at MRB_INT_MAX */
+  mrb_int y = x - x / 2;
 
   // Babylonian method (integer version)
   while (y < x) {

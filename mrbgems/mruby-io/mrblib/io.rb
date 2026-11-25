@@ -22,8 +22,8 @@ class IO
   #   $stderr.puts "Hello"
   #   a.close
   #
-  def self.open(*args, &block)
-    io = self.new(*args)
+  def self.open(*args, **opts, &block)
+    io = self.new(*args, **opts)
 
     return io unless block
 
@@ -113,6 +113,8 @@ class IO
   #   IO.read(name, [length [, offset]] )   -> string
   #   IO.read(name, [length [, offset]], mode: mode)   -> string
   #
+  # The other keyword options (encoding:, binmode:, ...) are IO.open's.
+  #
   # Opens the file, optionally seeks to the given offset, then returns length
   # bytes (defaulting to the rest of the file). read ensures the file is
   # closed before returning.
@@ -121,14 +123,14 @@ class IO
   #   IO.read("testfile", 20)       #=> "This is line one\nTh"
   #   IO.read("testfile", 20, 10)   #=> "ne one\nThis is line "
   #
-  def self.read(path, length=nil, offset=0, mode: "r")
+  def self.read(path, length=nil, offset=0, mode: "r", **opts)
     str = ""
     fd = -1
     io = nil
     begin
       fd = IO.sysopen(path, mode)
-      io = IO.open(fd, mode)
-      io.seek(offset) if offset > 0
+      io = IO.open(fd, mode, **opts)
+      io.seek(offset) if offset && offset != 0
       str = io.read(length)
     ensure
       if io
@@ -138,6 +140,100 @@ class IO
       end
     end
     str
+  end
+
+  #
+  # call-seq:
+  #   IO.readlines(name, sep=$/ [, limit], chomp: false, mode: "r")   -> array
+  #   IO.readlines(name, limit, chomp: false, mode: "r")              -> array
+  #
+  # Opens the file, reads its lines as IO#readlines does, and closes it.
+  # With chomp: true each line comes without its separator.
+  #
+  #   IO.readlines("testfile")               #=> ["This is line one\n", "This is line two\n"]
+  #   IO.readlines("testfile", chomp: true)  #=> ["This is line one", "This is line two"]
+  #
+  def self.readlines(path, *args, chomp: false, mode: "r", **opts)
+    lines = nil
+    fd = -1
+    io = nil
+    begin
+      fd = IO.sysopen(path, mode)
+      io = IO.open(fd, mode, **opts)
+      lines = io.readlines(*args)
+    ensure
+      if io
+        io.close
+      elsif fd != -1
+        IO._sysclose(fd)
+      end
+    end
+    if chomp
+      sep = args[0]
+      if sep.is_a?(String)
+        lines.map! { |line| line.chomp(sep) }
+      elsif !args.empty? && sep.nil?
+        # nil reads the whole file as one line; there is no separator
+      else
+        lines.map! { |line| line.chomp }
+      end
+    end
+    lines
+  end
+
+  #
+  # call-seq:
+  #   IO.binread(name, [length [, offset]])   -> string
+  #
+  # Reads the file as IO.read does, in binary mode. The string is
+  # ASCII-8BIT where the build can mark it so (String#b).
+  #
+  def self.binread(path, length=nil, offset=0)
+    str = read(path, length, offset, mode: "rb")
+    str = str.b if str.respond_to?(:b)
+    str
+  end
+
+  #
+  # call-seq:
+  #   IO.write(name, string, [offset], mode: mode)   -> integer
+  #
+  # Opens the file, writes string to it and closes it, and returns the
+  # number of bytes written. Without an offset the file is truncated
+  # first; with one, string is written there and the rest of the file is
+  # kept. The file is created when it does not exist.
+  #
+  #   IO.write("testfile", "abc")      #=> 3
+  #   IO.write("testfile", "Z", 1)     #=> 1, the file holds "aZc"
+  #
+  def self.write(path, string, offset=nil, mode: nil, **opts)
+    mode ||= offset ? File::WRONLY | File::CREAT : "w"
+    fd = -1
+    io = nil
+    n = 0
+    begin
+      fd = IO.sysopen(path, mode)
+      io = IO.open(fd, mode, **opts)
+      io.seek(offset) if offset
+      n = io.write(string.to_s)
+    ensure
+      if io
+        io.close
+      elsif fd != -1
+        IO._sysclose(fd)
+      end
+    end
+    n
+  end
+
+  #
+  # call-seq:
+  #   IO.binwrite(name, string, [offset])   -> integer
+  #
+  # IO.write in binary mode.
+  #
+  def self.binwrite(path, string, offset=nil)
+    write(path, string, offset, mode: offset ? File::WRONLY | File::CREAT | File::BINARY : "wb")
   end
 
 
@@ -209,10 +305,10 @@ class IO
   #   f.each {|line| puts "#{f.lineno}: #{line}" }
   #
   # 15.2.20.5.3
-  def each(&block)
-    return to_enum(:each) unless block
+  def each(*args, &block)
+    return to_enum(:each, *args) unless block
 
-    while line = self.gets
+    while line = self.gets(*args)
       block.call(line)
     end
     self

@@ -53,7 +53,9 @@ str_encoding(mrb_state *mrb, mrb_value self)
  *
  * Changes the encoding of the string to the specified encoding.
  * This method modifies the string in place and returns self.
- * In mruby, only "UTF-8", "ASCII-8BIT", and "BINARY" are supported.
+ * In mruby, only "UTF-8", "ASCII-8BIT", and "BINARY" are supported, and
+ * "US-ASCII" (or "ASCII"), which is read a byte at a time as CRuby reads
+ * it and so is taken as ASCII-8BIT.
  *
  *   str = "hello"
  *   str.force_encoding("ASCII-8BIT")  #=> "hello"
@@ -68,7 +70,9 @@ str_force_encoding(mrb_state *mrb, mrb_value self)
 
   struct RString *s = mrb_str_ptr(self);
   if (MRB_STR_CASECMP_P(enc, ENC_ASCII_8BIT) ||
-      MRB_STR_CASECMP_P(enc, ENC_BINARY)) {
+      MRB_STR_CASECMP_P(enc, ENC_BINARY) ||
+      MRB_STR_CASECMP_P(enc, "US-ASCII") ||
+      MRB_STR_CASECMP_P(enc, "ASCII")) {
     RSTR_ENCODING_SET(s, MRB_STR_ENCODING_BINARY);
   }
   else if (MRB_STR_CASECMP_P(enc, ENC_UTF8)) {
@@ -78,6 +82,31 @@ str_force_encoding(mrb_state *mrb, mrb_value self)
     mrb_raisef(mrb, E_ARGUMENT_ERROR, "unknown encoding name - %v", enc);
   }
   return self;
+}
+
+/*
+ * call-seq:
+ *   symbol.encoding -> encoding
+ *
+ * Returns the encoding of the symbol's name: US-ASCII when it is all ASCII,
+ * UTF-8 when it is valid UTF-8, and ASCII-8BIT (BINARY) otherwise.
+ *
+ *   :abc.encoding    #=> Encoding::US_ASCII
+ *   :"日本".encoding  #=> Encoding::UTF_8
+ */
+static mrb_value
+sym_encoding(mrb_state *mrb, mrb_value self)
+{
+  mrb_int len;
+  const char *p = mrb_sym_name_len(mrb, mrb_symbol(self), &len);
+
+  for (mrb_int i = 0; i < len; i++) {
+    if ((unsigned char)p[i] >= 0x80) {
+      mrb_value str = mrb_str_new(mrb, p, len);
+      return get_encoding(mrb, mrb_str_valid_encoding_p(mrb, str) ? MRB_SYM(UTF_8) : MRB_SYM(BINARY));
+    }
+  }
+  return get_encoding(mrb, MRB_SYM(US_ASCII));
 }
 
 void
@@ -101,6 +130,13 @@ mrb_mruby_encoding_gem_init(mrb_state* mrb)
   mrb_define_const_id(mrb, e, MRB_SYM(ASCII_8BIT), b);
   mrb_define_const_id(mrb, e, MRB_SYM(BINARY), b);
   mrb_define_const_id(mrb, e, MRB_SYM(UTF_8), mrb_str_new_lit_frozen(mrb, ENC_UTF8));
+  /* every string of ASCII bytes is also US-ASCII; the constant lets code
+     name the encoding (Active Support lists it) */
+  mrb_value ascii = mrb_str_new_lit_frozen(mrb, "US-ASCII");
+  mrb_define_const_id(mrb, e, MRB_SYM(US_ASCII), ascii);
+  mrb_define_const_id(mrb, e, MRB_SYM(ASCII), ascii);
+
+  mrb_define_method_id(mrb, mrb->symbol_class, MRB_SYM(encoding), sym_encoding, MRB_ARGS_NONE());
 }
 
 void

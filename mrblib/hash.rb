@@ -148,7 +148,7 @@ class Hash
       i += 1
       raise TypeError, "Hash required (#{other.class} given)" unless Hash === other
       other.each_key {|k|
-        h[k] = (self.has_key?(k))? yield(k, self[k], other[k]): other[k]
+        h[k] = (h.has_key?(k))? yield(k, h[k], other[k]): other[k]
       }
     end
     h
@@ -202,6 +202,7 @@ class Hash
     return to_enum(:reject) unless block
 
     h = {}
+    h.compare_by_identity if compare_by_identity?
     self.each {|k,v|
       unless yield([k, v])
         h[k] = v
@@ -258,6 +259,7 @@ class Hash
     return to_enum(:select) unless block
 
     h = {}
+    h.compare_by_identity if compare_by_identity?
     self.each {|k,v|
       if yield([k, v])
         h[k] = v

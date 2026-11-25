@@ -116,7 +116,9 @@ double round(double x) {
 
 #if !defined(NO_GETTIMEOFDAY) && defined(_WIN32) && !defined(USE_CLOCK_GETTIME)
 /* Windows gettimeofday polyfill */
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN  /* don't include winsock.h */
+#endif
 #include <windows.h>
 #define gettimeofday my_gettimeofday
 
@@ -412,7 +414,10 @@ time_update_datetime(mrb_state *mrb, struct mrb_time *self, int dealloc)
   else {
     aid = localtime_r(&t, &self->datetime);
   }
-  if (!aid) {
+  /* time_mktime() refuses a year for which tm_year + TM_YEAR_BASE is not an
+     int, and a broken-down time the platform hands back has to hold to the
+     same bound: Time#year and Time#asctime add the two in int. */
+  if (!aid || aid->tm_year > INT_MAX - TM_YEAR_BASE) {
     if (dealloc) mrb_free(mrb, self);
     time_out_of_range(mrb, time_value_from_time_t(mrb, t));
     /* not reached */
@@ -480,9 +485,20 @@ static struct mrb_time*
 time_alloc(mrb_state *mrb, mrb_value sec, mrb_value usec, enum mrb_timezone timezone)
 {
   time_t tsec, tusec; /* Variables to hold converted seconds and microseconds */
-  time_t nsec;
+  time_t nsec, frac_nsec = 0;
 
   tsec = mrb_to_time_t(mrb, sec, &tusec);
+#ifndef MRB_NO_FLOAT
+  if (mrb_float_p(usec)) {
+    /* Keep the fraction of a microsecond as nanoseconds, as CRuby does;
+       rounding it carried 999999.9 into the next second */
+    mrb_float f = mrb_float(usec);
+    mrb_float whole = floor(f);
+    tusec += mrb_to_time_t(mrb, mrb_float_value(mrb, whole), NULL);
+    frac_nsec = (time_t)trunc((f - whole) * 1000.0);
+  }
+  else
+#endif
   tusec += mrb_to_time_t(mrb, usec, NULL);
 
   /* Normalize microseconds to avoid overflow when converting to nanoseconds */
@@ -492,7 +508,7 @@ time_alloc(mrb_state *mrb, mrb_value sec, mrb_value usec, enum mrb_timezone time
     tsec += sec_adjustment;
   }
 
-  nsec = tusec * NSECS_PER_USEC;
+  nsec = tusec * NSECS_PER_USEC + frac_nsec;
   return time_alloc_time(mrb, tsec, nsec, timezone);
 }
 
@@ -658,10 +674,13 @@ time_mktime(mrb_state *mrb, mrb_int ayear, mrb_int amonth, mrb_int aday,
   /* Adjust year to be relative to TM_YEAR_BASE (1900) for struct tm */
   ayear -= TM_YEAR_BASE;
 
-  /* Validate arguments: year (after adjustment), month, day, hour, minute, second.
+  /* Validate arguments: year (after adjustment), month, day, hour, minute, second,
+   * microsecond.
    * This checks for valid ranges for each component.
    * For hour, it allows 24 only if minutes and seconds are zero (midnight).
    * For second, it allows up to 60 to accommodate leap seconds.
+   * Microseconds stay below a second, as in CRuby; they are not carried into
+   * the seconds.
    */
   if (OUTINT(ayear) ||
       amonth  < 1 || amonth  > MONTHS_PER_YEAR ||
@@ -669,7 +688,8 @@ time_mktime(mrb_state *mrb, mrb_int ayear, mrb_int amonth, mrb_int aday,
       ahour   < 0 || ahour   > HOURS_PER_DAY ||
       (ahour == HOURS_PER_DAY && (amin > 0 || asec > 0)) || /* Allow 24:00:00 */
       amin    < 0 || amin    > (MINS_PER_HOUR -1) ||
-      asec    < 0 || asec    > SECS_PER_MIN) /* tm_sec can be 60 for leap seconds */
+      asec    < 0 || asec    > SECS_PER_MIN || /* tm_sec can be 60 for leap seconds */
+      ausec   < 0 || ausec   >= USECS_PER_SEC)
     mrb_raise(mrb, E_ARGUMENT_ERROR, "argument out of range");
 
   nowtime.tm_year  = (int)ayear;
@@ -1651,9 +1671,9 @@ time_utc_offset(mrb_state *mrb, mrb_value self)
     return mrb_fixnum_value(0);  /* UTC is always offset 0 */
   }
 
-  /* For local times, calculate offset = local_time_t - utc_time_t */
+  /* For local times, the offset is the wall clock read as UTC minus the real UTC time */
   time_t utc_time_t = timegm(&tm->datetime);  /* Convert datetime as UTC */
-  mrb_int offset_seconds = (mrb_int)(tm->sec - utc_time_t);
+  mrb_int offset_seconds = (mrb_int)(utc_time_t - tm->sec);
 
   return mrb_fixnum_value(offset_seconds);
 }

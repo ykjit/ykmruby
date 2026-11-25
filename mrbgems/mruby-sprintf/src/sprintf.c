@@ -187,25 +187,28 @@ fmt_float(char *buf, size_t buf_size, char fmt, int flags, int width, int prec, 
   if (flags & FSPACE) sign = ' ';
 
   int len = mrb_format_float(f, buf, buf_size, fmt, prec, sign);
+  int sign_len = 0;
 
   // buf[0] < '0' returns true if the first character is space, + or -
   // buf[1] < '9' matches a digit, and doesn't match when we get back +nan or +inf
   if (buf[0] < '0' && buf[1] <= '9' && zero_pad) {
+    // the sign stays in front, and the zeros go after it
     buf++;
     width--;
     len--;
+    sign_len = 1;
   }
-  if (*buf < '0' || *buf >= '9') {
+  if (*buf < '0' || *buf > '9') {
     // For inf or nan, we don't want to zero pad.
     zero_pad = 0;
   }
   if (len >= width) {
-    return len;
+    return sign_len + len;
   }
   buf[width] = '\0';
   if (left_align) {
     memset(&buf[len], ' ', width - len);
-    return width;
+    return sign_len + width;
   }
   memmove(&buf[width - len], buf, len);
   if (zero_pad) {
@@ -214,7 +217,7 @@ fmt_float(char *buf, size_t buf_size, char fmt, int flags, int width, int prec, 
   else {
     memset(buf, ' ', width - len);
   }
-  return width;
+  return sign_len + width;
 }
 #endif
 
@@ -313,6 +316,7 @@ check_name_arg(mrb_state *mrb, int posarg, const char *name, size_t len)
 
 #define GETASTER(num) do { \
   mrb_value tmp_v; \
+  mrb_int tmp_n; \
   t = p++; \
   GETNUM(n, val); \
   if (*p == '$') { \
@@ -322,7 +326,10 @@ check_name_arg(mrb_state *mrb, int posarg, const char *name, size_t len)
     tmp_v = GETNEXTARG(); \
     p = t; \
   } \
-  num = (int)mrb_as_int(mrb, tmp_v); \
+  tmp_n = mrb_as_int(mrb, tmp_v); \
+  if (tmp_n < INT_MIN || INT_MAX < tmp_n) \
+    mrb_raise(mrb, E_ARGUMENT_ERROR, #num " too big"); \
+  num = (int)tmp_n; \
 } while (0)
 
 static const char*
@@ -425,6 +432,10 @@ mrb_str_format(mrb_state *mrb, mrb_int argc, const mrb_value *argv, mrb_value fm
   }
   if (bsiz > 4096) bsiz = 4096;
   result = mrb_str_new_capa(mrb, bsiz);
+  /* bsiz and buf track result's buffer, so a to_s/inspect callback must not
+     reach it through ObjectSpace and swap that buffer; the class is set back
+     on return. */
+  mrb_str_ptr(result)->c = NULL; /* hide from ObjectSpace.each_object */
   /* The bytes between the specifiers are the format string's own, so what is
      built out of them is read the way the format string was read, ASCII bytes
      and all: the reading a receiver holds, which nothing written into it
@@ -536,6 +547,7 @@ retry:
             GETASTER(prec);
             if (prec < 0) {  /* ignore negative precision */
               flags &= ~FPREC;
+              prec = -1;
             }
             p++;
             goto retry;
@@ -671,7 +683,8 @@ retry:
 
           /* Determine base and signedness from lookup table */
           base = spec.base;
-          if (spec.subtype == 1) { /* signed formats: d, i, u */
+          /* d, i and u are signed; the other bases are too with a + or space flag */
+          if (base == 10 || (flags & (FPLUS|FSPACE))) {
             sign = 1;
           }
 
@@ -697,7 +710,7 @@ retry:
           case MRB_TT_BIGINT:
             {
               mrb_int n = (mrb_bint_cmp(mrb, val, mrb_fixnum_value(0)));
-              mrb_bool need_dots = ((flags & FPLUS) == 0) && (base == 16 || base == 8 || base == 2) && n < 0;
+              mrb_bool need_dots = !sign && n < 0;
               if (need_dots) {
                 val = mrb_bint_2comp(mrb, val);
                 dots = 1;
@@ -706,6 +719,23 @@ retry:
               mrb_value str = mrb_bint_to_s(mrb, val, base);
               s = RSTRING_PTR(str);
               len = (int)RSTRING_LEN(str);
+              /* the top octal digit holds the sign bits left over by the limbs */
+              if (dots && base == 8 && (*s == '1' || *s == '3')) {
+                s++; len--;
+              }
+              /* emit the sign through sc, as for mrb_int, so the 0 flag pads after it */
+              if (*s == '-') {
+                sc = '-';
+                s++; len--; width--;
+              }
+              else if (sign && (flags & FPLUS)) {
+                sc = '+';
+                width--;
+              }
+              else if (sign && (flags & FSPACE)) {
+                sc = ' ';
+                width--;
+              }
             }
             goto str_skip;
 #endif
@@ -765,12 +795,12 @@ retry:
         }
 
         if (dots) {
-          if (base == 8 && (*s == '1' || *s == '3')) {
-            s++; len--;
-          }
           while (*s == fc) {
             s++; len--;
           }
+          /* the ".." and the leading fc count toward width and precision */
+          prec -= 3;
+          width -= 3;
         }
           /* Convert to uppercase for X, B formats */
           if (spec.subtype == 1) { /* uppercase formats: X, B */
@@ -797,7 +827,7 @@ retry:
             prefix = NULL;
           }
         }
-        else if (len == 1 && *s == '0') {
+        else if (!dots && len == 1 && *s == '0') {
           prefix = NULL;
         }
 
@@ -814,7 +844,7 @@ retry:
         }
         else {
           if (prec < len) {
-            if (!prefix && prec == 0 && len == 1 && *s == '0') len = 0;
+            if (!dots && !prefix && prec == 0 && len == 1 && *s == '0') len = 0;
             prec = len;
           }
           width -= prec;
@@ -832,23 +862,18 @@ retry:
           PUSH(prefix, plen);
         }
         if (dots) {
-          prec -= 2;
-          width -= 2;
           PUSH("..", 2);
-          if (*s != fc) {
-            FILL(fc, 1);
-            prec--; width--;
-          }
+          FILL(fc, 1);
         }
 
         if (prec > len) {
           CHECK(prec - len);
-          if ((flags & (FMINUS|FPREC)) != FMINUS) {
+          if (dots) {
+            FILL(fc, prec - len);
+          }
+          else if ((flags & (FMINUS|FPREC)) != FMINUS) {
             char c = '0';
             FILL(c, prec - len);
-          }
-          else if (v < 0) {
-            FILL(fc, prec - len);
           }
         }
           PUSH(s, len);
@@ -946,6 +971,7 @@ retry:
 
   sprint_exit:
   mrb_str_resize(mrb, result, blen);
+  mrb_str_ptr(result)->c = mrb->string_class;
 
   return result;
 }

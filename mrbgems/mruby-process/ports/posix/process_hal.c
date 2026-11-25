@@ -18,6 +18,9 @@
 #include <limits.h>
 #include <signal.h>
 #include <unistd.h>
+#if defined(__APPLE__)
+# include <TargetConditionals.h>
+#endif
 
 /*
  * Feature Capabilities
@@ -57,6 +60,64 @@ mrb_hal_process_ppid(mrb_state *mrb)
 {
   (void)mrb;
   return (mrb_int)getppid();
+}
+
+mrb_int
+mrb_hal_process_uid(mrb_state *mrb)
+{
+  return (mrb_int)getuid();
+}
+
+mrb_int
+mrb_hal_process_euid(mrb_state *mrb)
+{
+  return (mrb_int)geteuid();
+}
+
+mrb_int
+mrb_hal_process_gid(mrb_state *mrb)
+{
+  return (mrb_int)getgid();
+}
+
+mrb_int
+mrb_hal_process_egid(mrb_state *mrb)
+{
+  return (mrb_int)getegid();
+}
+
+/* iOS lets no process run another; fork(2) is refused there as on Windows,
+   which Process.fork reports as NotImplementedError. */
+mrb_int
+mrb_hal_process_fork(mrb_state *mrb)
+{
+#if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
+  (void)mrb;
+  errno = ENOSYS;
+  return -1;
+#else
+  pid_t pid;
+  pid = fork();
+  return pid < 0 ? -1 : (mrb_int)pid;
+#endif
+}
+
+int
+mrb_hal_process_exec(mrb_state *mrb, const char *cmd, char *const argv[])
+{
+  (void)mrb;
+#if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
+  (void)cmd; (void)argv;
+  errno = ENOSYS;
+#else
+  if (argv == NULL) {
+    execl("/bin/sh", "sh", "-c", cmd, (char*)NULL);
+  }
+  else {
+    execvp(cmd, argv);
+  }
+#endif
+  return -1;
 }
 
 /*

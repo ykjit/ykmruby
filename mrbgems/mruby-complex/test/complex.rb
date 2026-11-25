@@ -299,6 +299,12 @@ assert 'Complex#to_i and #to_f with exact parts' do
   assert_raise(RangeError) { Complex(3, 4).to_f }
 end
 
+assert 'Complex#to_i of an infinite or NaN real part' do
+  assert_raise(FloatDomainError) { Complex(Float::NAN, 0).to_i }
+  assert_raise(FloatDomainError) { Complex(Float::INFINITY, 0).to_i }
+  assert_raise(FloatDomainError) { Complex(-Float::INFINITY, 0).to_i }
+end
+
 assert 'Complex#abs2 with exact parts' do
   skip "float-only build" unless complex_exact
   assert_equal 1, Complex(-1).abs2
@@ -322,4 +328,12 @@ assert 'Complex holds a Bigint part' do
   assert_equal big + 1, (c + 1).real
   assert_true c == big
   assert_equal big, c.to_i
+end
+
+assert('Complex#/ by a divisor with a NaN real part and a zero imaginary part') do
+  # the divisor is not zero, so this is NaN, not ZeroDivisionError; the
+  # quotient used to come from a C division by zero
+  z = Complex(1, 1) / Complex(Float::NAN, 0)
+  assert_true z.real.nan?
+  assert_true z.imaginary.nan?
 end

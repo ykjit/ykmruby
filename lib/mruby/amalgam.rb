@@ -58,6 +58,7 @@ module MRuby
       numeric.c
       numops.c
       proc.c
+      refinement.c
       kernel.c
       enum.c
       error.c
@@ -79,6 +80,7 @@ module MRuby
       @processed_guards = {}
       @processed_headers = []  # Track header paths for include transformation
       @xmacro_cache = {}
+      @private_header_statics = {}  # static names in the current gem's private headers
       # Pre-collect gem header names for include transformation
       build_gem_header_map(library_gems)
     end
@@ -97,7 +99,7 @@ module MRuby
     # gem-local ones its mrbgem.rake adds (mruby-compiler's vendored
     # lib/prism/include) and the ones it writes under the build tree for the
     # headers it generates (mruby-compiler's prism/ast.h and
-    # prism/diagnostic.h, built from the templates). Only the paths the gem
+    # prism/internal/diagnostic.h, built from the templates). Only the paths the gem
     # itself adds count: the build's own include dirs carry the core headers,
     # which belong to the amalgamated mruby.h, not to a gem. Another gem's
     # include dir, added here as a dependency, is left to that gem's own
@@ -627,6 +629,8 @@ module MRuby
       pop
       peek
       NUMERIC_SHIFT_WIDTH_MAX
+      numerator
+      denominator
     ].freeze
 
     # File-local names defined in a C source: static functions and tables,
@@ -669,10 +673,14 @@ module MRuby
       return [] if collisions.empty?
 
       f.puts "\n/* Rename #{gem.name} static symbols colliding with earlier ones */"
-      collisions.sort.each do |sym|
+      write_rename_defines(f, gem, collisions)
+      collisions
+    end
+
+    def write_rename_defines(f, gem, syms)
+      syms.sort.each do |sym|
         f.puts "#define #{sym} #{gem.name.tr('-', '_')}_amalg_#{sym}"
       end
-      collisions
     end
 
     def write_static_rename_cleanup(f, collisions)
@@ -741,12 +749,19 @@ module MRuby
 
         # Include C sources if the gem has any
         unless sources.empty?
+          write_gem_private_headers(f, gem)
           renamed = write_static_renames(f, gem, sources)
           sources.each_with_index do |path, idx|
+            local = write_private_header_renames(f, gem, path, renamed)
             write_source_content(f, "#{gem.name}: #{source_label(gem, path)}", path)
+            write_static_rename_cleanup(f, local)
             # Clear macros between source files to avoid conflicts
             # (e.g., mrb_stat macro in file.c vs function in file_test.c)
-            write_macro_cleanup(f, "#{gem.name}/#{File.basename(path)}") if idx < sources.size - 1
+            next if idx == sources.size - 1
+            write_macro_cleanup(f, "#{gem.name}/#{File.basename(path)}")
+            # the cleanup also drops a rename whose name is in the list
+            # (prism's static peek), which the gem's later sources still need
+            write_rename_defines(f, gem, renamed & CONFLICTING_MACROS)
           end
           write_static_rename_cleanup(f, renamed)
         end
@@ -773,6 +788,46 @@ module MRuby
       if File.exist?(gem_init_path)
         write_source_content(f, "gem_init.c", gem_init_path)
       end
+    end
+
+    # The headers of a gem's own include dirs beyond its include/ (the
+    # vendored lib/prism/include and the prism headers generated under the
+    # build tree), for its sources, whose includes of them are commented
+    # out. mruby.h carries only what include/ reaches, and loses even some
+    # of that: prism/internal/*.h is reached by nothing there, and
+    # prism/source.h is first inlined under #ifndef
+    # PRISM_EXCLUDE_SERIALIZATION, which mruby-compiler defines. Each is
+    # written at top level, guard and all, after the ones it includes, so
+    # one mruby.h already carries comes out empty.
+    def write_gem_private_headers(f, gem)
+      @private_header_statics = {}
+      roots = gem_header_roots(gem).map { |d| File.expand_path(d) }
+      dirs = gem_include_dirs(gem) - roots
+      return if dirs.empty?
+
+      paths = dirs.flat_map { |d| Dir.glob("#{d}/**/*.h") }
+      written = order_gem_headers(paths, dirs).reject do |path|
+        gem_xmacro_path(header_rel_path(path, dirs), '"')
+      end
+      written.each do |path|
+        write_source_content(f, "#{gem.name}: #{header_rel_path(path, dirs)}", path)
+      end
+      @private_header_statics = collect_static_syms(written)
+    end
+
+    # A static of one source that a header written ahead of it by
+    # write_gem_private_headers also defines (prism's src/source.c and
+    # prism/internal/stringy.h each have an empty_source): the source does
+    # not include that header, or its own build would fail, so its own is
+    # renamed for the span of that source.
+    def write_private_header_renames(f, gem, path, renamed)
+      syms = collect_static_syms([path]).keys.select { |s| @private_header_statics[s] } - renamed
+      return [] if syms.empty?
+
+      tag = "#{gem.name}_#{File.basename(path, ".*")}".tr("-.", "__")
+      f.puts "\n/* Rename #{File.basename(path)} static symbols a header of its gem also defines */"
+      syms.sort.each { |sym| f.puts "#define #{sym} #{tag}_amalg_#{sym}" }
+      syms
     end
 
     def write_source_content(f, name, path)

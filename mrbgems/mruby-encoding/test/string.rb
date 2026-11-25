@@ -114,6 +114,7 @@ assert('every mutating method leaves an answer the string can stand behind') do
       "tr_s!"          => ->(s) { s.tr_s!("a", "\xE3") },
       "squeeze!"       => ->(s) { s.squeeze! },
       "delete!"        => ->(s) { s.delete!("a") },
+      "scrub!"         => ->(s) { s.scrub!("?") },
       "slice!"         => ->(s) { s.slice!(0) },
       "clear"          => ->(s) { s.clear },
       # Both cut one byte off an end, which is where a character can be left
@@ -933,4 +934,18 @@ assert('minrepro') do
       assert_equal cold.chars.size, warm.chars.size
     end
   end
+end
+
+assert('Encoding::US_ASCII') do
+  assert_equal "US-ASCII", Encoding::US_ASCII
+end
+
+assert("String#force_encoding with US-ASCII") do
+  s = "ab".dup
+  assert_same s, s.force_encoding("US-ASCII")
+  assert_equal Encoding::BINARY, s.encoding
+  assert_equal Encoding::BINARY, "ab".dup.force_encoding(Encoding::US_ASCII).encoding
+  assert_equal Encoding::BINARY, "ab".dup.force_encoding("ascii").encoding
+  # read a byte at a time, as CRuby reads US-ASCII
+  assert_equal 2, "\xffa".dup.force_encoding("US-ASCII").length
 end

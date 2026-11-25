@@ -24,6 +24,11 @@ MRuby::Gem::Specification.new('mruby-process') do |spec|
   # branch that settles for any StandardError.
   spec.add_test_dependency 'mruby-errno', core: 'mruby-errno'
 
+  # The fork tests end a child with `exit` and `exit!`.  Process.fork itself
+  # ends one without them, so a build can leave mruby-exit out and keep
+  # scripts from ending the process.
+  spec.add_test_dependency 'mruby-exit', core: 'mruby-exit'
+
   # Asking a Process::Status what instance_variables it hands out needs the
   # gem that defines Object#instance_variables in the first place.
   spec.add_test_dependency 'mruby-metaprog', core: 'mruby-metaprog'

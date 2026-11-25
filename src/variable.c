@@ -8,9 +8,13 @@
 #include <mruby/array.h>
 #include <mruby/class.h>
 #include <mruby/data.h>
+#include <mruby/debug.h>
+#include <mruby/error.h>
+#include <mruby/hash.h>
 #include <mruby/proc.h>
 #include <mruby/string.h>
 #include <mruby/variable.h>
+#include <mruby/khash.h>
 #include <mruby/internal.h>
 
 /* Instance variable table structure */
@@ -569,18 +573,121 @@ mrb_vm_special_set(mrb_state *mrb, mrb_sym i, mrb_value v)
 static mrb_bool
 obj_iv_p(mrb_value obj)
 {
+  return mrb_obj_iv_slot_p(mrb_unboxed_type(obj));
+}
+
+/* Instance variables of objects whose struct has no iv slot: a String or
+   Array subclass with an attribute is common. Rather than an iv slot in every
+   such struct, a side table keyed by the object holds an iv_tbl per object
+   that was given one. The table comes into being with the first such ivar.
+   An object with an entry has MRB_FL_HAS_GIV set, so the GC looks up only
+   those; a Proc has no bit to spare, so every Proc is looked up once a Proc
+   has been given one. An entry goes with its object (mrb_gc_free_giv). Keys
+   are object pointers the hash never dereferences. */
+#define giv_hash_func(mrb,key) mrb_int_hash_func(mrb, (intptr_t)(key) >> 4)
+#define giv_hash_equal(mrb,a,b) ((a) == (b))
+KHASH_DECLARE(giv, struct RBasic*, iv_tbl*, TRUE)
+KHASH_DEFINE(giv, struct RBasic*, iv_tbl*, TRUE, giv_hash_func, giv_hash_equal)
+
+static iv_tbl*
+giv_new_tbl(mrb_state *mrb, iv_tbl *unused)
+{
+  (void)unused;
+  return iv_new(mrb);
+}
+
+/* Gives `key` an entry holding the table `make(mrb, src)` builds.
+
+   Any allocation may run the GC (every one does under MRB_GC_STRESS), and
+   the GC reads this hash: the mark looks up each slotless object's entry,
+   and the sweep deletes the entries of the objects it frees. So the entry
+   is published holding NULL, which every reader takes for "no ivars",
+   before the table is built; and the slot is looked up again afterwards,
+   because a sweep's deletion can move the entries of a small table. An
+   allocation failure leaves the NULL entry, which goes with its object. */
+static iv_tbl*
+giv_store(mrb_state *mrb, struct RBasic *key, iv_tbl *(*make)(mrb_state*, iv_tbl*), iv_tbl *src)
+{
+  kh_giv_t *h = mrb->giv;
+  khiter_t k = kh_put(giv, mrb, h, key);
+  kh_value(giv, h, k) = NULL;
+  if (key->tt == MRB_TT_PROC) mrb->gc.giv_proc = TRUE;
+  else key->flags |= MRB_FL_HAS_GIV;
+  iv_tbl *t = make(mrb, src);
+  k = kh_get(giv, mrb, h, key);
+  mrb_assert(k != kh_end(h));
+  kh_value(giv, h, k) = t;
+  return t;
+}
+
+static iv_tbl*
+giv_tbl(mrb_state *mrb, mrb_value obj, mrb_bool create)
+{
+  kh_giv_t *h = mrb->giv;
+  struct RBasic *key = mrb_basic_ptr(obj);
+
+  if (!create && !mrb_gc_giv_p(mrb, key)) return NULL;
+  if (!h) {
+    if (!create) return NULL;
+    h = mrb->giv = kh_init(giv, mrb);
+  }
+  khiter_t k = kh_get(giv, mrb, h, key);
+  if (k != kh_end(h)) return kh_value(giv, h, k);
+  if (!create) return NULL;
+  return giv_store(mrb, key, giv_new_tbl, NULL);
+}
+
+/* An object that can hold instance variables in the side table. A Range or a
+   number is frozen and an internal type is out of reach, so none of them need
+   one. */
+static mrb_bool
+giv_obj_p(mrb_value obj)
+{
+  if (mrb_immediate_p(obj)) return FALSE;
   switch (mrb_unboxed_type(obj)) {
-    case MRB_TT_OBJECT:
-    case MRB_TT_CLASS:
-    case MRB_TT_MODULE:
-    case MRB_TT_SCLASS:
-    case MRB_TT_HASH:
-    case MRB_TT_CDATA:
-    case MRB_TT_EXCEPTION:
+    case MRB_TT_STRING:
+    case MRB_TT_ARRAY:
+    case MRB_TT_STRUCT:
+    case MRB_TT_SET:
+    case MRB_TT_FIBER:
+    case MRB_TT_ISTRUCT:
+    case MRB_TT_PROC:
       return TRUE;
     default:
       return FALSE;
   }
+}
+
+size_t
+mrb_gc_mark_giv(mrb_state *mrb, struct RBasic *obj)
+{
+  iv_tbl *t = giv_tbl(mrb, mrb_obj_value(obj), FALSE);
+  if (!t) return 0;
+  mark_tbl(mrb, t);
+  return iv_size(mrb, t);
+}
+
+void
+mrb_gc_free_giv(mrb_state *mrb, struct RBasic *obj)
+{
+  kh_giv_t *h = mrb->giv;
+  khiter_t k = kh_get(giv, mrb, h, obj);
+  if (k == kh_end(h)) return;
+  if (kh_value(giv, h, k)) iv_free(mrb, kh_value(giv, h, k));
+  kh_del(giv, mrb, h, k);
+  if (obj->tt != MRB_TT_PROC) obj->flags &= ~MRB_FL_HAS_GIV;
+}
+
+void
+mrb_gc_free_giv_all(mrb_state *mrb)
+{
+  kh_giv_t *h = mrb->giv;
+  if (!h) return;
+  mrb->giv = NULL;
+  for (khiter_t k = kh_begin(h); k != kh_end(h); k++) {
+    if (kh_exist(giv, h, k) && kh_value(giv, h, k)) iv_free(mrb, kh_value(giv, h, k));
+  }
+  kh_destroy(giv, mrb, h);
 }
 
 static iv_tbl*
@@ -636,6 +743,11 @@ mrb_iv_get(mrb_state *mrb, mrb_value obj, mrb_sym sym)
 {
   if (obj_iv_p(obj)) {
     return mrb_obj_iv_get(mrb, mrb_obj_ptr(obj), sym);
+  }
+  if (mrb->giv && giv_obj_p(obj)) {
+    iv_tbl *t = giv_tbl(mrb, obj, FALSE);
+    mrb_value v;
+    if (t && iv_get(mrb, t, sym, &v)) return v;
   }
   return mrb_nil_value();
 }
@@ -728,7 +840,13 @@ mrb_obj_iv_set(mrb_state *mrb, struct RObject *obj, mrb_sym sym, mrb_value v)
 MRB_API void
 mrb_iv_foreach(mrb_state *mrb, mrb_value obj, mrb_iv_foreach_func *func, void *p)
 {
-  if (!obj_iv_p(obj)) return;
+  if (!obj_iv_p(obj)) {
+    if (mrb->giv && giv_obj_p(obj)) {
+      iv_tbl *t = giv_tbl(mrb, obj, FALSE);
+      if (t) iv_foreach(mrb, t, func, p);
+    }
+    return;
+  }
   if (MRB_OBJ_SHAPED_P(mrb_obj_ptr(obj))) {
     shaped_iv_foreach(mrb, mrb_obj_ptr(obj), func, p);
     return;
@@ -758,6 +876,11 @@ mrb_iv_set(mrb_state *mrb, mrb_value obj, mrb_sym sym, mrb_value v)
 {
   if (obj_iv_p(obj)) {
     mrb_obj_iv_set(mrb, mrb_obj_ptr(obj), sym, v);
+  }
+  else if (giv_obj_p(obj)) {
+    mrb_check_frozen(mrb, mrb_basic_ptr(obj));
+    iv_put(mrb, giv_tbl(mrb, obj, TRUE), sym, v);
+    mrb_field_write_barrier_value(mrb, mrb_basic_ptr(obj), v);
   }
   else {
     mrb_raise(mrb, E_ARGUMENT_ERROR, "cannot set instance variable");
@@ -806,7 +929,13 @@ mrb_obj_iv_defined(mrb_state *mrb, struct RObject *obj, mrb_sym sym)
 MRB_API mrb_bool
 mrb_iv_defined(mrb_state *mrb, mrb_value obj, mrb_sym sym)
 {
-  if (!obj_iv_p(obj)) return FALSE;
+  if (!obj_iv_p(obj)) {
+    if (mrb->giv && giv_obj_p(obj)) {
+      iv_tbl *t = giv_tbl(mrb, obj, FALSE);
+      return t && iv_get(mrb, t, sym, NULL);
+    }
+    return FALSE;
+  }
   return mrb_obj_iv_defined(mrb, mrb_obj_ptr(obj), sym);
 }
 
@@ -871,6 +1000,23 @@ mrb_iv_name_sym_check(mrb_state *mrb, mrb_sym iv_name)
 MRB_API void
 mrb_iv_copy(mrb_state *mrb, mrb_value dest, mrb_value src)
 {
+  if (!obj_iv_p(src)) {
+    /* a slotless type: dest, of the same type, takes a copy of src's side
+       table entry in place of its own, if either has one */
+    if (!mrb->giv || !giv_obj_p(src)) return;
+    if (mrb_gc_giv_p(mrb, mrb_basic_ptr(dest))) {
+      mrb_gc_free_giv(mrb, mrb_basic_ptr(dest));
+    }
+    iv_tbl *t = giv_tbl(mrb, src, FALSE);
+    if (t && t->size > 0) {
+      /* src stays reachable from the caller, so the values the copy
+         holds stay alive while it is being made */
+      giv_store(mrb, mrb_basic_ptr(dest), iv_copy, t);
+      mrb_write_barrier(mrb, mrb_basic_ptr(dest));
+    }
+    return;
+  }
+
   struct RObject *d = mrb_obj_ptr(dest);
   struct RObject *s = mrb_obj_ptr(src);
 
@@ -942,6 +1088,15 @@ mrb_iv_copy(mrb_state *mrb, mrb_value dest, mrb_value src)
 MRB_API mrb_value
 mrb_iv_remove(mrb_state *mrb, mrb_value obj, mrb_sym sym)
 {
+  if (!obj_iv_p(obj)) {
+    if (mrb->giv && giv_obj_p(obj)) {
+      mrb_check_frozen(mrb, mrb_basic_ptr(obj));
+      iv_tbl *t = giv_tbl(mrb, obj, FALSE);
+      mrb_value val;
+      if (t && iv_del(mrb, t, sym, &val)) return val;
+    }
+    return mrb_undef_value();
+  }
   if (obj_iv_p(obj)) {
     struct RObject *o = mrb_obj_ptr(obj);
     mrb_check_frozen(mrb, o);
@@ -1013,6 +1168,10 @@ mrb_obj_instance_variables(mrb_state *mrb, mrb_value self)
     else {
       iv_foreach(mrb, obj->iv, iv_i, &ary);
     }
+  }
+  else if (mrb->giv && giv_obj_p(self)) {
+    iv_tbl *t = giv_tbl(mrb, self, FALSE);
+    if (t) iv_foreach(mrb, t, iv_i, &ary);
   }
   return ary;
 }
@@ -1293,8 +1452,266 @@ mod_const_check(mrb_state *mrb, mrb_value mod)
   }
 }
 
+/* A pending autoload, held behind a sentinel stored as the constant
+ * itself, the way a virtual global is: the name is defined and listed, it
+ * shadows the same name further out on the lookup path, and the first
+ * lookup that reaches it requires the file and reads the constant again.
+ * While the file is loading, and once it is in without defining the name,
+ * the constant is not there and the lookup goes on past it, as in CRuby.
+ * The sentinel never leaks into Ruby as the constant's value. */
+struct autoload {
+  mrb_bool loading;
+  mrb_int len;
+  char path[];
+};
+
+static void
+autoload_free(mrb_state *mrb, void *p)
+{
+  mrb_free(mrb, p);
+}
+
+static const mrb_data_type autoload_type = { "autoload", autoload_free };
+
+static struct autoload*
+autoload_check(mrb_value v)
+{
+  if (mrb_data_p(v) && DATA_TYPE(v) == &autoload_type) {
+    return (struct autoload*)DATA_PTR(v);
+  }
+  return NULL;
+}
+
 static mrb_value
-const_get_nohook(mrb_state *mrb, struct RClass *base, mrb_sym sym, mrb_bool skip)
+autoload_require(mrb_state *mrb, void *path)
+{
+  return mrb_funcall_argv(mrb, mrb_top_self(mrb), MRB_SYM(require), 1, (mrb_value*)path);
+}
+
+/* Require the file of the autoload `marker` for `c::sym`. The autoload is
+   spent once the file is in, defined or not; one whose file raised stays,
+   to be tried again. */
+static void
+autoload_load(mrb_state *mrb, struct RClass *c, mrb_sym sym, mrb_value marker)
+{
+  struct autoload *al = (struct autoload*)DATA_PTR(marker);
+  int ai = mrb_gc_arena_save(mrb);
+  mrb_bool error;
+
+  /* mruby has no require of its own: name what is missing rather than
+     fail on a method the program never called; the autoload stays */
+  mrb_value top = mrb_top_self(mrb);
+  if (!mrb_obj_respond_to(mrb, mrb_class(mrb, top), MRB_SYM(require))) {
+    mrb_raisef(mrb, E_NOTIMP_ERROR,
+               "autoload of %C::%n needs Kernel#require to load \"%s\"",
+               c, sym, al->path);
+  }
+
+  /* the file may replace the constant, and with it the last reference */
+  mrb_gc_protect(mrb, marker);
+  mrb_value path = mrb_str_new(mrb, al->path, al->len);
+  al->loading = TRUE;
+  mrb_value result = mrb_protect_error(mrb, autoload_require, &path, &error);
+  al->loading = FALSE;
+  if (error) {
+    mrb_gc_arena_restore(mrb, ai);
+    mrb_exc_raise(mrb, result);
+  }
+
+  /* straight from the table: `c` may be an iclass or frozen */
+  iv_tbl *t = class_iv_ptr(c);
+  mrb_value v;
+  if (iv_get(mrb, t, sym, &v) && mrb_obj_eq(mrb, v, marker)) {
+    iv_del(mrb, t, sym, NULL);
+    mrb_const_cache_clear(mrb);
+  }
+  mrb_gc_arena_restore(mrb, ai);
+}
+
+/* Look `sym` up in the table of `c` alone. With `load`, a pending autoload
+   is loaded and the constant read again; without, it is found as it is,
+   for `defined?` and const_defined?. An autoload whose file is loading is
+   not found either way, nor is a name the file only autoloads anew. */
+static mrb_bool
+const_lookup(mrb_state *mrb, struct RClass *c, mrb_sym sym, mrb_value *vp, mrb_bool load)
+{
+  mrb_value v;
+
+  if (!iv_get(mrb, class_iv_ptr(c), sym, &v)) return FALSE;
+  struct autoload *al = mrb->autoload_used ? autoload_check(v) : NULL;
+  if (al) {
+    if (al->loading) return FALSE;
+    if (load) {
+      autoload_load(mrb, c, sym, v);
+      if (!iv_get(mrb, class_iv_ptr(c), sym, &v)) return FALSE;
+      if (autoload_check(v)) return FALSE;
+    }
+  }
+  if (vp) *vp = v;
+  return TRUE;
+}
+
+mrb_bool
+mrb_const_lookup_at(mrb_state *mrb, struct RClass *c, mrb_sym sym, mrb_value *vp, mrb_bool load)
+{
+  return const_lookup(mrb, c, sym, vp, load);
+}
+
+/* Register `path` to be required the first time `c::sym` is looked up.
+   A constant already defined is left alone; a pending autoload is
+   replaced. */
+void
+mrb_autoload_define(mrb_state *mrb, struct RClass *c, mrb_sym sym, mrb_value path)
+{
+  mrb_value v;
+
+  if (iv_get(mrb, class_iv_ptr(c), sym, &v) && !autoload_check(v)) return;
+
+  mrb_int len = RSTRING_LEN(path);
+  /* classless, as the virtual global's sentinel is, for the same reason */
+  struct RData *d = mrb_data_object_alloc(mrb, NULL, NULL, &autoload_type);
+  struct autoload *al = (struct autoload*)mrb_malloc(mrb, sizeof(struct autoload) + len + 1);
+  al->loading = FALSE;
+  al->len = len;
+  memcpy(al->path, RSTRING_PTR(path), len);
+  al->path[len] = '\0';
+  d->data = al;
+  mrb->autoload_used = TRUE;
+  mrb_obj_iv_set(mrb, (struct RObject*)c, sym, mrb_obj_value(d));
+  mrb_const_cache_clear(mrb);
+
+  mrb_value name = mrb_symbol_value(sym);
+  mrb_funcall_argv(mrb, mrb_obj_value(c), MRB_SYM(const_added), 1, &name);
+}
+
+/* The path of the autoload pending for `sym` in `c`, or with `inherit` in
+   its ancestors too, as Module#autoload? answers: nil when the constant is
+   defined first, or its file is loading. */
+mrb_value
+mrb_autoload_path(mrb_state *mrb, struct RClass *c, mrb_sym sym, mrb_bool inherit)
+{
+  mrb_value v;
+
+  for (; c; c = c->super) {
+    if (MRB_FLAG_TEST(c, MRB_FL_CLASS_IS_PREPENDED)) continue;
+    if (iv_get(mrb, class_iv_ptr(c), sym, &v)) {
+      struct autoload *al = autoload_check(v);
+      if (!al || al->loading) break;
+      return mrb_str_new(mrb, al->path, al->len);
+    }
+    if (!inherit) break;
+  }
+  return mrb_nil_value();
+}
+
+mrb_bool
+mrb_autoload_p(mrb_value v)
+{
+  return autoload_check(v) != NULL;
+}
+
+/* Module#private_constant and #deprecate_constant mark a constant in a
+   Hash its module keeps under a name no Ruby code reaches, and
+   MRB_FL_CLASS_CONST_FLAGS on the module tells a lookup to look there. */
+
+/* the module that holds the constants `c` is searched for */
+static struct RClass*
+const_owner(struct RClass *c)
+{
+  return c->tt == MRB_TT_ICLASS ? c->c : c;
+}
+
+int
+mrb_const_flags(mrb_state *mrb, struct RClass *c, mrb_sym sym)
+{
+  mrb_value h;
+
+  c = const_owner(c);
+  if (!MRB_FLAG_TEST(c, MRB_FL_CLASS_CONST_FLAGS)) return 0;
+  if (!iv_get(mrb, c->iv, MRB_SYM(__const_flags__), &h) || !mrb_hash_p(h)) return 0;
+  mrb_value v = mrb_hash_fetch(mrb, h, mrb_symbol_value(sym), mrb_fixnum_value(0));
+  return mrb_integer_p(v) ? (int)mrb_integer(v) : 0;
+}
+
+/* turns `flag` of the constant `sym` of `c` on or off */
+void
+mrb_const_flags_set(mrb_state *mrb, struct RClass *c, mrb_sym sym, int flag, mrb_bool on)
+{
+  mrb_value h;
+  int fl = mrb_const_flags(mrb, c, sym);
+
+  if (on ? (fl & flag) == flag : (fl & flag) == 0) return;
+  if (!iv_get(mrb, c->iv, MRB_SYM(__const_flags__), &h) || !mrb_hash_p(h)) {
+    h = mrb_hash_new(mrb);
+    mrb_obj_iv_set(mrb, (struct RObject*)c, MRB_SYM(__const_flags__), h);
+  }
+  fl = on ? fl | flag : fl & ~flag;
+  if (fl) mrb_hash_set(mrb, h, mrb_symbol_value(sym), mrb_fixnum_value(fl));
+  else mrb_hash_delete_key(mrb, h, mrb_symbol_value(sym));
+  c->flags |= MRB_FL_CLASS_CONST_FLAGS;
+  /* a constant read through the cache would not be warned of */
+  mrb_const_cache_clear(mrb);
+}
+
+/* a copy of a module takes its own copy of the marks */
+void
+mrb_const_flags_copy(mrb_state *mrb, struct RClass *dst, struct RClass *src)
+{
+  mrb_value h;
+
+  if (!MRB_FLAG_TEST(src, MRB_FL_CLASS_CONST_FLAGS)) return;
+  if (!iv_get(mrb, src->iv, MRB_SYM(__const_flags__), &h) || !mrb_hash_p(h)) return;
+  mrb_obj_iv_set(mrb, (struct RObject*)dst, MRB_SYM(__const_flags__), mrb_hash_dup(mrb, h));
+  dst->flags |= MRB_FL_CLASS_CONST_FLAGS;
+}
+
+/* The file and line of the Ruby code running, as a warning starts with */
+static mrb_value
+const_warn_location(mrb_state *mrb)
+{
+  for (mrb_callinfo *ci = mrb->c->ci; ci >= mrb->c->cibase; ci--) {
+    if (!ci->proc || MRB_PROC_CFUNC_P(ci->proc) || !ci->pc) continue;
+    const mrb_irep *irep = ci->proc->body.irep;
+    if (!irep || !irep->debug_info) continue;
+    uint32_t idx = (uint32_t)(ci->pc - irep->iseq - 1);
+    const char *file = mrb_debug_get_filename(mrb, irep, idx);
+    int32_t line = mrb_debug_get_line(mrb, irep, idx);
+    if (file && line >= 0) return mrb_format(mrb, "%s:%d: ", file, (int)line);
+  }
+  return mrb_str_new(mrb, NULL, 0);
+}
+
+/* A constant `c::sym` has been read: if it is deprecated, warn, when
+   Warning (from mruby-warning) says to for :deprecated, as CRuby does, and
+   answer TRUE, so the read is not cached and the next warns too. funcall
+   takes no keyword arguments, so Warning.warn is not given `category:`. */
+static mrb_bool
+const_warn_deprecated(mrb_state *mrb, struct RClass *c, mrb_sym sym, mrb_value v)
+{
+  c = const_owner(c);
+  if (!(mrb_const_flags(mrb, c, sym) & MRB_CONST_DEPRECATED)) return FALSE;
+  /* Warning may remove the constant, and v is then the caller's alone */
+  mrb_gc_protect(mrb, v);
+  mrb_value w;
+  /* a read does not load Warning, nor see an autoload of it */
+  if (!const_lookup(mrb, mrb->object_class, MRB_SYM(Warning), &w, FALSE) || autoload_check(w)) return TRUE;
+  mrb_value cat = mrb_symbol_value(MRB_SYM(deprecated));
+  if (!mrb_respond_to(mrb, w, MRB_OPSYM(aref))) return TRUE;
+  if (!mrb_test(mrb_funcall_argv(mrb, w, MRB_OPSYM(aref), 1, &cat))) return TRUE;
+
+  mrb_value msg = const_warn_location(mrb);
+  if (c == mrb->object_class) {
+    mrb_str_cat_str(mrb, msg, mrb_format(mrb, "warning: constant ::%n is deprecated\n", sym));
+  }
+  else {
+    mrb_str_cat_str(mrb, msg, mrb_format(mrb, "warning: constant %C::%n is deprecated\n", c, sym));
+  }
+  mrb_funcall_argv(mrb, w, MRB_SYM(warn), 1, &msg);
+  return TRUE;
+}
+
+static mrb_value
+const_get_nohook(mrb_state *mrb, struct RClass *base, mrb_sym sym, mrb_bool skip, mrb_bool load, struct RClass **ownerp)
 {
   struct RClass *c = base;
   mrb_value v;
@@ -1304,7 +1721,8 @@ const_get_nohook(mrb_state *mrb, struct RClass *base, mrb_sym sym, mrb_bool skip
   if (skip) c = c->super;
 L_RETRY:
   while (c) {
-    if (!MRB_FLAG_TEST(c, MRB_FL_CLASS_IS_PREPENDED) && iv_get(mrb, class_iv_ptr(c), sym, &v)) {
+    if (!MRB_FLAG_TEST(c, MRB_FL_CLASS_IS_PREPENDED) && const_lookup(mrb, c, sym, &v, load)) {
+      if (ownerp) *ownerp = c;
       return v;
     }
     c = c->super;
@@ -1319,26 +1737,60 @@ L_RETRY:
 }
 
 static mrb_value
-const_get(mrb_state *mrb, struct RClass *base, mrb_sym sym, mrb_bool skip)
+const_missing(mrb_state *mrb, struct RClass *base, mrb_sym sym)
 {
-  mrb_value v = const_get_nohook(mrb, base, sym, skip);
+  mrb_value mod = mrb_obj_value(base);
+  if (mrb_func_basic_p(mrb, mod, MRB_SYM(const_missing), mrb_mod_const_missing)) {
+    return mrb_const_missing(mrb, mod, sym);
+  }
+  mrb_value name = mrb_symbol_value(sym);
+  return mrb_funcall_argv(mrb, mod, MRB_SYM(const_missing), 1, &name);
+}
+
+/* *cachep, unless NULL, is cleared when the constant is deprecated, or
+   when const_missing answers for it: the hook is called for each read, as
+   in CRuby, and what it gives is not the constant */
+static mrb_value
+const_get(mrb_state *mrb, struct RClass *base, mrb_sym sym, mrb_bool skip, mrb_bool *cachep)
+{
+  struct RClass *owner;
+  mrb_value v = const_get_nohook(mrb, base, sym, skip, TRUE, &owner);
 
   /* call const_missing hook */
   if (mrb_undef_p(v)) {
-    mrb_value mod = mrb_obj_value(base);
-    if (mrb_func_basic_p(mrb, mod, MRB_SYM(const_missing), mrb_mod_const_missing)) {
-      return mrb_const_missing(mrb, mod, sym);
-    }
-    mrb_value name = mrb_symbol_value(sym);
-    return mrb_funcall_argv(mrb, mod, MRB_SYM(const_missing), 1, &name);
+    if (cachep) *cachep = FALSE;
+    return const_missing(mrb, base, sym);
   }
+  if (const_warn_deprecated(mrb, owner, sym, v) && cachep) *cachep = FALSE;
+  return v;
+}
+
+/* `mod::sym`, a constant path read: a private constant is not there to it,
+   and const_missing is called as for one missing; the default one says it
+   is private. */
+mrb_value
+mrb_vm_const_get_path(mrb_state *mrb, mrb_value mod, mrb_sym sym)
+{
+  struct RClass *owner;
+
+  mod_const_check(mrb, mod);
+  struct RClass *base = mrb_class_ptr(mod);
+  mrb_value v = const_get_nohook(mrb, base, sym, FALSE, TRUE, &owner);
+  if (mrb_undef_p(v)) return const_missing(mrb, base, sym);
+  if (mrb_const_flags(mrb, owner, sym) & MRB_CONST_PRIVATE) {
+    if (mrb_func_basic_p(mrb, mod, MRB_SYM(const_missing), mrb_mod_const_missing)) {
+      mrb_name_error(mrb, sym, "private constant %C::%n referenced", const_owner(owner), sym);
+    }
+    return const_missing(mrb, base, sym);
+  }
+  const_warn_deprecated(mrb, owner, sym, v);
   return v;
 }
 
 mrb_value
 mrb_exc_const_get(mrb_state *mrb, mrb_sym sym)
 {
-  return const_get_nohook(mrb, mrb->object_class, sym, FALSE);
+  return const_get_nohook(mrb, mrb->object_class, sym, FALSE, TRUE, NULL);
 }
 
 /*
@@ -1365,7 +1817,7 @@ MRB_API mrb_value
 mrb_const_get(mrb_state *mrb, mrb_value mod, mrb_sym sym)
 {
   mod_const_check(mrb, mod);
-  return const_get(mrb, mrb_class_ptr(mod), sym, FALSE);
+  return const_get(mrb, mrb_class_ptr(mod), sym, FALSE, NULL);
 }
 
 static struct RClass*
@@ -1396,8 +1848,10 @@ lexical_scope_p(mrb_state *mrb, const struct RProc *proc)
   return proc_class(mrb, proc) != proc_class(mrb, proc->upper);
 }
 
+/* the constant `sym` a lexical read finds; *cachep is cleared when it is
+   deprecated, so that each read warns, or when const_missing gives it */
 mrb_value
-mrb_vm_const_get(mrb_state *mrb, mrb_sym sym)
+mrb_vm_const_get(mrb_state *mrb, mrb_sym sym, mrb_bool *cachep)
 {
   const struct RProc *proc = mrb->c->ci->proc;
   struct RClass *c = mrb_vm_cref_class(mrb, mrb->c->ci), *c2;
@@ -1405,19 +1859,22 @@ mrb_vm_const_get(mrb_state *mrb, mrb_sym sym)
   if (!c) c = mrb->object_class;
   mrb_value v;
 
-  if (iv_get(mrb, class_iv_ptr(c), sym, &v)) {
+  if (const_lookup(mrb, c, sym, &v, TRUE)) {
+    if (const_warn_deprecated(mrb, c, sym, v)) *cachep = FALSE;
     return v;
   }
   for (proc = proc->upper; proc && proc->upper; proc = proc->upper) {
     if (!lexical_scope_p(mrb, proc)) continue;
     c2 = proc_class(mrb, proc);
-    if (iv_get(mrb, class_iv_ptr(c2), sym, &v)) {
+    if (const_lookup(mrb, c2, sym, &v, TRUE)) {
+      if (const_warn_deprecated(mrb, c2, sym, v)) *cachep = FALSE;
       return v;
     }
   }
   if (c->tt == MRB_TT_SCLASS) {
-    v = const_get_nohook(mrb, c, sym, TRUE);
+    v = const_get_nohook(mrb, c, sym, TRUE, TRUE, &c2);
     if (!mrb_undef_p(v)) {
+      if (const_warn_deprecated(mrb, c2, sym, v)) *cachep = FALSE;
       return v;
     }
 
@@ -1430,15 +1887,17 @@ mrb_vm_const_get(mrb_state *mrb, mrb_sym sym)
     }
     if (c2 && (c2->tt == MRB_TT_CLASS || c2->tt == MRB_TT_MODULE)) c = c2;
   }
-  return const_get(mrb, c, sym, TRUE);
+  return const_get(mrb, c, sym, TRUE, cachep);
 }
 
 /* Non-raising lexical constant lookup for `defined?`. Mirrors the search
    order of mrb_vm_const_get but takes the lexical scope's proc as an argument
    (the caller's, via ci[-1]) and returns the value or undef, without invoking
-   const_missing or raising. */
+   const_missing or raising. A pending autoload is loaded with `load`, and is
+   returned as it is without: `defined?(A)` is "constant" with A's file still
+   out, `defined?(A::B)` needs A itself. */
 mrb_value
-mrb_vm_const_get_noraise(mrb_state *mrb, mrb_callinfo *ci, mrb_sym sym)
+mrb_vm_const_get_noraise(mrb_state *mrb, mrb_callinfo *ci, mrb_sym sym, mrb_bool load)
 {
   const struct RProc *proc = ci->proc;
   struct RClass *c = mrb_vm_cref_class(mrb, ci), *c2;
@@ -1446,14 +1905,14 @@ mrb_vm_const_get_noraise(mrb_state *mrb, mrb_callinfo *ci, mrb_sym sym)
   if (!c) c = mrb->object_class;
   mrb_value v;
 
-  if (iv_get(mrb, class_iv_ptr(c), sym, &v)) return v;
+  if (const_lookup(mrb, c, sym, &v, load)) return v;
   for (proc = proc->upper; proc && proc->upper; proc = proc->upper) {
     if (!lexical_scope_p(mrb, proc)) continue;
     c2 = proc_class(mrb, proc);
-    if (iv_get(mrb, class_iv_ptr(c2), sym, &v)) return v;
+    if (const_lookup(mrb, c2, sym, &v, load)) return v;
   }
   if (c->tt == MRB_TT_SCLASS) {
-    v = const_get_nohook(mrb, c, sym, TRUE);
+    v = const_get_nohook(mrb, c, sym, TRUE, load, NULL);
     if (!mrb_undef_p(v)) return v;
 
     mrb_value klass;
@@ -1465,23 +1924,30 @@ mrb_vm_const_get_noraise(mrb_state *mrb, mrb_callinfo *ci, mrb_sym sym)
     }
     if (c2 && (c2->tt == MRB_TT_CLASS || c2->tt == MRB_TT_MODULE)) c = c2;
   }
-  return const_get_nohook(mrb, c, sym, TRUE);
+  return const_get_nohook(mrb, c, sym, TRUE, load, NULL);
 }
 
 mrb_bool
 mrb_vm_const_defined_p(mrb_state *mrb, mrb_callinfo *ci, mrb_sym sym)
 {
-  return !mrb_undef_p(mrb_vm_const_get_noraise(mrb, ci, sym));
+  return !mrb_undef_p(mrb_vm_const_get_noraise(mrb, ci, sym, FALSE));
 }
 
 /* The lookup a constant path read makes from a module, `Mod::NAME`, without
    its hooks: the value, or undef where the name is missing, with no
    const_missing call and nothing raised.  A constant Object holds is out of
-   reach from any other module here, as it is for the read. */
+   reach from any other module here, as it is for the read, and so is a
+   private constant. A pending autoload is loaded with `load`, as for
+   mrb_vm_const_get_noraise(). */
 mrb_value
-mrb_const_get_noraise(mrb_state *mrb, struct RClass *mod, mrb_sym sym)
+mrb_const_get_noraise(mrb_state *mrb, struct RClass *mod, mrb_sym sym, mrb_bool load)
 {
-  return const_get_nohook(mrb, mod, sym, FALSE);
+  struct RClass *owner;
+  mrb_value v = const_get_nohook(mrb, mod, sym, FALSE, load, &owner);
+  if (!mrb_undef_p(v) && (mrb_const_flags(mrb, owner, sym) & MRB_CONST_PRIVATE)) {
+    return mrb_undef_value();
+  }
+  return v;
 }
 
 /*
@@ -1562,6 +2028,7 @@ mrb_const_remove(mrb_state *mrb, mrb_value mod, mrb_sym sym)
 {
   mod_const_check(mrb, mod);
   mrb_iv_remove(mrb, mod, sym);
+  mrb_const_flags_set(mrb, mrb_class_ptr(mod), sym, MRB_CONST_PRIVATE|MRB_CONST_DEPRECATED, FALSE);
   mrb_const_cache_clear(mrb);
 }
 
@@ -1618,14 +2085,21 @@ mrb_define_global_const(mrb_state *mrb, const char *name, mrb_value val)
   mrb_define_const(mrb, mrb->object_class, name, val);
 }
 
+struct const_i_arg {
+  struct RClass *c;
+  mrb_value ary;
+};
+
+/* a private constant is not listed */
 static int
 const_i(mrb_state *mrb, mrb_sym sym, mrb_value v, void *p)
 {
-  mrb_value ary = *(mrb_value*)p;
+  struct const_i_arg *arg = (struct const_i_arg*)p;
+  mrb_value ary = arg->ary;
   mrb_int len;
   const char* s = mrb_sym_name_len(mrb, sym, &len);
 
-  if (len >= 1 && ISUPPER(s[0])) {
+  if (len >= 1 && ISUPPER(s[0]) && !(mrb_const_flags(mrb, arg->c, sym) & MRB_CONST_PRIVATE)) {
     mrb_int i, alen = RARRAY_LEN(ary);
 
     for (i=0; i<alen; i++) {
@@ -1642,7 +2116,8 @@ const_i(mrb_state *mrb, mrb_sym sym, mrb_value v, void *p)
 mrb_value
 mrb_mod_const_at(mrb_state *mrb, struct RClass *c, mrb_value ary)
 {
-  iv_foreach(mrb, class_iv_ptr(c), const_i, &ary);
+  struct const_i_arg arg = { c, ary };
+  iv_foreach(mrb, class_iv_ptr(c), const_i, &arg);
   return ary;
 }
 
@@ -1864,7 +2339,7 @@ const_defined_0(mrb_state *mrb, mrb_value mod, mrb_sym id, mrb_bool exclude, mrb
   tmp = klass;
 retry:
   while (tmp) {
-    if (iv_get(mrb, class_iv_ptr(tmp), id, NULL)) {
+    if (const_lookup(mrb, tmp, id, NULL, FALSE)) {
       return TRUE;
     }
     if (!recurse && (klass != mrb->object_class)) break;

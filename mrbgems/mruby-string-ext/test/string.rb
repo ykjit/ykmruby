@@ -716,6 +716,14 @@ assert('String#oct') do
   assert_equal 8, "1_0".oct
   assert_equal 8, "010".oct
   assert_equal (-8), "-10".oct
+  assert_equal 8, "0o10".oct
+  assert_equal 31, "0x1f".oct
+  assert_equal 31, "0X1F".oct
+  assert_equal 5, "0b101".oct
+  assert_equal 19, "0d19".oct
+  assert_equal (-31), "-0x1f".oct
+  assert_equal 1, "0b12".oct
+  assert_equal 0, "089".oct
 end
 
 assert('String#lines') do
@@ -1145,6 +1153,16 @@ assert('String#insert') do
   a = "abcd"
   a.insert(0, 'X')
   assert_equal "Xabcd", a
+
+  # The receiver inserted into itself is copied over its own bytes
+  b = "abcd"
+  b.insert(1, b)
+  assert_equal "aabcdbcd", b
+
+  c = "0123456789" * 10
+  expected = c[0, 7] + c + c[7..-1]
+  c.insert(7, c)
+  assert_equal expected, c
 end
 
 assert('String#prepend') do
@@ -1273,6 +1291,19 @@ assert('String#upto') do
   assert_upto [], "25", "5"
   assert_upto ["07", "08", "09", "10", "11"], "07", "11"
   assert_upto ["9", ":", ";", "<", "=", ">", "?", "@", "A"], "9", "A"
+  # a shorter string steps past ones that sort after the end
+  assert_upto %w(a b c d e f g h i j k l m n o p q r s t u v w x y z aa), "a", "aa"
+  assert_upto %w(a b c d e f g h i j k l m n o p q r s t u v w x y z), "a", "aa", true
+  assert_upto %w(a9 b0 b1), "a9", "b1"
+  assert_upto [], "y", "ab"
+  assert_upto ["az", "ba"], "az", "ba"
+  assert_upto [], "b", "aa"
+  assert_upto [""], "", "a"
+  assert_upto %w(9 10), "9", "10"
+  # strings with digits that are not all digits step by succ
+  assert_upto %w(1.9 2.0 2.1), "1.9", "2.1"
+  assert_upto %w(1y 1z 2a), "1y", "2a"
+  assert_upto %w(00 01 02), "00", "02"
 
   if UTF8STRING
     assert_upto %w(あ ぃ い ぅ う ぇ え ぉ お), "あ", "お"
@@ -1773,12 +1804,32 @@ assert('String#scrub with block') do
   assert_equal "abc42def", "abc\x80def".scrub { 42 }
 end
 
+assert('String#scrub!') do
+  skip unless "あ".length == 1
+  s = "abc\x80def"
+  assert_same s, s.scrub!
+  assert_equal "abc\u{FFFD}def", s
+  s = "a\x80b"
+  assert_same s, s.scrub!("?")
+  assert_equal "a?b", s
+  s = "x\x80"
+  assert_same s, s.scrub! { |b| "<#{b.bytes.first}>" }
+  assert_equal "x<128>", s
+  # nothing to replace: self, even when frozen
+  f = "abc".freeze
+  assert_same f, f.scrub!
+  assert_raise(FrozenError) { "a\x80".freeze.scrub! }
+end
+
 assert('String#scrub no-op on non-UTF-8 build') do
   skip if "あ".length == 1
   # Method is still defined and returns a (string-equal) copy.
   assert_equal "abc\x80def", "abc\x80def".scrub
   assert_equal "abc\x80def", "abc\x80def".scrub("?")
   assert_equal "abc\x80def", "abc\x80def".scrub { |_| "?" }
+  s = "abc\x80def"
+  assert_same s, s.scrub!
+  assert_equal "abc\x80def", s
 end
 
 assert('String#chars of a receiver longer than the GC arena') do
@@ -1796,3 +1847,13 @@ assert('String#chars of a multibyte receiver longer than the GC arena') do
   assert_equal 300, ("\u3042" * 300).chars.size
   assert_equal "\u3042", ("\u3042" * 300).chars.last
 end if UTF8STRING
+
+assert('String#dedup') do
+  a = "abc"
+  b = a.dedup
+  assert_true b.frozen?
+  assert_equal "abc", b
+  assert_false a.frozen?
+  f = "xyz".freeze
+  assert_same f, f.dedup
+end

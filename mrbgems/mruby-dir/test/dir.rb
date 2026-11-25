@@ -39,6 +39,15 @@ assert('Dir.foreach') do
   assert_true a.include?("b")
 end
 
+assert('Dir.each_child') do
+  a = []
+  assert_nil Dir.each_child(DirTest.sandbox) { |s| a << s }
+  assert_true a.include?("a")
+  assert_true a.include?("b")
+  assert_false a.include?(".")
+  assert_false a.include?("..")
+end
+
 assert('Dir.getwd') do
   s = Dir.getwd
   assert_true s.kind_of? String
@@ -171,6 +180,90 @@ assert('Dir#seek') do
   rescue NotImplementedError => e
     skip e.message
   end
+end
+
+assert('Dir methods take an object with to_path for a path') do
+  # an object that stands for a path, as a Pathname does
+  path = Object.new
+  def path.to_path
+    DirTest.sandbox + "/topath"
+  end
+  assert_equal 0, Dir.mkdir(path)
+  assert_true Dir.exist?(path)
+  assert_true Dir.empty?(path)
+  assert_equal [".", ".."], Dir.entries(path).sort
+  assert_equal [], Dir.children(path)
+  d = Dir.new(path)
+  names = []
+  d.each { |name| names << name }
+  assert_equal [".", ".."], names.sort
+  d.close
+  Dir.chdir(path) { assert_true Dir.getwd.include?("topath") }
+  assert_equal 0, Dir.delete(path)
+  assert_false Dir.exist?(path)
+  assert_raise(TypeError) { Dir.exist?(1) }
+end
+
+# The size of the sandbox's "日本語" among the names: 9 for a binary
+# string, and "日本語".size, 3 where strings are UTF-8, for a UTF-8 one.
+def dir_test_jp_size(names)
+  names.each { |n| return n.size if n.bytesize == 9 }
+  nil
+end
+
+assert('Dir methods take encoding:') do
+  d = DirTest.sandbox
+  utf8 = "日本語".size
+  assert_equal 9, dir_test_jp_size(Dir.children(d, encoding: "BINARY"))
+  assert_equal 9, dir_test_jp_size(Dir.entries(d, encoding: "ascii-8bit"))
+  assert_equal utf8, dir_test_jp_size(Dir.children(d, encoding: "UTF-8"))
+  assert_equal utf8, dir_test_jp_size(Dir.children(d, encoding: nil))
+  # an encoding mruby does not have gives UTF-8 names, as mruby-io reads it
+  assert_equal utf8, dir_test_jp_size(Dir.entries(d, encoding: "EUC-JP"))
+
+  a = []
+  Dir.each_child(d, encoding: "BINARY") { |n| a << n }
+  assert_equal 9, dir_test_jp_size(a)
+  a = []
+  Dir.foreach(d, encoding: "BINARY") { |n| a << n }
+  assert_equal 9, dir_test_jp_size(a)
+
+  dir = Dir.new(d, encoding: "BINARY")
+  a = []
+  while n = dir.read
+    a << n
+  end
+  dir.close
+  assert_equal 9, dir_test_jp_size(a)
+  a = []
+  Dir.open(d, encoding: "BINARY") { |x| x.each_child { |n| a << n } }
+  assert_equal 9, dir_test_jp_size(a)
+
+  assert_raise(TypeError) { Dir.children(d, encoding: 1) }
+  assert_raise(ArgumentError) { Dir.children(d, no_such_option: 1) }
+end
+
+class DirTestReinitPath
+  def initialize(dir)
+    @dir = dir
+  end
+
+  def to_path
+    @dir.instance_eval { initialize(DirTest.sandbox) }
+    DirTest.sandbox
+  end
+end
+
+assert('Dir#initialize keeps its arguments when to_path initializes the Dir again') do
+  dir = Dir.new(DirTest.sandbox)
+  path = DirTestReinitPath.new(dir)
+  dir.instance_eval { initialize(path, encoding: "BINARY") }
+  a = []
+  while n = dir.read
+    a << n
+  end
+  dir.close
+  assert_equal 9, dir_test_jp_size(a)
 end
 
 assert('DirTest.teardown') do

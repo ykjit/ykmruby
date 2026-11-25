@@ -28,6 +28,8 @@
 #include <errno.h>
 #include <limits.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /*
@@ -157,6 +159,182 @@ process_ppid(mrb_state *mrb, mrb_value self)
 
   if (ppid < 0) mrb_sys_fail(mrb, "getppid");
   return mrb_int_value(mrb, ppid);
+}
+
+/*
+ * call-seq:
+ *   Process.uid -> integer
+ *
+ * The (real) user ID belonging to the current process.
+ */
+static mrb_value
+process_uid(mrb_state *mrb, mrb_value self)
+{
+  mrb_int uid = mrb_hal_process_uid(mrb);
+  if (uid < 0) mrb_sys_fail(mrb, "getuid");
+  return mrb_int_value(mrb, uid);
+}
+
+/*
+ * call-seq:
+ *   Process.euid -> integer
+ *
+ * The (effective) user ID belonging to the current process.
+ */
+static mrb_value
+process_euid(mrb_state *mrb, mrb_value self)
+{
+  mrb_int euid = mrb_hal_process_euid(mrb);
+  if (euid < 0) mrb_sys_fail(mrb, "geteuid");
+  return mrb_int_value(mrb, euid);
+}
+
+/*
+ * call-seq:
+ *   Process.__fork -> integer
+ *
+ * The fork(2) system call creates a new process that
+ * inherits from its parent.
+ *
+ * See mruby-process/mrblib/kernel.rb for where and how
+ * this method is called.
+*/
+static mrb_value
+process_fork(mrb_state *mrb, mrb_value self)
+{
+  mrb_int pid;
+  /* the child inherits the stdio buffers; flush them so that output still
+     pending is not written by both processes */
+  fflush(NULL);
+  pid = mrb_hal_process_fork(mrb);
+  if (pid == -1) {
+    if (errno == ENOSYS) {
+      mrb_raise(mrb, E_NOTIMP_ERROR, "fork(2) is not implemented on this platform");
+    } else {
+      mrb_sys_fail(mrb, "fork");
+    }
+  }
+  if (pid == 0) {
+    mrb_int childpid;
+    childpid = mrb_hal_process_pid(mrb);
+    mrb_gv_set(mrb, mrb_intern_lit(mrb, "$$"), mrb_int_value(mrb, childpid));
+  }
+  return mrb_int_value(mrb, pid);
+}
+
+/*
+ * call-seq:
+ *   Process.exec(command)              -> never returns
+ *   Process.exec(cmd, arg1, ...)       -> never returns
+ *
+ * Replaces the current process by running the given command.  A single
+ * _command_ is a command line run by the shell; with arguments, _cmd_ is
+ * the program, found through PATH, and is run without a shell.  Raises
+ * SystemCallError when the command cannot be run, and NotImplementedError
+ * where a process cannot run another program.
+ */
+static mrb_value
+process_exec(mrb_state *mrb, mrb_value self)
+{
+  const mrb_value *args;
+  mrb_int argc;
+  char **argv = NULL;
+
+  mrb_get_args(mrb, "*", &args, &argc);
+  if (argc == 0) {
+    mrb_argnum_error(mrb, 0, 1, -1);
+  }
+  /* raise for a bad argument before anything is allocated; once done, each
+     argument holds a NUL-terminated buffer and reading it allocates nothing */
+  for (mrb_int i = 0; i < argc; i++) {
+    mrb_value v = args[i];
+    mrb_string_value_cstr(mrb, &v);
+  }
+  mrb_value v = args[0];
+  const char *cmd = mrb_string_value_cstr(mrb, &v);
+  if (argc > 1) {
+    if ((size_t)argc >= SIZE_MAX / sizeof(char*)) {
+      mrb_raise(mrb, E_ARGUMENT_ERROR, "too many arguments");
+    }
+    argv = (char**)mrb_malloc(mrb, (size_t)(argc + 1) * sizeof(char*));
+    for (mrb_int i = 0; i < argc; i++) {
+      v = args[i];
+      argv[i] = (char*)mrb_string_value_cstr(mrb, &v);
+    }
+    argv[argc] = NULL;
+  }
+
+  /* output still pending would be lost with the process image */
+  fflush(NULL);
+  mrb_hal_process_exec(mrb, cmd, argv);
+  int err = errno;
+  mrb_free(mrb, argv);
+  errno = err;
+  if (err == ENOSYS) {
+    mrb_raise(mrb, E_NOTIMP_ERROR, "exec is not implemented on this platform");
+  }
+  mrb_sys_fail(mrb, cmd);
+  return mrb_nil_value();       /* not reached */
+}
+
+/*
+ * call-seq:
+ *   Process.__exit_child(exc) -> never returns
+ *
+ * Ends the child Process.fork ran a block in, through exit(3) so that its
+ * stdio buffers are flushed.  _exc_ is nil when the block finished, and
+ * the exception that ended it otherwise: a SystemExit gives its status,
+ * anything else is reported and gives failure.  SystemExit is recognized
+ * by its flag, so this gem does not need mruby-exit.
+ */
+static mrb_value
+process_exit_child(mrb_state *mrb, mrb_value self)
+{
+  mrb_value exc = mrb_get_arg1(mrb);
+  int status = EXIT_SUCCESS;
+
+  if (mrb_exception_p(exc)) {
+    struct RObject *e = mrb_obj_ptr(exc);
+    if (MRB_EXC_EXIT_P(e)) {
+      status = MRB_EXC_EXIT_STATUS(mrb, e);
+    }
+    else {
+      mrb->exc = e;
+      mrb_print_error(mrb);
+      status = EXIT_FAILURE;
+    }
+  }
+  exit(status);
+  /* not reached */
+  return mrb_nil_value();
+}
+
+/*
+ * call-seq:
+ *   Process.gid -> integer
+ *
+ * The (real) group ID belonging to the current process.
+ */
+static mrb_value
+process_gid(mrb_state *mrb, mrb_value self)
+{
+  mrb_int gid = mrb_hal_process_gid(mrb);
+  if (gid < 0) mrb_sys_fail(mrb, "getgid");
+  return mrb_int_value(mrb, gid);
+}
+
+/*
+ * call-seq:
+ *   Process.egid -> integer
+ *
+ * The (effective) group ID belonging to the current process.
+ */
+static mrb_value
+process_egid(mrb_state *mrb, mrb_value self)
+{
+  mrb_int egid = mrb_hal_process_egid(mrb);
+  if (egid < 0) mrb_sys_fail(mrb, "getegid");
+  return mrb_int_value(mrb, egid);
 }
 
 /*
@@ -339,6 +517,13 @@ mrb_mruby_process_gem_init(mrb_state *mrb)
                       mrb_fixnum_value(MRB_PROCESS_WAIT_UNTRACED));
   mrb_define_module_function_id(mrb, process, MRB_SYM(pid),     process_pid,     MRB_ARGS_NONE());
   mrb_define_module_function_id(mrb, process, MRB_SYM(ppid),    process_ppid,    MRB_ARGS_NONE());
+  mrb_define_module_function_id(mrb, process, MRB_SYM(uid),     process_uid,     MRB_ARGS_NONE());
+  mrb_define_module_function_id(mrb, process, MRB_SYM(euid),    process_euid,    MRB_ARGS_NONE());
+  mrb_define_module_function_id(mrb, process, MRB_SYM(__fork),  process_fork,    MRB_ARGS_NONE());
+  mrb_define_module_function_id(mrb, process, MRB_SYM(exec),    process_exec,    MRB_ARGS_ANY());
+  mrb_define_module_function_id(mrb, process, MRB_SYM(__exit_child), process_exit_child, MRB_ARGS_REQ(1));
+  mrb_define_module_function_id(mrb, process, MRB_SYM(gid),     process_gid,     MRB_ARGS_NONE());
+  mrb_define_module_function_id(mrb, process, MRB_SYM(egid),    process_egid,    MRB_ARGS_NONE());
   mrb_define_module_function_id(mrb, process, MRB_SYM(kill),    process_kill,    MRB_ARGS_REQ(2)|MRB_ARGS_REST());
   mrb_define_module_function_id(mrb, process, MRB_SYM(waitpid),  process_waitpid,  MRB_ARGS_OPT(2));
   mrb_define_module_function_id(mrb, process, MRB_SYM(wait),     process_waitpid,  MRB_ARGS_OPT(2));

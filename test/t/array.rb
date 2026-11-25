@@ -65,6 +65,31 @@ assert('Array#[]', '15.2.12.5.4') do
   assert_equal("b", a[1.1])
 end
 
+assert('Array#[] with a Float index that stands for no Integer') do
+  # The index is truncated toward zero, so a Float no `mrb_int` holds spells no
+  # index at all and is out of range rather than whatever the C cast makes of
+  # it: the cast read `Float::NAN` as 0 on AArch64 and as `MRB_INT_MIN` on
+  # x86-64, so the same script answered "a" on one and nil on the other. The
+  # length argument of the same method has always been read this way.
+  skip unless Object.const_defined?(:Float)
+  a = [ "a", "b", "c" ]
+  inf = Float::INFINITY
+  nan = Float::NAN
+
+  assert_raise(RangeError) { a[inf] }
+  assert_raise(RangeError) { a[-inf] }
+  assert_raise(RangeError) { a[nan] }
+  assert_raise(RangeError) { a[1e30] }
+  assert_raise(RangeError) { a[inf, 1] }
+  assert_raise(RangeError) { a.slice(nan) }
+  assert_raise(RangeError) { a[nan] = 1 }
+  assert_equal([ "a", "b", "c" ], a)
+
+  # an index a Float does stand for is still truncated toward zero
+  assert_equal("b", a[1.9])
+  assert_equal("c", a[-1.9])
+end
+
 assert('Array#[] redefined on Array itself reaches the redefinition') do
   # `OP_GETIDX` answers `a[1]` from C and `OP_GETIDX0` answers `a[0]` the same
   # way whenever the receiver's class is exactly `Array`, which they may only
@@ -218,6 +243,12 @@ assert('Array#delete_at', '15.2.12.5.9') do
   assert_equal([1], a)
 end
 
+assert('Array#delete_at keeps what it returns while the array shrinks') do
+  # the strings are held by the array alone, and its capacity shrinks
+  a = (1..40).map { |i| "s#{i}" }
+  35.times { |i| assert_equal("s#{i + 1}", a.delete_at(0)) }
+end
+
 assert('Array#each', '15.2.12.5.10') do
   a = [1,2,3]
   b = 0
@@ -282,6 +313,73 @@ assert('Array#initialize', '15.2.12.5.15') do
   assert_equal([0,1], d)
 end
 
+assert('Array#initialize negative size and shrink') do
+  assert_raise_with_message(ArgumentError, "negative array size") { Array.new(-1) }
+  assert_raise_with_message(ArgumentError, "negative array size") { Array.new(-1, 0) }
+  assert_raise_with_message(ArgumentError, "negative array size") { Array.new(-5) {|i| i} }
+
+  a = [1, 2, 3]
+  assert_raise_with_message(ArgumentError, "negative array size") { a.__send__(:initialize, -1) }
+  assert_equal([1, 2, 3], a)
+
+  assert_equal([], Array.new(0))
+  assert_equal([], Array.new)
+
+  a = [1, 2, 3]
+  a.__send__(:initialize)
+  assert_equal([], a)
+
+  a = [1, 2, 3]
+  a.__send__(:initialize, 0)
+  assert_equal([], a)
+
+  assert_equal([1, 1], Array.new(2, 1))
+  assert_equal([0, 1], Array.new(2) {|i| i})
+
+  a = [1, 2, 3]
+  a.__send__(:initialize, 1)
+  assert_equal([nil], a)
+
+  a = [1, 2, 3]
+  a.__send__(:initialize, 2) {|i| i * 10}
+  assert_equal([0, 10], a)
+
+  a = [1, 2, 3]
+  a.__send__(:initialize, 5, :x)
+  assert_equal([:x, :x, :x, :x, :x], a)
+
+  assert_equal([9, 8], Array.new([9, 8]))
+  a = [1, 2, 3]
+  a.__send__(:initialize, [9, 8])
+  assert_equal([9, 8], a)
+
+  assert_raise(FrozenError) { [1, 2].freeze.__send__(:initialize) }
+  assert_raise(FrozenError) { [1, 2].freeze.__send__(:initialize, -1) }
+
+  a = [1, 2, 3, 4, 5]
+  b = a[1, 3]
+  b.__send__(:initialize, 1, :x)
+  assert_equal([:x], b)
+  assert_equal([1, 2, 3, 4, 5], a)
+
+  b = a[1, 3]
+  b.__send__(:initialize, 5, :y)
+  assert_equal([:y, :y, :y, :y, :y], b)
+  assert_equal([1, 2, 3, 4, 5], a)
+
+  a = [1, 2, 3, 4]
+  a.__send__(:initialize, 4, 0)
+  assert_equal([0, 0, 0, 0], a)
+
+  a = [1, 2]
+  a.__send__(:initialize, 2, :z)
+  assert_equal([:z, :z], a)
+
+  a = [1, 2, 3]
+  a.__send__(:initialize, 3, :w)
+  assert_equal([:w, :w, :w], a)
+end
+
 assert('Array#initialize_copy', '15.2.12.5.16') do
   a = [1,2,3]
   b = [].__send__(:initialize_copy, a)
@@ -321,6 +419,23 @@ assert('Array#join deeply nested array does not overflow the C stack') do
   # join is iterative, so a deeply nested (non-cyclic) array must not overflow
   # the native stack; every leaf here is empty, so the result is "".
   assert_equal('', a.join)
+end
+
+assert('Array#join keeps a nested array its to_s drops') do
+  # The element's to_s empties the outer array and runs GC while join is
+  # still walking the inner one, which nothing else holds any more.
+  c = Class.new do
+    attr_accessor :outer
+    def to_s
+      @outer.clear
+      GC.start
+      100.times { "x" * 100 }
+      "e"
+    end
+  end
+  e = c.new
+  e.outer = [[e, "a", "b"] + ["c"] * 30, "d"]
+  assert_equal("e,a,b," + (["c"] * 30).join(","), e.outer.join(","))
 end
 
 assert('Array#last', '15.2.12.5.18') do
@@ -746,6 +861,23 @@ assert('Array#delete') do
   assert_equal [], a
 end
 
+assert('Array#delete when the last == empties the array') do
+  # the kept count was written back as the length of the emptied array, whose
+  # slots then held the freed buffer's pointer
+  e = Object.new
+  def e.ary=(a)
+    @ary = a
+  end
+  def e.==(_)
+    @ary.clear
+    true
+  end
+  a = [1, 2, 3, e]
+  e.ary = a
+  assert_raise(RuntimeError) { a.delete(:x) }
+  assert_equal [], a
+end
+
 assert('Array#hash with self-referencing arrays') do
   a = []
   a << a
@@ -790,4 +922,25 @@ assert('Array#== and #eql? with recursive elements') do
   e = [1]; f = [1]; e << f; f << e
   g = [1]; h = [1]; g << h; h << g
   assert_true e == g
+end
+
+assert('Array#[]= with a length or range end at the Integer limit') do
+  # the largest Integer an index may be, 64 or 32 bits
+  max = 0x7fffffff
+  begin
+    m = 0x7fffffffffffffff
+    [][m, 0]
+    max = m
+  rescue RangeError
+  end
+  a = [1,2,3]
+  a[1, max] = 9
+  assert_equal([1,9], a)
+  a = [1,2,3]
+  a[..max] = 9
+  assert_equal([9], a)
+  a = [1,2,3]
+  a[1..max] = []
+  assert_equal([1], a)
+  assert_raise(IndexError) { [1][max..-max-1] = 2 }
 end

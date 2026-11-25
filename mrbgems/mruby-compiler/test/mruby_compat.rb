@@ -29,3 +29,67 @@ assert('an empty source file is not a read failure') do
 
   assert_false exc
 end
+
+##
+# A float literal in bytecode, run where there is no Float
+
+assert('a float pool entry loads where Float is missing, and runs only if reached') do
+  # The literal becomes the float pool entry the helper makes; it is a
+  # string here so that this file compiles under every build.
+  src = '$__float_pool ? 1234567890123 : :skipped'
+  $__float_pool = false
+  r = __float_pool_roundtrip(src)
+  skip 'no integer pool entry in this build' if r.nil?
+  same, value = r
+  # read back and dumped again, the entry comes out as it went in
+  assert_true same
+  # what does not reach the literal runs to the end
+  assert_equal :skipped, value
+
+  $__float_pool = true
+  if Object.const_defined?(:Float)
+    assert_equal "1.5", __float_pool_roundtrip(src)[1].to_s
+  else
+    assert_raise(NotImplementedError) { __float_pool_roundtrip(src) }
+  end
+end
+
+##
+# Compiler contexts that outlive each other
+
+assert('a parser state freed first leaves a younger one intact') do
+  # Everything Prism allocates for a parse comes from an arena that belongs
+  # to the parse's compiler context.  The arena that was current was the
+  # one given back, on the assumption that contexts are freed in the reverse
+  # order of their making; a caller that keeps two parser states and frees
+  # the older one first then had the younger one's tree, constant pool and
+  # options freed under it, and generating code from it read freed memory.
+  assert_equal 7, __parsers_outlive_each_other('1 + 2', 'x = 3; x + 4')
+end
+
+##
+# Instruction decoding
+
+assert('mrb_decode_insn keeps all 24 bits of the OP_ENTER operand') do
+  # The required-argument count sits at bit 18 of the aspec, above what a
+  # 16-bit operand holds.
+  assert_equal 1 << 18, __enter_operand { |a| a }
+  assert_equal 2 << 18, __enter_operand { |a, b| a }
+end
+
+assert('mrb_decode_insn points at the next instruction') do
+  # LOADI_1 (2 bytes), MOVE (3), LOADI16 (4), ADD (2), RETURN (2), STOP (1)
+  assert_equal [6, 0], __insn_walk("a = 1; a + 300")
+  # a symbol index above 255 takes an OP_EXT2 prefix
+  _, ext = __insn_walk((0..300).map { |i| "x.m#{i}" }.join(";"))
+  assert_true ext > 0
+end
+
+assert('local variable names read back while the symbol table fills') do
+  # read_section_lv() interns the names first and fills irep->lv after; a
+  # symbol GC in between must not take the names interned before it
+  src = (0...200).map { |i| "lv_#{i}_x = #{i}\n" }.join
+  names = __lv_at_symbol_limit(src, 100)
+  skip 'no symbol GC in this build' if names.nil?
+  assert_equal (0...200).map { |i| "LV_#{i}_x" }, names
+end

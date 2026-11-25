@@ -48,6 +48,19 @@ assert("Enumerable#sort_by") do
   assert_equal ["car", "train", "bicycle"], %w{car bicycle train}.sort_by {|e| e.length}
 end
 
+assert("Array#sort_by!") do
+  a = %w{car bicycle train}
+  assert_same a, a.sort_by! {|e| e.length}
+  assert_equal ["car", "train", "bicycle"], a
+
+  # without a block, an Enumerator that sorts in place by the block it is given
+  a = %w{b a c}
+  e = a.sort_by!
+  assert_kind_of Enumerator, e
+  assert_same a, e.with_index {|_, i| -i}
+  assert_equal ["c", "a", "b"], a
+end
+
 assert("Enumerable#first") do
   a = Object.new
   a.extend Enumerable
@@ -77,6 +90,12 @@ assert("Enumerable#flat_map") do
   assert_equal [1, 2, 3, 4], [1, 2, 3, 4].flat_map { |e| e }
   assert_equal [1, -1, 2, -2, 3, -3, 4, -4], [1, 2, 3, 4].flat_map { |e| [e, -e] }
   assert_equal [1, 2, 100, 3, 4, 100], [[1, 2], [3, 4]].flat_map { |e| e + [100] }
+  # only an array is flattened: to_ary is not consulted
+  assert_equal [1..2, 3..4], [1..2, 3..4].flat_map { |e| e }
+  assert_equal [{a: 1}], [{a: 1}].flat_map { |e| e }
+  o = Object.new
+  def o.to_ary; [:x, :y]; end
+  assert_equal [o, 1], [o, 1].flat_map { |e| e }
 end
 
 assert("Enumerable#max_by") do
@@ -447,4 +466,21 @@ assert("Array#count with a NaN") do
   assert_equal 1, [a].count(a)
   assert_equal 0, [a].count(b)
   assert_equal 2, [a, a].count(a)
+end
+
+assert("Array#minmax keeps the pair it returns out of reach") do
+  skip unless Object.const_defined?(:ObjectSpace)
+  seen = []
+  c = Class.new do
+    attr_reader :v
+    def initialize(v); @v = v; end
+    define_method(:<=>) do |o|
+      ObjectSpace.each_object(Array) { |a| seen << a }
+      @v <=> o.v
+    end
+  end
+  a = [c.new(2), c.new(1), c.new(3)]
+  r = a.minmax
+  assert_equal [1, 3], r.map(&:v)
+  assert_false seen.any? { |x| x.equal?(r) }
 end

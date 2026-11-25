@@ -7,6 +7,32 @@ assert('IPSocket.getaddress') do
   assert_true (l == "127.0.0.1" or l == "::1")
 end
 
+assert('IPSocket.pton') do
+  assert_equal "\x01\x02\x03\x04", IPSocket.pton(Socket::AF_INET, "1.2.3.4")
+  assert_raise(ArgumentError) { IPSocket.pton(Socket::AF_INET, "1.2.3.4junk") }
+  assert_raise(ArgumentError) { IPSocket.pton(Socket::AF_INET, "1.2.3.4\0junk") }
+  assert_raise(ArgumentError) { IPSocket.pton(Socket::AF_INET6, "::1\0junk") }
+end
+
+assert('IPSocket.ntop') do
+  assert_equal "1.2.3.4", IPSocket.ntop(Socket::AF_INET, "\x01\x02\x03\x04")
+  assert_equal "::1", IPSocket.ntop(Socket::AF_INET6, "\0" * 15 + "\x01")
+  assert_raise(ArgumentError) { IPSocket.ntop(Socket::AF_INET, "\x01\x02\x03") }
+  assert_raise(ArgumentError) { IPSocket.ntop(Socket::AF_INET6, "\x01\x02\x03\x04") }
+  assert_raise(ArgumentError) { IPSocket.ntop(Socket::AF_UNSPEC, "\x01\x02\x03\x04") }
+
+  # A family past C int is not the family it would be cut down to; on 32-bit
+  # mrb_int it is a Bigint, refused before the family check. Computed, not
+  # written out, so the file still compiles where mrb_int is 32 bits.
+  shift = 32
+  big = begin
+    1 << shift
+  rescue RangeError
+    nil
+  end
+  assert_raise(ArgumentError, RangeError) { IPSocket.ntop(big + Socket::AF_INET6, "\x01") } if big
+end
+
 assert('IPSocket.addr') do
   localhost = "127.0.0.1"
   s = UDPSocket.new

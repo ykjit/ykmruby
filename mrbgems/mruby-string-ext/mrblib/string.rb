@@ -119,7 +119,10 @@ class String
     # both edges are all digits
     bi = self.to_i(10)
     ei = max.to_i(10)
-    if (bi > 0 or bi == "0"*len) and (ei > 0 or ei == "0"*maxlen)
+    # to_i also reads "1a" and "1.9": all digits only when the number
+    # spells the string back, leading zeros and all
+    if bi >= 0 and ei >= 0 and
+       bi.to_s.rjust(len, "0") == self and ei.to_s.rjust(maxlen, "0") == max
       while bi <= ei
         break if exclusive and bi == ei
         s = bi.to_s
@@ -129,16 +132,23 @@ class String
       end
       return self
     end
+    # step by succ up to max, which a shorter string reaches past others
+    # that sort after it ("b" comes between "a" and "aa"); stop when the
+    # string grows longer than max. The loop follows rb_str_upto_each()
+    # in CRuby's string.c, used with the permission of its author
+    # (Copyright (C) 1993-2007 Yukihiro Matsumoto).
+    n = (self <=> max)
+    return self if n > 0 || (exclusive && n == 0)
+    after_max = max.succ
     bs = self
-    while true
-      n = (bs <=> max)
-      break if n > 0
-      break if exclusive and n == 0
+    while bs != after_max
+      succ = (exclusive || bs != max) ? bs.succ : nil
       yield bs
-      break if n == 0
+      break if succ.nil?
+      bs = succ
+      break if exclusive && bs == max
       bsiz = bs.size
-      break if bsiz > max.size || bsiz == 0
-      bs = bs.succ
+      break if bsiz > maxlen || bsiz == 0
     end
     self
   end
@@ -192,5 +202,24 @@ class String
       i += 2
     end
     result
+  end
+
+  ##
+  # call-seq:
+  #    str.scrub!                                  -> str
+  #    str.scrub!(repl)                            -> str
+  #    str.scrub! {|bytes| block }                 -> str
+  #
+  # Replaces the invalid UTF-8 bytes of +self+ as String#scrub does and
+  # returns +self+. A string with nothing to replace is left as it is,
+  # frozen or not.
+  #
+  #    s = "abc\x80def"
+  #    s.scrub!                    #=> "abc\u{FFFD}def"
+  #    s                           #=> "abc\u{FFFD}def"
+  def scrub!(repl = nil, &block)
+    str = scrub(repl, &block)
+    replace(str) unless str == self
+    self
   end
 end

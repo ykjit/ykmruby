@@ -21,6 +21,18 @@ assert('Time.at', '15.2.19.6.1') do
   assert_raise(FloatDomainError) { Time.at(0, -Float::INFINITY) }
 end
 
+assert('Time.at with a fractional microsecond argument') do
+  skip unless Object.const_defined?(:Float)
+  t = Time.at(1, 999999.5)
+  assert_equal 1, t.to_i
+  assert_equal 999999, t.usec
+  assert_equal 999999500, t.nsec
+  assert_equal 500, Time.at(1, 0.5).nsec
+  assert_equal 1500, Time.at(1, 1.5).nsec
+  assert_equal 0, Time.at(1, -0.5).to_i
+  assert_equal 999999500, Time.at(1, -0.5).nsec
+end
+
 assert('Time.gm', '15.2.19.6.2') do
   t = Time.gm(2012, 9, 23)
   assert_operator(2012, :eql?, t.year)
@@ -30,6 +42,17 @@ assert('Time.gm', '15.2.19.6.2') do
   assert_operator(   0, :eql?, t.min)
   assert_operator(   0, :eql?, t.sec)
   assert_operator(   0, :eql?, t.usec)
+end
+
+assert('Time.gm refuses microseconds outside a second') do
+  assert_equal(999_999, Time.gm(2024, 1, 1, 0, 0, 0, 999_999).usec)
+  assert_raise(ArgumentError) { Time.gm(2024, 1, 1, 0, 0, 0, 1_000_000) }
+  assert_raise(ArgumentError) { Time.gm(2024, 1, 1, 0, 0, 0, -1) }
+  # converting these to nanoseconds used to overflow a 32-bit and a 64-bit
+  # mrb_int; one too wide for mrb_int is refused before it gets that far
+  assert_raise(ArgumentError) { Time.gm(2024, 1, 1, 0, 0, 0, 0x7fffffff) }
+  assert_raise(ArgumentError, RangeError) { Time.gm(2024, 1, 1, 0, 0, 0, 10**16) }
+  assert_raise(ArgumentError) { Time.local(2024, 1, 1, 0, 0, 0, 1_000_000) }
 end
 
 assert('Time.local', '15.2.19.6.3') do
@@ -226,6 +249,20 @@ assert('Time#to_i wider than mrb_int') do
   assert_equal(sec, i.to_f)
 end
 
+assert('Time.at past the year a struct tm holds') do
+  skip unless Object.const_defined?(:Float)
+  begin
+    Time.at(-4294967296.0 * 20)
+  rescue RangeError
+    skip "time_t is not wider than 32 bits"
+  end
+  # Time.utc refuses a year for which tm_year + 1900 is not an int, and
+  # seconds landing past it are out of range the same way: #year read year
+  # 2147484972 back as -2147482324 while #to_s still printed it.
+  assert_equal(36812, Time.at(1099511627776.0).utc.year)
+  assert_raise(RangeError) { Time.at(6.77680180379136e16) }
+end
+
 assert('Time#usec', '15.2.19.7.26') do
   assert_equal(0, Time.at(1300000000).usec)
   skip unless Object.const_defined?(:Float)
@@ -259,6 +296,12 @@ assert('Time#utc_offset, #gmt_offset, #gmtoff', '15.2.19.7.12, 15.2.19.7.14, 15.
   assert_equal(utc_time.utc_offset, utc_time.gmtoff)
   assert_equal(local_time.utc_offset, local_time.gmt_offset)
   assert_equal(local_time.utc_offset, local_time.gmtoff)
+
+  # The offset is positive east of UTC: the wall clock read as UTC is ahead of the real time
+  [local_time, Time.local(2000, 7, 1, 12), Time.at(0), Time.at(1300000000)].each do |t|
+    wall_clock = Time.utc(t.year, t.mon, t.day, t.hour, t.min, t.sec)
+    assert_equal(wall_clock.to_i - t.to_i, t.utc_offset)
+  end
 end
 
 assert('Time#nsec, #tv_nsec') do

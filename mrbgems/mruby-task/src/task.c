@@ -55,6 +55,46 @@ task_unshare_envs(mrb_state *mrb, struct mrb_context *c)
   mrb_env_detach_all(mrb, c, TRUE);
 }
 
+/* What a Fiber object from Fiber.current holds once its task is freed: a
+ * context that is over, so the object answers as a finished fiber does. */
+static const struct mrb_context task_gone_context = {
+  NULL, NULL, NULL, NULL, NULL, NULL, NULL, MRB_TASK_STOPPED
+};
+
+/* A task's context is part of its mrb_task, so a Fiber object from
+ * Fiber.current can outlive it. Called before the context goes away or is
+ * rebuilt. */
+static void
+task_release_fiber(struct mrb_context *c)
+{
+  if (c->fib) {
+    c->fib->cxt = (struct mrb_context*)&task_gone_context;
+    c->fib = NULL;
+  }
+}
+
+/* The fibers a stopped task leaves unfinished never run again, and their prev
+ * links would outlive the task's context. Envs are detached first and with
+ * the chain intact, as that can run the GC, which reaches them all through
+ * t->parked. Only called while the VM is alive, like task_unshare_envs(). */
+static void
+task_abandon_fibers(mrb_state *mrb, mrb_task *t)
+{
+  struct mrb_context *c;
+
+  for (c = t->parked; c != &t->c; c = c->prev) {
+    if (!c) return;
+    mrb_env_detach_all(mrb, c, TRUE);
+  }
+  for (c = t->parked; c != &t->c; ) {
+    struct mrb_context *prev = c->prev;
+    c->status = MRB_FIBER_TERMINATED;
+    c->prev = NULL;
+    c = prev;
+  }
+  t->parked = NULL;
+}
+
 /*
  * Task data type for GC
  */
@@ -63,10 +103,14 @@ mrb_task_free(mrb_state *mrb, void *ptr)
 {
   mrb_task *t = (mrb_task*)ptr;
   if (t) {
+    MRB_TASK_TRACE(mrb, t, MRB_TASK_TRACE_FREE);
+
     /* Unregister from GC protection (unless it's the main task during shutdown) */
     if (t != mrb->task.main_task) {
       mrb_gc_unregister(mrb, t->self);
     }
+
+    task_release_fiber(&t->c);
 
     /* Free context resources - always free if allocated */
     /* Main task never has allocated context (stbase/cibase are NULL) */
@@ -76,6 +120,7 @@ mrb_task_free(mrb_state *mrb, void *ptr)
     if (t->c.cibase) {
       mrb_free(mrb, t->c.cibase);
     }
+    mrb_free(mrb, t->c.svars);
 
     /* Free the task structure itself */
     mrb_free(mrb, t);
@@ -181,6 +226,8 @@ mrb_task_mark_all(mrb_state *mrb)
 
       /* Mark fiber */
       mrb_gc_mark(mrb, (struct RBasic*)c->fib);
+      /* The fiber a slice stopped in, and through its resumers the rest */
+      if (t->parked) mrb_gc_mark(mrb, (struct RBasic*)t->parked->fib);
 
       /* Mark task-specific values */
       mrb_gc_mark_value(mrb, t->self);
@@ -188,6 +235,32 @@ mrb_task_mark_all(mrb_state *mrb)
       mrb_gc_mark_value(mrb, t->name);
 
       t = t->next;
+    }
+  }
+  mrb_task_excl_exit(mrb);
+}
+
+/* For the symbol GC, which walks objects and the running context only:
+   calls `ctx` with the context of each queued task, and `val` with the
+   values each task, the main one too, keeps in its mrb_task. */
+void
+mrb_task_foreach(mrb_state *mrb, void (*ctx)(mrb_state*, struct mrb_context*),
+                 void (*val)(mrb_state*, mrb_value))
+{
+  if (mrb->task.main_task) {
+    val(mrb, mrb->task.main_task->result);
+    val(mrb, mrb->task.main_task->name);
+  }
+  if (mrb->task.queues[0] == NULL && mrb->task.queues[1] == NULL &&
+      mrb->task.queues[2] == NULL && mrb->task.queues[3] == NULL) {
+    return;
+  }
+  mrb_task_excl_enter(mrb);
+  for (int qi = 0; qi < 4; qi++) {
+    for (mrb_task *t = mrb->task.queues[qi]; t; t = t->next) {
+      ctx(mrb, &t->c);
+      val(mrb, t->result);
+      val(mrb, t->name);
     }
   }
   mrb_task_excl_exit(mrb);
@@ -270,12 +343,14 @@ static inline mrb_bool
 task_cleanup_if_stopped(mrb_state *mrb, mrb_task *t)
 {
   if (t->status == MRB_TASK_STATUS_DORMANT || t->c.status == MRB_TASK_STOPPED) {
+    task_abandon_fibers(mrb, t);
     /* Task is terminated but still in queue - remove it */
     mrb_task_excl_enter(mrb);
     mrb_task_q_delete(mrb, t);
     if (t->status != MRB_TASK_STATUS_DORMANT) {
       t->status = MRB_TASK_STATUS_DORMANT;
       mrb_task_q_insert(mrb, t);
+      MRB_TASK_TRACE(mrb, t, MRB_TASK_TRACE_STATE);
     }
     mrb_task_excl_exit(mrb);
     return TRUE;
@@ -369,6 +444,30 @@ task_init_context(mrb_state *mrb, mrb_task *t, const struct RProc *proc)
  * Scheduler core
  */
 
+/* The task whose slice this is, or NULL on the root context. mrb->c is the
+   task's own context, or a fiber the task is running: a fiber's context
+   lies in no mrb_task, so it is followed back through its resumers to the
+   task's, or to the root context when the fiber was resumed outside any
+   task. A transferred fiber has no resumer to follow, so the running task
+   is read off the ready queue, the way mrb_tick does. */
+mrb_task*
+mrb_task_running(mrb_state *mrb)
+{
+  struct mrb_context *c = mrb->c;
+
+  while (c->fib && !MRB_FLAG_TEST(c->fib, MRB_FL_FIBER_BORROWED)) {
+    if (!c->prev) {
+      for (mrb_task *t = q_ready_; t; t = t->next) {
+        if (t->status == MRB_TASK_STATUS_RUNNING) return t;
+      }
+      return NULL;
+    }
+    c = c->prev;
+  }
+  if (c == mrb->root_c) return NULL;
+  return MRB2TASK_C(c);
+}
+
 /* Wake up tasks waiting on join for a completed task */
 static void
 wake_up_join_waiters(mrb_state *mrb, mrb_task *completed_task)
@@ -383,11 +482,12 @@ wake_up_join_waiters(mrb_state *mrb, mrb_task *completed_task)
       curr->reason = MRB_TASK_REASON_NONE;
       curr->wait.join = NULL;
       mrb_task_q_insert(mrb, curr);
+      MRB_TASK_TRACE(mrb, curr, MRB_TASK_TRACE_STATE);
       /* If a higher-priority waiter is resumed from task context,
        * request a context switch after leaving the critical section. */
       if (mrb->c != mrb->root_c && !switching_) {
-        mrb_task *running = MRB2TASK(mrb);
-        if (curr->priority < running->priority) {
+        mrb_task *running = mrb_task_running(mrb);
+        if (running && curr->priority < running->priority) {
           switching_ = TRUE;
         }
       }
@@ -442,33 +542,39 @@ execute_task(mrb_state *mrb, mrb_task *t)
    * (ci == NULL). Retire such a task instead of dereferencing the hole
    * — checked BEFORE the context switch so the scheduler's own context
    * stays usable. */
-  if (t->c.ci == NULL || t->c.ci->proc == NULL) {
+  struct mrb_context *c = t->parked ? t->parked : &t->c;
+  if (c->ci == NULL || c->ci->proc == NULL) {
+    task_abandon_fibers(mrb, t);
     mrb_task_excl_enter(mrb);
     mrb_task_q_delete(mrb, t);
     t->status = MRB_TASK_STATUS_DORMANT;
     t->c.status = MRB_TASK_STOPPED;
     mrb_task_q_insert(mrb, t);
     mrb_task_excl_exit(mrb);
+    MRB_TASK_TRACE(mrb, t, MRB_TASK_TRACE_STATE);
     return;
   }
 
   /* Set task as running */
   t->timeslice = MRB_TIMESLICE_TICK_COUNT;
   t->status = MRB_TASK_STATUS_RUNNING;
+  MRB_TASK_TRACE(mrb, t, MRB_TASK_TRACE_SWITCH_IN);
 
   /* Switch to task context */
   prev_c = mrb->c;
   prev_ci = prev_c->ci;
   prev_cci = prev_c->ci->cci;
   t->c.prev = mrb->c;
-  mrb->c = &t->c;
+  /* Pick up where the last slice stopped, which may be inside a fiber */
+  mrb->c = c;
+  t->parked = NULL;
 
   /* Clear switching flag */
   switching_ = FALSE;
 
   /* Save proc and PC to locals before calling mrb_vm_exec */
-  const struct RProc *proc = t->c.ci->proc;
-  const mrb_code *pc = t->c.ci->pc;
+  const struct RProc *proc = mrb->c->ci->proc;
+  const mrb_code *pc = mrb->c->ci->pc;
 
   /* Set vmexec flag to prevent fiber_terminate from being called */
   t->c.vmexec = TRUE;
@@ -494,6 +600,19 @@ execute_task(mrb_state *mrb, mrb_task *t)
   /* Clear switching flag */
   switching_ = FALSE;
 
+  /* A slice can end inside a fiber resumed from this task. Nothing wrote a
+     barrier for that fiber's stack while it ran as the current context, and
+     it is no longer one. */
+  for (c = mrb->c; c; c = c->prev) {
+    if (c == &t->c) {
+      if (mrb->c != &t->c) {
+        t->parked = mrb->c;
+        mrb_write_barrier(mrb, (struct RBasic*)mrb->c->fib);
+      }
+      break;
+    }
+  }
+
   /* Restore context */
   mrb->c = prev_c;
   t->c.prev = NULL;
@@ -515,18 +634,23 @@ execute_task(mrb_state *mrb, mrb_task *t)
   /* Handle task termination */
   if (t->c.status == MRB_TASK_STOPPED) {
     switching_ = FALSE;
+    task_abandon_fibers(mrb, t);
     mrb_task_excl_enter(mrb);
     mrb_task_q_delete(mrb, t);
     t->status = MRB_TASK_STATUS_DORMANT;
     mrb_task_q_insert(mrb, t);
     mrb_task_excl_exit(mrb);
+    MRB_TASK_TRACE(mrb, t, MRB_TASK_TRACE_SWITCH_OUT);
 
     /* Wake up tasks waiting on join */
     wake_up_join_waiters(mrb, t);
   }
-  else if (t->status == MRB_TASK_STATUS_RUNNING) {
-    /* Task yielded but still running - move to ready queue */
-    t->status = MRB_TASK_STATUS_READY;
+  else {
+    if (t->status == MRB_TASK_STATUS_RUNNING) {
+      /* Task yielded but still running - move to ready queue */
+      t->status = MRB_TASK_STATUS_READY;
+    }
+    MRB_TASK_TRACE(mrb, t, MRB_TASK_TRACE_SWITCH_OUT);
   }
 }
 
@@ -698,6 +822,15 @@ mrb_task_set_scheduler_hook(mrb_state *mrb, void (*fn)(mrb_state *mrb, void *ud)
   mrb->task.scheduler_hook_ud = ud;
 }
 
+#ifdef MRB_USE_TASK_TRACE
+MRB_API void
+mrb_task_set_trace_hook(mrb_state *mrb, mrb_task_trace_func fn, void *ud)
+{
+  mrb->task.trace_hook = fn;
+  mrb->task.trace_hook_ud = ud;
+}
+#endif
+
 /* Single-step task execution for WASM event loop integration */
 MRB_API mrb_value
 mrb_task_run_once(mrb_state *mrb)
@@ -777,15 +910,12 @@ sleep_us_impl(mrb_state *mrb, uint32_t usec)
     return;
   }
 
-  /* Check for C function boundary - cannot do cooperative context switch */
-  mrb_callinfo *ci;
-  for (ci = mrb->c->ci; ci >= mrb->c->cibase; ci--) {
-    if (ci->cci > 0) {
-      /* Inside C function - fall back to blocking sleep without context switch */
-      mrb_hal_task_sleep_us(mrb, usec);
-      switching_ = FALSE;
-      return;
-    }
+  /* Across a C function the task cannot be parked: fall back to a blocking
+     sleep without a context switch. */
+  if (mrb_task_across_c_boundary(mrb)) {
+    mrb_hal_task_sleep_us(mrb, usec);
+    switching_ = FALSE;
+    return;
   }
 
   /* A synchronous execution (mrb_execute_proc_synchronously) runs its
@@ -795,7 +925,7 @@ sleep_us_impl(mrb_state *mrb, uint32_t usec)
   task_check_scheduler_lock(mrb);
 
   /* In task context - get current running task */
-  t = MRB2TASK(mrb);
+  t = mrb_task_running(mrb);
 
   mrb_task_excl_enter(mrb);
 
@@ -852,16 +982,13 @@ mrb_f_sleep(mrb_state *mrb, mrb_value self)
       /* Root context has no task to suspend */
       return mrb_nil_value();
     }
-    mrb_callinfo *ci;
-    for (ci = mrb->c->ci; ci >= mrb->c->cibase; ci--) {
-      if (ci->cci > 0) {
-        mrb_raise(mrb, E_RUNTIME_ERROR, "can't sleep across C function boundary");
-      }
+    if (mrb_task_across_c_boundary(mrb)) {
+      mrb_raise(mrb, E_RUNTIME_ERROR, "can't sleep across C function boundary");
     }
     /* See sleep_us_impl: never park the temporary task of a synchronous
        execution. */
     task_check_scheduler_lock(mrb);
-    mrb_task *t = MRB2TASK(mrb);
+    mrb_task *t = mrb_task_running(mrb);
     mrb_task_excl_enter(mrb);
     mrb_task_q_delete(mrb, t);
     t->status = MRB_TASK_STATUS_SUSPENDED;
@@ -950,6 +1077,7 @@ task_create_common(mrb_state *mrb, const struct RProc *proc,
   mrb_task_excl_enter(mrb);
   mrb_task_q_insert(mrb, t);
   mrb_task_excl_exit(mrb);
+  MRB_TASK_TRACE(mrb, t, MRB_TASK_TRACE_CREATE);
 
   if (q_ready_ && q_ready_->status == MRB_TASK_STATUS_RUNNING) {
     if (t->priority < q_ready_->priority) {
@@ -1009,8 +1137,9 @@ mrb_task_s_new(mrb_state *mrb, mrb_value self)
 static mrb_value
 mrb_task_s_current(mrb_state *mrb, mrb_value self)
 {
-  /* Check if we're in root context */
-  if (mrb->c == mrb->root_c) {
+  /* The root context, or a fiber resumed from it, is the main task's */
+  mrb_task *running = mrb_task_running(mrb);
+  if (!running) {
     /* Return main task wrapper (lazy-allocate if needed) */
     if (!mrb->task.main_task) {
       struct RClass *task_class = mrb_class_ptr(self);
@@ -1034,9 +1163,7 @@ mrb_task_s_current(mrb_state *mrb, mrb_value self)
     return mrb->task.main_task->self;
   }
 
-  /* Use pointer arithmetic to get task from context - O(1) */
-  mrb_task *t = MRB2TASK(mrb);
-  return t->self;
+  return running->self;
 }
 
 static mrb_value
@@ -1093,12 +1220,10 @@ mrb_task_s_pass(mrb_state *mrb, mrb_value self)
     task_run_one_iteration(mrb);
   }
   else {
-    /* Check for C function boundary - cannot yield from C function */
-    mrb_callinfo *ci;
-    for (ci = mrb->c->ci; ci >= mrb->c->cibase; ci--) {
-      if (ci->cci > 0) {
-        mrb_raise(mrb, E_RUNTIME_ERROR, "can't pass across C function boundary");
-      }
+    /* Across a C function there is no frame to come back to from the
+       scheduler. */
+    if (mrb_task_across_c_boundary(mrb)) {
+      mrb_raise(mrb, E_RUNTIME_ERROR, "can't pass across C function boundary");
     }
 
     /* In task context - trigger context switch */
@@ -1166,11 +1291,13 @@ mrb_task_s_get(mrb_state *mrb, mrb_value self)
 
   mrb_get_args(mrb, "S", &name);
 
-  /* Search all queues for task with matching name */
+  /* Search all queues for task with matching name. Compare bytes in C:
+     Task#name= takes any object, and an `==` dispatched from here could
+     close or relink the task under the walk. */
   for (int i = 0; i < MRB_NUM_TASK_QUEUE; i++) {
     mrb_task *t = mrb->task.queues[i];
     while (t != NULL) {
-      if (mrb_equal(mrb, t->name, name)) {
+      if (mrb_string_p(t->name) && mrb_str_equal(mrb, t->name, name)) {
         return t->self;
       }
       t = t->next;
@@ -1381,7 +1508,7 @@ mrb_task_join(mrb_state *mrb, mrb_value self)
   if (mrb->c == mrb->root_c) {
     mrb_raise(mrb, E_RUNTIME_ERROR, "join can only be called from running task");
   }
-  current = MRB2TASK(mrb);
+  current = mrb_task_running(mrb);
 
   /* Can't join self */
   if (t == current) {
@@ -1392,6 +1519,18 @@ mrb_task_join(mrb_state *mrb, mrb_value self)
   if (t->status == MRB_TASK_STATUS_DORMANT) {
     return t->result;
   }
+
+  /* Check for C function boundary - cannot do cooperative context switch.
+     Without this, join parks the task and sets the switch flag, but the
+     C caller runs on; the switch happens only when control returns to
+     the VM, so the statement after join runs before the target ends. */
+  if (mrb_task_across_c_boundary(mrb)) {
+    mrb_raise(mrb, E_RUNTIME_ERROR, "can't join across C function boundary");
+  }
+
+  /* See sleep_us_impl: never park the temporary task of a synchronous
+     execution. */
+  task_check_scheduler_lock(mrb);
 
   /* Wait for task to complete */
   mrb_task_excl_enter(mrb);
@@ -1536,6 +1675,7 @@ mrb_execute_proc_synchronously(mrb_state *mrb, mrb_value proc_val, mrb_int argc,
   DATA_TYPE(task_obj) = NULL;
 
   /* Free context resources directly (bypass GC since we own this task) */
+  task_release_fiber(&t->c);
   task_unshare_envs(mrb, &t->c);
   if (t->c.stbase) {
     mrb_free(mrb, t->c.stbase);
@@ -1545,6 +1685,8 @@ mrb_execute_proc_synchronously(mrb_state *mrb, mrb_value proc_val, mrb_int argc,
     mrb_free(mrb, t->c.cibase);
     t->c.cibase = NULL;
   }
+  mrb_free(mrb, t->c.svars);
+  t->c.svars = NULL;
   mrb_free(mrb, t);
 
   /* 7. Restore context and unlock */
@@ -1623,6 +1765,7 @@ suspend_task_internal(mrb_state *mrb, mrb_task *t)
   mrb_bool need_switch = (t == q_ready_ || t->status == MRB_TASK_STATUS_RUNNING);
 
   task_change_state(mrb, t, MRB_TASK_STATUS_SUSPENDED);
+  MRB_TASK_TRACE(mrb, t, MRB_TASK_TRACE_STATE);
 
   if (need_switch) {
     switching_ = TRUE;
@@ -1656,6 +1799,7 @@ resume_task_internal(mrb_state *mrb, mrb_task *t)
                           MRB_TASK_STATUS_READY : MRB_TASK_STATUS_WAITING;
 
   task_change_state(mrb, t, target_status);
+  MRB_TASK_TRACE(mrb, t, MRB_TASK_TRACE_STATE);
 
   /* Trigger context switch if resumed task has higher priority */
   if (target_status == MRB_TASK_STATUS_READY && q_ready_ &&
@@ -1712,12 +1856,15 @@ terminate_task_internal(mrb_state *mrb, mrb_task *t)
 
   mrb_bool was_running = (t->status == MRB_TASK_STATUS_RUNNING);
 
+  task_abandon_fibers(mrb, t);
+
   mrb_task_excl_enter(mrb);
   mrb_task_q_delete(mrb, t);
   t->status = MRB_TASK_STATUS_DORMANT;
   t->c.status = MRB_TASK_STOPPED;
   mrb_task_q_insert(mrb, t);
   mrb_task_excl_exit(mrb);
+  MRB_TASK_TRACE(mrb, t, MRB_TASK_TRACE_STATE);
 
   wake_up_join_waiters(mrb, t);
 
@@ -1750,7 +1897,7 @@ mrb_close_task(mrb_state *mrb, mrb_value task)
   if (!t) return;
 
   if (t == mrb->task.main_task ||
-      (mrb->c != mrb->root_c && t == MRB2TASK(mrb))) {
+      (mrb->c != mrb->root_c && t == mrb_task_running(mrb))) {
     mrb_raise(mrb, E_RUNTIME_ERROR, "can't close current task");
   }
 
@@ -1808,6 +1955,8 @@ mrb_task_init_context(mrb_state *mrb, mrb_value task, struct RProc *proc)
   struct mrb_context *c = &t->c;
 
   /* Cleanup existing context if any */
+  task_abandon_fibers(mrb, t);
+  task_release_fiber(c);
   task_unshare_envs(mrb, c);
   if (c->stbase) {
     mrb_free(mrb, c->stbase);
@@ -1817,6 +1966,8 @@ mrb_task_init_context(mrb_state *mrb, mrb_value task, struct RProc *proc)
     mrb_free(mrb, c->cibase);
     c->cibase = NULL;
   }
+  mrb_free(mrb, c->svars);
+  c->svars = NULL;
 
   /* Re-initialize context */
   task_init_context(mrb, t, proc);
@@ -1834,6 +1985,7 @@ mrb_task_reset_context(mrb_state *mrb, mrb_value task)
   if (!t) return;
 
   struct mrb_context *c = &t->c;
+  task_abandon_fibers(mrb, t);
   c->ci = c->cibase;
   c->status = MRB_TASK_CREATED;
   if (c->ci) {
@@ -1934,9 +2086,6 @@ mrb_mruby_task_gem_init(mrb_state *mrb)
 {
   struct RClass *task_class;
 
-  /* Initialize HAL (timer and interrupts) */
-  mrb_hal_task_init(mrb);
-
   /* Initialize main task to NULL and scheduler_lock to 0 */
   mrb->task.main_task = NULL;
   mrb->task.scheduler_lock = 0;
@@ -1987,6 +2136,11 @@ mrb_mruby_task_gem_init(mrb_state *mrb)
   mrb_define_module_function_id(mrb, mrb->kernel_module, MRB_SYM(sleep),    mrb_f_sleep,    MRB_ARGS_OPT(1));
   mrb_define_module_function_id(mrb, mrb->kernel_module, MRB_SYM(usleep),   mrb_f_usleep,   MRB_ARGS_REQ(1));
   mrb_define_module_function_id(mrb, mrb->kernel_module, MRB_SYM(sleep_ms), mrb_f_sleep_ms, MRB_ARGS_REQ(1));
+
+  /* Initialize HAL (timer and interrupts) last: it registers the state with
+     a process-wide timer that only mrb_mruby_task_gem_final() removes, and
+     the gem is not finalized if anything above raises. */
+  mrb_hal_task_init(mrb);
 }
 
 void

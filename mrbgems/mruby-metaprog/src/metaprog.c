@@ -141,9 +141,11 @@ method_entry_i(mrb_state *mrb, mrb_sym mid, mrb_method_t m, void *p)
 {
   struct mt_set *s = (struct mt_set*)p;
 
-  if (vicheck(m.flags, s->visibility) && kh_get(st, mrb, s->set, mid) == kh_end(s->set)) {
+  /* the nearest definition decides, whatever its visibility: a method
+     redefined public hides a private one of the same name further up */
+  if (kh_get(st, mrb, s->set, mid) == kh_end(s->set)) {
     khint_t k = kh_put(st, mrb, s->set, mid);
-    kh_val(st, s->set, k) = !MRB_METHOD_UNDEF_P(m);
+    kh_val(st, s->set, k) = vicheck(m.flags, s->visibility) && !MRB_METHOD_UNDEF_P(m);
   }
   return 0;
 }
@@ -293,7 +295,9 @@ mrb_obj_singleton_methods(mrb_state *mrb, mrb_bool recur, mrb_value obj)
 
   ary = mrb_ary_new(mrb);
   KHASH_FOREACH(st, set, k) {
-    mrb_ary_push(mrb, ary, mrb_symbol_value(kh_key(st, set, k)));
+    if (kh_val(st, set, k)) {
+      mrb_ary_push(mrb, ary, mrb_symbol_value(kh_key(st, set, k)));
+    }
   }
   kh_destroy(st, mrb, set);
 
@@ -341,12 +345,30 @@ mrb_obj_singleton_methods_m(mrb_state *mrb, mrb_value self)
   return mrb_obj_singleton_methods(mrb, recur, self);
 }
 
-mrb_value mrb_mod_define_method_m(mrb_state *mrb, struct RClass *c);
-
+/*
+ *  call-seq:
+ *     obj.define_singleton_method(symbol, method) -> symbol
+ *     obj.define_singleton_method(symbol) { block } -> symbol
+ *
+ *  Defines a singleton method on obj, as the singleton class's
+ *  define_method would: the body is a Proc, the block, or with
+ *  mruby-method a Method or an UnboundMethod.
+ */
 static mrb_value
 mod_define_singleton_method(mrb_state *mrb, mrb_value self)
 {
-  return mrb_mod_define_method_m(mrb, mrb_class_ptr(mrb_singleton_class(mrb, self)));
+  mrb_value sclass = mrb_singleton_class(mrb, self);
+  struct RClass *c = mrb->module_class;
+  mrb_method_t m = mrb_method_search_vm(mrb, &c, MRB_SYM(define_method));
+
+  /* The one Module holds, so that a gem that widens it (mruby-method) widens
+     this one too.  Not a call on the singleton class: a class method of the
+     object's class named define_method answers there.  It reads its arguments
+     from this frame. */
+  if (MRB_METHOD_CFUNC_P(m)) {
+    return MRB_METHOD_CFUNC(m)(mrb, sclass);
+  }
+  return mrb_mod_define_method_m(mrb, mrb_class_ptr(sclass));
 }
 
 static mrb_bool
@@ -740,7 +762,7 @@ MRB_YK_STATIC const mrb_mt_entry metaprog_krn_rom_entries[] = {
   MRB_MT_ENTRY(mrb_obj_protected_methods, MRB_SYM(protected_methods), MRB_ARGS_OPT(1)),  /* 15.3.1.3.37 */
   MRB_MT_ENTRY(mrb_obj_public_methods,    MRB_SYM(public_methods), MRB_ARGS_OPT(1)),  /* 15.3.1.3.38 */
   MRB_MT_ENTRY(mrb_obj_singleton_methods_m, MRB_SYM(singleton_methods), MRB_ARGS_OPT(1)),  /* 15.3.1.3.45 */
-  MRB_MT_ENTRY(mod_define_singleton_method, MRB_SYM(define_singleton_method), MRB_ARGS_REQ(1)|MRB_ARGS_BLOCK()),
+  MRB_MT_ENTRY(mod_define_singleton_method, MRB_SYM(define_singleton_method), MRB_ARGS_ARG(1,1)|MRB_ARGS_BLOCK()),
   MRB_MT_ENTRY(mrb_f_send,               MRB_SYM(send), MRB_ARGS_REQ(1)|MRB_ARGS_REST()|MRB_ARGS_BLOCK()),  /* 15.3.1.3.44 */
   MRB_MT_ENTRY(mrb_f_public_send,        MRB_SYM(public_send), MRB_ARGS_REQ(1)|MRB_ARGS_REST()|MRB_ARGS_BLOCK()),
 };

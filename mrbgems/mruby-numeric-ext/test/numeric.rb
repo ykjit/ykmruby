@@ -8,6 +8,39 @@ end
 assert('Float#div') do
   skip unless Object.const_defined?(:Float)
   assert_float 52, 365.2425.div(7)
+  assert_equal(-3, 7.5.div(-2.5))
+  assert_equal(-3, 6.5.div(-3))
+  assert_equal(-1, -0.5.div(1))
+  assert_equal 5, 2.5.div(0.5)
+  assert_raise(ZeroDivisionError) { 1.5.div(0) }
+  assert_raise(ZeroDivisionError) { 1.5.div(0.0) }
+  assert_raise(FloatDomainError) { 1.5.div(Float::NAN) }
+end
+
+assert('Integer#div with a Float') do
+  skip unless Object.const_defined?(:Float)
+  assert_equal 2, 7.div(2.5)
+  assert_equal(-3, 7.div(-2.5))
+  assert_equal 14, 7.div(0.5)
+  assert_equal 10, 1.div(0.1)
+  assert_equal 0, 7.div(Float::INFINITY)
+  assert_raise(ZeroDivisionError) { 7.div(0.0) }
+  begin
+    assert_equal 4722366482869645213696, (2**70).div(0.25)
+  rescue RangeError
+    skip
+  end
+end
+
+assert('Float#remainder') do
+  skip unless Object.const_defined?(:Float)
+  assert_equal 1.5, 5.5.remainder(2.0)
+  assert_equal(-1.5, -5.5.remainder(2.0))
+  assert_equal 1.5, 5.5.remainder(-2.0)
+  # 2**65 / 3.0 is not exact, so truncating the quotient lost the remainder
+  assert_equal 2.0, (2.0**65).remainder(3.0)
+  assert_equal(-2.0, (-2.0**65).remainder(3.0))
+  assert_equal 4.0, (2.0**65).remainder(-7.0)
 end
 
 assert('Integer#zero?') do
@@ -26,6 +59,27 @@ assert('Integer#pow') do
   assert_equal(361, 9.pow(1024,1000))
 end
 
+assert('Integer#pow(e, m) takes the sign of m') do
+  assert_equal(2, (-7).pow(3, 5))
+  assert_equal(4, (-7).pow(2, 5))
+  assert_equal(-3, (-7).pow(3, -5))
+  assert_equal(-2, 7.pow(3, -5))
+  assert_equal(0, (-5).pow(3, 5))
+
+  # the smallest mrb_int, whose magnitude does not fit in one
+  min = -(1 << (1.size * 8 - 2)) * 2
+  begin
+    1 << (1.size * 8)   # probe: a value past mrb_int needs mruby-bigint
+  rescue RangeError
+    assert_raise(RangeError) { 2.pow(1, min) }
+  else
+    assert_equal(min + 2, 2.pow(1, min))
+    assert_equal(min + 243, 3.pow(5, min))
+    assert_equal(-27, (-3).pow(3, min))
+    assert_equal(min + 5, (min * -4 + 5).pow(1, min))
+  end
+end
+
 assert('Integer#gcd') do
   assert_equal(1, 2.gcd(3))
   assert_equal(5, 10.gcd(15))
@@ -36,6 +90,16 @@ assert('Integer#gcd') do
   assert_equal(5, (-10).gcd(15))
   assert_equal(5, 10.gcd(-15))
   assert_equal(5, (-10).gcd(-15))
+
+  # gcd(MRB_INT_MIN, MRB_INT_MIN) is |MRB_INT_MIN|, one past the type; master
+  # raised RangeError instead of returning the bigint.
+  begin
+    min = -(1 << (1.size * 8 - 1))
+  rescue RangeError
+    skip 'requires mruby-bigint'
+  end
+  assert_equal(1 << (1.size * 8 - 1), min.gcd(min))
+  assert_equal(1 << (1.size * 8 - 1), min.gcd(0))
 end
 
 assert('Integer#lcm') do
@@ -48,6 +112,20 @@ assert('Integer#lcm') do
   assert_equal(30, (-10).lcm(15))
   assert_equal(30, 10.lcm(-15))
   assert_equal(30, (-10).lcm(-15))
+
+  # A product past the mrb_int range is the lcm as a bigint, not an error;
+  # master raised RangeError from the fixnum path. m is half the width, so
+  # m+1 and m-1 are fixnums whose product m*m-1 overflows whatever the build's
+  # integer width; they are coprime, so that product is their lcm.
+  begin
+    1 << (1.size * 8)   # probe: a value past mrb_int needs mruby-bigint
+  rescue RangeError
+    skip 'requires mruby-bigint'
+  end
+  m = 1 << (1.size * 4)
+  assert_equal(m * m - 1, (m + 1).lcm(m - 1))
+  min = -(1 << (1.size * 8 - 1))
+  assert_equal(1 << (1.size * 8 - 1), min.lcm(1))
 end
 
 assert('Integer#ceildiv') do
@@ -110,6 +188,14 @@ assert('Integer.sqrt') do
   assert_equal(4, Integer.sqrt(16))
   assert_equal(10, Integer.sqrt(100))
   assert_equal(85, Integer.sqrt(7244))
+
+  # MRB_INT_MAX, built from two halves so no step passes it. The first
+  # Babylonian guess (n + 1) / 2 overflowed there and the answer came back
+  # negative.
+  half = 1 << (1.size * 8 - 2)
+  max = half - 1 + half
+  r = Integer.sqrt(max)
+  assert_true(r > 0 && r <= max / r && r + 1 > max / (r + 1))
 end
 
 assert('Integer#bit_length') do

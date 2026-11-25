@@ -509,13 +509,24 @@ ary_memb_init(mrb_state *mrb, ary_memb *m, const mrb_value *arys, mrb_int n_arys
   }
 
   if (n_arys > 0) {
-    /* Shared copies hold the elements while kh_put() runs `hash`, which is
-       Ruby code and free to empty the caller's arrays. A caller that hands
-       over no arrays has to pin the set's keys some other way; `|` holds
-       every key in its result. */
+    /* Shared copies hold the keys while kh_get()/kh_put() runs `hash`, which
+       is Ruby code and free to empty the caller's arrays. The copies are
+       hidden from ObjectSpace.each_object as well (a class pointer of NULL,
+       see os_each_object_cb), so that `hash` cannot reach a copy, empty it
+       and have GC free the keys it was the only thing pinning: a
+       use-after-free the next set probe would read (GHSA-xp9g-4qj8-x3c4).
+       Every key the set can hold is an element of one of these arrays, so
+       copying all of them pins all of them. */
     mrb_value *copies = (mrb_value *)mrb_alloca(mrb, sizeof(mrb_value) * n_arys);
     for (mrb_int i = 0; i < n_arys; i++) {
-      copies[i] = mrb_ary_make_shared_copy(mrb, arys[i]);
+      mrb_value copy = mrb_ary_make_shared_copy(mrb, arys[i]);
+      /* make_shared_copy returns a frozen argument unchanged: that is the
+         caller's own object, never hidden, and a frozen array cannot be
+         emptied from Ruby anyway. Only a fresh copy we own is hidden. */
+      if (mrb_basic_ptr(copy) != mrb_basic_ptr(arys[i])) {
+        mrb_basic_ptr(copy)->c = NULL;
+      }
+      copies[i] = copy;
     }
     m->arys = copies;
   }
@@ -678,6 +689,8 @@ ary_subtract_internal(mrb_state *mrb, mrb_value self, mrb_int argc, const mrb_va
   mrb_int total_len = ary_get_array_args(mrb, argc, &argv);
 
   mrb_value result = mrb_ary_new(mrb);
+  /* an element's #hash, #eql? and #== must not reach the result being filled */
+  mrb_ary_ptr(result)->c = NULL; /* hide from ObjectSpace.each_object */
 
   /* Both sides have to be worth a set: it costs O(total_len) to build and is
      then asked RARRAY_LEN(self) questions. A short receiver cannot repay a
@@ -690,6 +703,7 @@ ary_subtract_internal(mrb_state *mrb, mrb_value self, mrb_int argc, const mrb_va
 
   struct ary_subtract_ctx ctx = { &memb, self, result };
   ARY_MEMB_RUN(mrb, result, ary_subtract_body, &ctx, &memb);
+  mrb_ary_ptr(result)->c = mrb->array_class;
 
   return result;
 }
@@ -772,18 +786,31 @@ ary_union_internal(mrb_state *mrb, mrb_value self, mrb_int argc, const mrb_value
   mrb_int total_len = ary_get_array_args(mrb, argc, &argv) + RARRAY_LEN(self);
 
   mrb_value result = mrb_ary_new(mrb);
+  /* an element's #hash, #eql? and #== must not reach the result being filled */
+  mrb_ary_ptr(result)->c = NULL; /* hide from ObjectSpace.each_object */
 
-  /* The record of what has been kept is the result itself, and the result is
-     also what keeps the set's keys alive: every element the set remembers
-     was pushed there in the same turn. So the membership object is handed no
-     arrays, and the sources are walked in place, each element kept in
-     encounter order the first time it is met. */
+  /* The record of what has been kept is the result itself; the sources are
+     walked in place, each element kept in encounter order the first time it
+     is met. The set's keys are the elements of the receiver and the
+     arguments, so those are what the membership object is handed to pin:
+     under the hash path its hidden copies keep every key alive while `hash`
+     runs, where relying on the Ruby-visible result to do it let `hash` reach
+     the result through ObjectSpace, empty it and free the keys
+     (GHSA-xp9g-4qj8-x3c4). The copies pin only; the walk reads self and the
+     arguments straight from the context. */
+  mrb_value *sources = (mrb_value *)mrb_alloca(mrb, sizeof(mrb_value) * (argc + 1));
+  sources[0] = self;
+  for (mrb_int i = 0; i < argc; i++) {
+    sources[i + 1] = argv[i];
+  }
+
   ary_memb memb;
-  ary_memb_init(mrb, &memb, NULL, 0, total_len,
+  ary_memb_init(mrb, &memb, sources, argc + 1, total_len,
                 total_len > SET_OP_HASH_THRESHOLD);
 
   struct ary_union_ctx ctx = { &memb, self, result, argv, argc };
   ARY_MEMB_RUN(mrb, result, ary_union_body, &ctx, &memb);
+  mrb_ary_ptr(result)->c = mrb->array_class;
 
   return result;
 }
@@ -847,17 +874,13 @@ ary_intersection_body(mrb_state *mrb, void *data)
     ary_memb_select(mrb, memb, j);
 
     /* The first argument selects out of `self` into the still empty result;
-       every later one narrows that result, which is ours alone and can be
-       compacted in place since the write position never runs ahead of the
-       read position. take() gives up an element the first time it is taken,
-       so a duplicate in `self` no longer finds it and the result keeps one
-       of each; from the second argument on the source is the result itself,
-       already duplicate-free, so its record of taken elements stays empty. */
-    mrb_value src = ctx->self;
-    if (j > 0) {
-      src = ctx->result;
-      mrb_ary_modify(mrb, mrb_ary_ptr(ctx->result));
-    }
+       every later one narrows that result in place, the write position never
+       running ahead of the read position. take() gives up an element the
+       first time it is taken, so a duplicate in `self` no longer finds it and
+       the result keeps one of each; from the second argument on the source is
+       the result itself, already duplicate-free, so its record of taken
+       elements stays empty. */
+    mrb_value src = j > 0 ? ctx->result : ctx->self;
 
     mrb_int write_pos = 0;
     int ai = mrb_gc_arena_save(mrb);
@@ -868,7 +891,11 @@ ary_intersection_body(mrb_state *mrb, void *data)
         if (j == 0) {
           mrb_ary_push(mrb, ctx->result, p);
         }
-        else {
+        else if (write_pos < RARRAY_LEN(ctx->result)) {
+          /* take() ran `hash` or `eql?`, Ruby code that can reach the result and
+             shrink, share or freeze it, so the slot is checked and the
+             buffer made ours after the call, as uniq! does. */
+          mrb_ary_modify(mrb, mrb_ary_ptr(ctx->result));
           RARRAY_PTR(ctx->result)[write_pos] = p;
         }
         write_pos++;
@@ -898,6 +925,8 @@ ary_intersection_internal(mrb_state *mrb, mrb_value self, mrb_int argc, const mr
   mrb_int total_len = ary_get_array_args(mrb, argc, &argv);
 
   mrb_value result = mrb_ary_new(mrb);
+  /* an element's #hash, #eql? and #== must not reach the result being filled */
+  mrb_ary_ptr(result)->c = NULL; /* hide from ObjectSpace.each_object */
 
   ary_memb memb;
   ary_memb_init(mrb, &memb, argv, argc, total_len,
@@ -905,6 +934,7 @@ ary_intersection_internal(mrb_state *mrb, mrb_value self, mrb_int argc, const mr
 
   struct ary_intersection_ctx ctx = { &memb, self, result };
   ARY_MEMB_RUN(mrb, result, ary_intersection_body, &ctx, &memb);
+  mrb_ary_ptr(result)->c = mrb->array_class;
 
   return result;
 }
@@ -1181,10 +1211,16 @@ ary_uniq_bang_body(mrb_state *mrb, void *data)
 {
   struct ary_uniq_bang_ctx *ctx = (struct ary_uniq_bang_ctx *)data;
   mrb_value self = ctx->self;
+  /* Under the set this is the shared copy, not `self`: the set keeps each
+     element it is asked about as a key, and only the copy keeps a key alive.
+     An element that `hash` put into `self` after the copy was taken would
+     become a key nothing pins (GHSA-6vh7-2mq3-mhc5). Under the walk it is
+     `self`; the walk keeps no keys. */
+  mrb_value src = ctx->memb->arys[0];
 
   int ai = mrb_gc_arena_save(mrb);
-  for (mrb_int read_pos = 0; read_pos < RARRAY_LEN(self); read_pos++) {
-    mrb_value elem = RARRAY_PTR(self)[read_pos];
+  for (mrb_int read_pos = 0; read_pos < RARRAY_LEN(src); read_pos++) {
+    mrb_value elem = RARRAY_PTR(src)[read_pos];
     mrb_gc_protect(mrb, elem); // elem may be removed from self by ary_memb_first()
     if (ary_memb_first(mrb, ctx->memb, elem, self, *ctx->write_pos)) {
       if (*ctx->write_pos != read_pos && *ctx->write_pos < RARRAY_LEN(self)) {
@@ -1220,8 +1256,8 @@ ary_uniq_bang(mrb_state *mrb, mrb_value self)
 
   /* The kept prefix of `self` is the record of first occurrences, so the
      membership object holds `self` itself: under the set as a shared copy
-     that keeps every element alive while `hash` runs, under the walk as the
-     array whose prefix first() reads. */
+     that keeps every element alive while `hash` runs and that the body reads
+     from, under the walk as the array whose prefix first() reads. */
   ary_memb memb;
   ary_memb_init(mrb, &memb, &self, 1, len, len > SET_OP_HASH_THRESHOLD);
 
@@ -1248,7 +1284,10 @@ static mrb_value
 ary_uniq(mrb_state *mrb, mrb_value self)
 {
   mrb_value ary = mrb_ary_dup(mrb, self);
+  /* an element's #hash and #eql? must not reach the copy being narrowed */
+  mrb_ary_ptr(ary)->c = NULL; /* hide from ObjectSpace.each_object */
   ary_uniq_bang(mrb, ary);
+  mrb_ary_ptr(ary)->c = mrb->array_class;
   return ary;
 }
 

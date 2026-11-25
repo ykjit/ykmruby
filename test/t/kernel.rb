@@ -408,6 +408,22 @@ assert('Kernel#method_missing', '15.3.1.3.30') do
   assert_equal [:foo, [], { k: 1 }, 2], a.foo(k: 1) { 2 }
 end
 
+assert('Kernel#__send__ to method_missing') do
+  a = Object.new
+  def a.method_missing(mid, *args, **opts, &blk)
+    [mid, args, opts, blk&.call]
+  end
+  assert_equal [:foo, [], {}, nil], a.__send__(:foo)
+  assert_equal [:foo, [1, 2], {}, nil], a.__send__(:foo, 1, 2)
+  assert_equal [:foo, [], { k: 1 }, nil], a.__send__(:foo, k: 1)
+  assert_equal [:foo, [1], { k: 2 }, 3], a.__send__(:foo, 1, k: 2) { 3 }
+  assert_equal [:foo, [{ k: 2 }], {}, nil], a.__send__(:foo, { k: 2 })
+  assert_equal [:foo, [1], { k: 2 }, nil], a.__send__("foo", 1, k: 2)
+  args = [:foo, *(1..15).to_a]
+  assert_equal [:foo, (1..15).to_a, { k: 1 }, nil], a.__send__(*args, k: 1)
+  assert_equal :foo, args[0]
+end
+
 assert('Kernel#nil?', '15.3.1.3.32') do
   assert_false nil?
 end
@@ -446,6 +462,116 @@ assert('Kernel#raise', '15.3.1.3.40') do
   assert_raise RuntimeError do
     raise RuntimeError.new
   end
+end
+
+assert('instance variables on objects of a type without an iv slot') do
+  # A String, Array, Range, Proc, ... holds instance variables in a side
+  # table; nothing of that exists until one is set.
+  str_class = Class.new(String) do
+    attr_accessor :tag
+    def initialize(s, tag = nil)
+      super(s)
+      @tag = tag
+    end
+  end
+  s = str_class.new("abc", :t)
+  assert_equal "abc", s
+  assert_equal :t, s.tag
+  s.tag = :u
+  assert_equal :u, s.tag
+  assert_equal :u, s.dup.tag                 # dup and clone copy the entry
+  assert_equal :u, s.clone.tag
+  assert_nil str_class.new("plain").tag
+
+  ary_class = Class.new(Array) { attr_accessor :tag }
+  a = ary_class.new
+  a.tag = 1
+  a << :x
+  assert_equal [:x], a
+  assert_equal 1, a.tag
+  assert_equal 1, a.dup.tag
+
+  pr = Proc.new { }
+  def pr.tag=(v) @tag = v end
+  def pr.tag; @tag; end
+  pr.tag = "t" + "ag"
+  GC.start
+  assert_equal "tag", pr.tag
+
+  # a Range is frozen, and has no side table entry to fall back on
+  range_class = Class.new(Range) { attr_accessor :tag }
+  assert_raise(ArgumentError) { range_class.new(1, 2).tag = 3 }
+end
+
+assert('instance variables on a frozen String are refused') do
+  str_class = Class.new(String) { attr_accessor :tag }
+  s = str_class.new("abc")
+  s.tag = 1
+  s.freeze
+  assert_raise(FrozenError) { s.tag = 2 }
+  assert_equal 1, s.tag
+  assert_raise(FrozenError) { s.remove_instance_variable(:@tag) }
+end
+
+assert('remove_instance_variable on a String') do
+  str_class = Class.new(String) do
+    attr_accessor :tag
+    def drop; remove_instance_variable(:@tag); end
+  end
+  s = str_class.new("abc")
+  s.tag = :t
+  assert_equal :t, s.drop
+  assert_nil s.tag
+  assert_raise(NameError) { s.drop }
+end
+
+assert('instance variables of a String survive GC and leave with it') do
+  str_class = Class.new(String) { attr_accessor :tag }
+  kept = []
+  i = 0
+  while i < 500
+    s = str_class.new("s#{i}")
+    s.tag = "tag#{i}"
+    kept << s if i % 50 == 0
+    i += 1
+  end
+  GC.start
+  assert_equal "tag0", kept[0].tag
+  assert_equal "tag450", kept[9].tag
+  i = 0
+  while i < 500
+    s = str_class.new("t#{i}")
+    s.tag = [i]
+    i += 1
+  end
+  GC.start
+  assert_equal "tag450", kept[9].tag
+end
+
+assert('a long chain of Strings through instance variables survives GC') do
+  str_class = Class.new(String) { attr_accessor :nxt }
+  head = nil
+  i = 0
+  # one collection is the test; MRB_GC_STRESS would run one per allocation
+  GC.disable
+  begin
+    while i < 500000
+      s = str_class.new("x")
+      s.nxt = head
+      head = s
+      i += 1
+    end
+  ensure
+    GC.enable
+  end
+  s = nil
+  GC.start
+  n = 0
+  while head
+    head = head.nxt
+    n += 1
+  end
+  assert_equal 500000, n
 end
 
 assert('Kernel#remove_instance_variable', '15.3.1.3.41') do

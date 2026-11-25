@@ -177,6 +177,33 @@ mrb_int mrb_hal_process_pid(mrb_state *mrb);
    cannot name a parent (errno ENOSYS when it has no such notion at all). */
 mrb_int mrb_hal_process_ppid(mrb_state *mrb);
 
+/* The (real) user ID belonging to a process.
+   Returns -1 with errno set on failure. */
+mrb_int mrb_hal_process_uid(mrb_state *mrb);
+
+/* The (effective) user ID belonging to a process.
+   Returns -1 with errno set on failure. */
+mrb_int mrb_hal_process_euid(mrb_state *mrb);
+
+/* The (real) group ID belonging to a process.
+   Returns -1 with errno set on failure. */
+mrb_int mrb_hal_process_gid(mrb_state *mrb);
+
+/* The (effective) group ID belonging to a process.
+   Returns -1 with errno set on failure. */
+mrb_int mrb_hal_process_egid(mrb_state *mrb);
+
+/* The fork(2) system call.
+   Returns -1 with errno set on failure. */
+mrb_int mrb_hal_process_fork(mrb_state *mrb);
+
+/* Replace the process image.  With argv NULL, `cmd` is a command line for
+   the shell; otherwise `cmd` is the program, found through PATH, and argv
+   the NULL-terminated argument vector it gets.
+   Returns only on failure: -1 with errno set (ENOSYS where a process
+   cannot run another program). */
+int mrb_hal_process_exec(mrb_state *mrb, const char *cmd, char *const argv[]);
+
 #ifdef MRB_HAL_PROCESS_HAS_WAIT
 /*
  * Wait for a child process to change state.

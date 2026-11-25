@@ -475,16 +475,17 @@ mrb_ary_init(mrb_state *mrb, mrb_value ary)
   mrb_int size = mrb_as_int(mrb, ss);
   struct RArray *a = mrb_ary_ptr(ary);
 
-  /* Rebuilding an array through `initialize` writes over whatever it held,
-     and nothing below this point asks whether that is allowed: a size of
-     zero writes nothing at all, and the loop that fills a larger one writes
-     through no helper that checks. The branch above goes through
-     ary_replace(), which opens with the same check. */
   ary_modify_check(mrb, a);
+  if (size < 0) {
+    mrb_raise(mrb, E_ARGUMENT_ERROR, "negative array size");
+  }
+  ary_modify(mrb, a);
 
   if (ARY_CAPA(a) < size) {
     ary_expand_capa(mrb, a, size);
   }
+
+  ARY_SET_LEN(a, 0);
 
   int ai = mrb_gc_arena_save(mrb);
   for (mrb_int i=0; i<size; i++) {
@@ -1183,18 +1184,14 @@ mrb_ary_splice(mrb_state *mrb, mrb_value ary, mrb_int head, mrb_int len, mrb_val
   /* range check */
   if (head < 0) {
     head += alen;
-    if (head < 0) goto out_of_range;
+    if (head < 0) {
+    out_of_range:
+      mrb_raisef(mrb, E_INDEX_ERROR, "index %i is out of array", head);
+    }
   }
-  if (head > ARY_MAX_SIZE - len) {
-  out_of_range:
-    mrb_raisef(mrb, E_INDEX_ERROR, "index %i is out of array", head);
-  }
-
+  /* only the elements up to the end can be replaced */
+  if (len > alen - head) len = head < alen ? alen - head : 0;
   mrb_int tail = head + len;
-  if (alen < len || alen < tail) {
-    len = alen - head;
-    tail = head + len;
-  }
 
   /* size check */
   if (mrb_array_p(rpl)) {
@@ -1320,7 +1317,10 @@ aget_index(mrb_state *mrb, mrb_value index)
   }
 #ifndef MRB_NO_FLOAT
   else if (mrb_float_p(index)) {
-    return (mrb_int)mrb_float(index);
+    /* The conversion the length argument of the same method already takes:
+       a Float no mrb_int holds, Infinity and NaN among them, is out of range
+       rather than whatever the cast makes of it. */
+    return mrb_as_int(mrb, index);
   }
 #endif
   else {
@@ -1475,6 +1475,10 @@ mrb_ary_delete_at(mrb_state *mrb, mrb_value self)
   ary_modify(mrb, a);
   mrb_value *ptr = ARY_PTR(a);
   mrb_value val = ptr[index];
+  /* the shrink below may collect, and val is then out of the array:
+     protect it while the array still holds it, since growing the arena
+     may collect too */
+  mrb_gc_protect(mrb, val);
 
   ptr += index;
   mrb_int len = alen - index;
@@ -1802,10 +1806,18 @@ join_ary(mrb_state *mrb, mrb_value ary, mrb_value sep)
      Nested results are concatenated verbatim, so appending every element
      into one shared buffer in depth-first order yields the same bytes a
      per-level recursion would.  The stack is a GC-tracked array; an
-     exception unwind reclaims it, so there is no leak. */
+     exception unwind reclaims it, so there is no leak.  It holds every array
+     on the current path, the one being walked last, with the index to resume
+     each parent at between them: a nested array is pinned by the stack while
+     a to_s/to_str/to_ary call runs, since that Ruby code can drop it from its
+     parent and run GC.  It is hidden from ObjectSpace.each_object so that the
+     same code cannot rewrite the frames either. */
   mrb_value stack = mrb_ary_new(mrb);
   mrb_int idx = 0;
 
+  mrb_ary_ptr(stack)->c = NULL; /* hide from ObjectSpace.each_object */
+  mrb_str_ptr(result)->c = NULL; /* and the string under construction */
+  mrb_ary_push(mrb, stack, ary);
   for (;;) {
     while (idx < RARRAY_LEN(ary)) {
       mrb_value val = RARRAY_PTR(ary)[idx];
@@ -1842,18 +1854,15 @@ join_ary(mrb_state *mrb, mrb_value ary, mrb_value sep)
       }
 
       if (as_array) {
-        /* check recursive: val must not be an ancestor on the current path */
-        if (mrb_obj_equal(mrb, val, ary)) {
-          mrb_raise(mrb, E_ARGUMENT_ERROR, "recursive array join");
-        }
+        /* check recursive: val must not be on the current path */
         for (mrb_int j = 0; j < RARRAY_LEN(stack); j += 2) {
           if (mrb_obj_equal(mrb, val, RARRAY_PTR(stack)[j])) {
             mrb_raise(mrb, E_ARGUMENT_ERROR, "recursive array join");
           }
         }
-        /* descend: save the current frame and switch to val */
-        mrb_ary_push(mrb, stack, ary);
+        /* descend: save the resume index and switch to val */
         mrb_ary_push(mrb, stack, mrb_fixnum_value(idx));
+        mrb_ary_push(mrb, stack, val);
         ary = val;
         idx = 0;
       }
@@ -1862,11 +1871,13 @@ join_ary(mrb_state *mrb, mrb_value ary, mrb_value sep)
       }
     }
 
+    mrb_ary_pop(mrb, stack);    /* the array just walked */
     if (RARRAY_LEN(stack) == 0) break;
     /* ascend: restore the parent frame */
     idx = mrb_fixnum(mrb_ary_pop(mrb, stack));
-    ary = mrb_ary_pop(mrb, stack);
+    ary = mrb_ary_entry(stack, -1);  /* g++ miscompiles PTR[LEN-1] here */
   }
+  mrb_str_ptr(result)->c = mrb->string_class;
 
   return result;
 }
@@ -1931,12 +1942,15 @@ mrb_ary_to_s(mrb_state *mrb, mrb_value self)
     mrb_str_cat_lit(mrb, ret, "...]");
     return ret;
   }
+  /* an element's inspect must not reach the string under construction */
+  mrb_str_ptr(ret)->c = NULL; /* hide from ObjectSpace.each_object */
   for (mrb_int i=0; i<RARRAY_LEN(self); i++) {
     if (i>0) mrb_str_cat_lit(mrb, ret, ", ");
     mrb_str_cat_str(mrb, ret, mrb_inspect(mrb, RARRAY_PTR(self)[i]));
     mrb_gc_arena_restore(mrb, ai);
   }
   mrb_str_cat_lit(mrb, ret, "]");
+  mrb_str_ptr(ret)->c = mrb->string_class;
 
   return ret;
 }
@@ -2144,6 +2158,11 @@ mrb_ary_delete(mrb_state *mrb, mrb_value self)
     return mrb_yield(mrb, blk, obj);
   }
 
+  /* the last == can have shrunk the array below what was kept */
+  if (j > ARY_LEN(ary)) {
+    mrb_raise(mrb, E_RUNTIME_ERROR, "array modified during delete");
+  }
+  ary_modify(mrb, ary);
   ARY_SET_LEN(ary, j);
   return ret;
 }

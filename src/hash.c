@@ -170,6 +170,13 @@ DEFINE_GETTER(h, size, uint32_t, size)                          /* h_size       
 DEFINE_ACCESSOR(h, ht, hash_table*, hsh.ht)                     /* h_ht         h_set_ht         */
 DEFINE_SWITCHER(ht, HT)                                         /* h_ht_on  h_ht_off  h_ht_p     */
 
+MRB_INLINE void h_identity_on(struct RHash *h) {
+  h->flags |= MRB_HASH_COMPARE_BY_IDENTITY;
+}
+MRB_INLINE mrb_bool h_identity_p(const struct RHash *h) {
+  return (h->flags & MRB_HASH_COMPARE_BY_IDENTITY) != 0;
+}
+
 #define EA_EACH_USED(ea, n_used, entry_var)                                   \
   for (hash_entry *entry_var = (ea), *ea_end__ = (entry_var) + (n_used);      \
        entry_var < ea_end__;                                                  \
@@ -358,13 +365,22 @@ float_hash_code(mrb_float f)
 }
 #endif
 
-uint32_t
-mrb_obj_hash_code(mrb_state *mrb, mrb_value key)
+/* What key hashes to in h, or by eql? when h is NULL.  Identity is decided here,
+   in a function too big to inline, so that obj_hash_code() stays small enough
+   for every lookup to inline it. */
+static uint32_t
+key_hash_code(mrb_state *mrb, mrb_value key, const struct RHash *h)
 {
   enum mrb_vtype tt = mrb_type(key);
   uint32_t hash_code;
   mrb_value hash_code_obj;
-  switch (tt) {
+
+  if (h && h_identity_p(h)) {
+    /* the object, as mrb_obj_eq() tells objects apart; nothing is called */
+    uint64_t id = (uint64_t)mrb_obj_id(key);
+    hash_code = U32(id ^ (id >> 32));
+  }
+  else switch (tt) {
   case MRB_TT_STRING:
     hash_code = mrb_str_hash(mrb, key);
     break;
@@ -409,13 +425,19 @@ mrb_obj_hash_code(mrb_state *mrb, mrb_value key)
   return hash_code;
 }
 
+uint32_t
+mrb_obj_hash_code(mrb_state *mrb, mrb_value key)
+{
+  return key_hash_code(mrb, key, NULL);
+}
+
 static uint32_t
 obj_hash_code(mrb_state *mrb, mrb_value key, struct RHash *h)
 {
   uint32_t hash_code = 0;
 
   H_CHECK_MODIFIED(mrb, h) {
-    hash_code = mrb_obj_hash_code(mrb, key);
+    hash_code = key_hash_code(mrb, key, h);
   }
   return hash_code;
 }
@@ -486,6 +508,15 @@ entry_key_eql(mrb_state *mrb, struct RHash *h, hash_entry *entry, mrb_value key)
   if (!obj_eql(mrb, key, stored, h)) return FALSE;
   entry_check_vacated(mrb, entry, stored);
   return TRUE;
+}
+
+/* Whether entry holds the key of h: the same object once h compares by
+   identity, which calls nothing, and eql? otherwise. */
+static mrb_bool
+entry_holds_key_p(mrb_state *mrb, struct RHash *h, hash_entry *entry, mrb_value key)
+{
+  if (h_identity_p(h)) return mrb_obj_eq(mrb, key, entry->key);
+  return entry_key_eql(mrb, h, entry, key);
 }
 
 static inline mrb_bool
@@ -589,6 +620,14 @@ static hash_entry*
 ea_get_by_key(mrb_state *mrb, hash_entry *ea, uint32_t ea_capa, uint32_t size,
               mrb_value key, struct RHash *h)
 {
+  /* asked once for the search and not of each entry it walks, which is what a
+     Hash that never compares by identity would otherwise pay for */
+  if (h_identity_p(h)) {
+    EA_EACH(ea, ea_capa, size, entry) {
+      if (mrb_obj_eq(mrb, key, entry->key)) return entry;
+    }
+    return NULL;
+  }
   EA_EACH(ea, ea_capa, size, entry) {
     if (entry_key_eql(mrb, h, entry, key)) return entry;
   }
@@ -646,12 +685,10 @@ ar_compress(mrb_state *mrb, struct RHash *h)
 static mrb_bool
 ar_get(mrb_state *mrb, struct RHash *h, mrb_value key, mrb_value *valp)
 {
-  EA_EACH(ar_ea(h), ar_ea_capa(h), ar_size(h), entry) {
-    if (!entry_key_eql(mrb, h, entry, key)) continue;
-    *valp = entry->val;
-    return TRUE;
-  }
-  return FALSE;
+  hash_entry *entry = ea_get_by_key(mrb, ar_ea(h), ar_ea_capa(h), ar_size(h), key, h);
+  if (!entry) return FALSE;
+  *valp = entry->val;
+  return TRUE;
 }
 
 static void
@@ -847,7 +884,7 @@ ib_it_find_by_key(mrb_state *mrb, index_buckets_iter *it, mrb_value key)
     ib_it_next(it);
     if (ib_it_empty_p(it)) return FALSE;
     if (!ib_it_deleted_p(it) &&
-        entry_key_eql(mrb, it->h, ib_it_entry(it), key)) {
+        entry_holds_key_p(mrb, it->h, ib_it_entry(it), key)) {
       return TRUE;
     }
   }
@@ -1043,7 +1080,7 @@ ht_set(mrb_state *mrb, struct RHash *h, mrb_value key, mrb_value val)
   mrb_assert(ht_size(h) < ib_bit_to_capa(ib_bit(h)));
   IB_CYCLE_BY_KEY(mrb, h, key, it) {
     if (ib_it_active_p(it)) {
-      if (!entry_key_eql(mrb, h, ib_it_entry(it), key)) continue;
+      if (!entry_holds_key_p(mrb, h, ib_it_entry(it), key)) continue;
       ib_it_entry(it)->val = val;
     }
     else if (ib_it_deleted_p(it)) {
@@ -1122,7 +1159,7 @@ ht_rehash(mrb_state *mrb, struct RHash *h)
     mrb_value key = r_entry->key;
     IB_CYCLE_BY_KEY(mrb, h, key, it) {
       if (ib_it_active_p(it)) {
-        if (!entry_key_eql(mrb, h, ib_it_entry(it), key)) continue;
+        if (!entry_holds_key_p(mrb, h, ib_it_entry(it), key)) continue;
         entry_check_vacated(mrb, r_entry, key);
         ib_it_entry(it)->val = r_entry->val;
         ht_set_size(h, --size);
@@ -1156,7 +1193,7 @@ ht_rehash(mrb_state *mrb, struct RHash *h)
 static mrb_value
 h_key_for(mrb_state *mrb, struct RHash *h, mrb_value key)
 {
-  if (mrb_string_p(key) && !mrb_frozen_p(mrb_str_ptr(key))) {
+  if (mrb_string_p(key) && !mrb_frozen_p(mrb_str_ptr(key)) && !h_identity_p(h)) {
     key = mrb_str_dup(mrb, key);
     mrb_str_ptr(key)->frozen = 1;
     mrb_field_write_barrier_value(mrb, (struct RBasic*)h, key);
@@ -1258,6 +1295,8 @@ h_replace(mrb_state *mrb, struct RHash *h, struct RHash *orig_h)
 #endif
     ib_set_bit(h, ib_bit(orig_h));
   }
+  /* the entries came in by a copy, past the barrier on each store */
+  mrb_write_barrier(mrb, (struct RBasic*)h);
 }
 
 size_t
@@ -1417,7 +1456,7 @@ static void
 hash_replace(mrb_state *mrb, mrb_value self, mrb_value orig)
 {
   struct RHash *h = mrb_hash_ptr(self), *orig_h = mrb_hash_ptr(orig);
-  uint32_t mask = MRB_HASH_DEFAULT | MRB_HASH_PROC_DEFAULT;
+  uint32_t mask = MRB_HASH_DEFAULT | MRB_HASH_PROC_DEFAULT | MRB_HASH_COMPARE_BY_IDENTITY;
   mrb_sym name;
   h_replace(mrb, h, orig_h);
   name = MRB_SYM(ifnone);
@@ -2161,6 +2200,43 @@ mrb_hash_rehash(mrb_state *mrb, mrb_value self)
   return self;
 }
 
+/*
+ *  call-seq:
+ *     hsh.compare_by_identity    -> hsh
+ *
+ *  Makes hsh compare its keys by their identity, so that two keys are the
+ *  same key only when they are the same object, and returns hsh. A String
+ *  key is then stored as it is, not as a frozen copy.
+ *
+ *     h = {}.compare_by_identity
+ *     h["a"] = 1
+ *     h["a"] = 2
+ *     h.size   #=> 2
+ */
+static mrb_value
+mrb_hash_compare_by_identity(mrb_state *mrb, mrb_value self)
+{
+  struct RHash *h = mrb_hash_ptr(self);
+
+  if (h_identity_p(h)) return self;
+  hash_modify(mrb, self);
+  h_identity_on(h);
+  h_rehash(mrb, h);
+  return self;
+}
+
+/*
+ *  call-seq:
+ *     hsh.compare_by_identity?    -> true or false
+ *
+ *  Returns true if hsh compares its keys by their identity.
+ */
+static mrb_value
+mrb_hash_compare_by_identity_p(mrb_state *mrb, mrb_value self)
+{
+  return mrb_bool_value(h_identity_p(mrb_hash_ptr(self)));
+}
+
 static mrb_value
 mrb_hash_compact(mrb_state *mrb, mrb_value hash)
 {
@@ -2236,6 +2312,9 @@ mrb_hash_except_keys(mrb_state *mrb, mrb_value hash)
   struct RHash *h = mrb_hash_ptr(hash);
   int ai = mrb_gc_arena_save(mrb);
 
+  /* the keys' #==, #hash and #eql? must not reach the result being filled */
+  mrb_hash_ptr(result)->c = NULL; /* hide from ObjectSpace.each_object */
+
   /* Both calls below run Ruby: #== on a key, and #hash and #eql? on the key
      being stored. That can replace `keys`, so its buffer and length are read
      afresh each time, and it can rehash `hash` out from under H_EACH, which
@@ -2264,6 +2343,7 @@ mrb_hash_except_keys(mrb_state *mrb, mrb_value hash)
     }
     mrb_gc_arena_restore(mrb, ai);
   }
+  mrb_hash_ptr(result)->c = mrb->hash_class;
   return result;
 }
 
@@ -2284,6 +2364,8 @@ mrb_hash_to_s(mrb_state *mrb, mrb_value self)
     mrb_str_cat_lit(mrb, ret, "...}");
     return ret;
   }
+  /* a key's or value's inspect must not reach the string under construction */
+  mrb_str_ptr(ret)->c = NULL; /* hide from ObjectSpace.each_object */
 
   mrb_int i = 0;
   struct RHash *h = mrb_hash_ptr(self);
@@ -2311,6 +2393,7 @@ mrb_hash_to_s(mrb_state *mrb, mrb_value self)
     mrb_gc_arena_restore(mrb, ai);
   }
   mrb_str_cat_lit(mrb, ret, "}");
+  mrb_str_ptr(ret)->c = mrb->string_class;
 
   return ret;
 }
@@ -2395,6 +2478,12 @@ mrb_hash_equal(mrb_state *mrb, mrb_value hash)
   if (mrb_hash_size(mrb, hash) != mrb_hash_size(mrb, hash2)) {
     return mrb_false_value();
   }
+  /* as in CRuby, hashes that tell their keys apart differently are equal
+     only when both are empty */
+  if (mrb_hash_size(mrb, hash) > 0 &&
+      h_identity_p(mrb_hash_ptr(hash)) != h_identity_p(mrb_hash_ptr(hash2))) {
+    return mrb_false_value();
+  }
 
   /* A pair already being compared is taken as equal, as in CRuby's
      recursive_equal(), and the other elements decide the outcome. */
@@ -2445,6 +2534,12 @@ mrb_hash_eql(mrb_state *mrb, mrb_value hash)
     return mrb_false_value();
   }
   if (mrb_hash_size(mrb, hash) != mrb_hash_size(mrb, hash2)) {
+    return mrb_false_value();
+  }
+  /* as in CRuby, hashes that tell their keys apart differently are equal
+     only when both are empty */
+  if (mrb_hash_size(mrb, hash) > 0 &&
+      h_identity_p(mrb_hash_ptr(hash)) != h_identity_p(mrb_hash_ptr(hash2))) {
     return mrb_false_value();
   }
 
@@ -2511,6 +2606,8 @@ MRB_YK_STATIC const mrb_mt_entry hash_rom_entries[] = {
   MRB_MT_ENTRY(mrb_hash_to_s,             MRB_SYM(to_s),            MRB_ARGS_NONE()),
   MRB_MT_ENTRY(mrb_hash_to_s,             MRB_SYM(inspect),         MRB_ARGS_NONE()),
   MRB_MT_ENTRY(mrb_hash_rehash,           MRB_SYM(rehash),          MRB_ARGS_NONE()),
+  MRB_MT_ENTRY(mrb_hash_compare_by_identity, MRB_SYM(compare_by_identity), MRB_ARGS_NONE()),
+  MRB_MT_ENTRY(mrb_hash_compare_by_identity_p, MRB_SYM_Q(compare_by_identity), MRB_ARGS_NONE()),
   MRB_MT_ENTRY(mrb_hash_to_hash,          MRB_SYM(to_hash),         MRB_ARGS_NONE()),
   MRB_MT_ENTRY(mrb_hash_assoc,            MRB_SYM(assoc),           MRB_ARGS_REQ(1)),
   MRB_MT_ENTRY(mrb_hash_rassoc,           MRB_SYM(rassoc),          MRB_ARGS_REQ(1)),

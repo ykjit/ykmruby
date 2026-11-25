@@ -40,8 +40,35 @@ assert('Module#alias_method', '15.2.2.4.8') do
     end
   end
 
-  assert_same(cls, cls.alias_method(:bar, :foo))
+  assert_equal(:bar, cls.alias_method(:bar, :foo))
   assert_equal("FOO", cls.new.bar)
+end
+
+assert('Module#alias_method super in an alias a subclass holds') do
+  a = Class.new { def m; "A"; end }
+  b = Class.new(a) { def m; "B" + super; end }
+  c = Class.new(b) { alias_method :m2, :m }
+  assert_equal("BA", c.new.m2)
+
+  # the alias reaches the original from a subclass that overrides it
+  d = Class.new(b) { alias_method :m2, :m; def m; "D" + super; end }
+  assert_equal("BA", d.new.m2)
+  e = Class.new(d)
+  assert_equal("BA", e.new.m2)
+
+  # super in a block, and with arguments
+  f = Class.new(a) { def m(x = 0); [1].map { "F#{x}" + super() }.first; end }
+  g = Class.new(f) { alias_method :m2, :m }
+  assert_equal("F1A", g.new.m2(1))
+end
+
+assert('Module#alias_method super in an alias of a module method') do
+  base = Class.new { def m; "A"; end }
+  m = Module.new { def m; "M" + super; end; alias_method :m2, :m }
+  assert_equal("MA", Class.new(base) { include m }.new.m2)
+  assert_equal("MA", Class.new(base) { include m; alias_method :m3, :m }.new.m3)
+  n = Module.new { include m; alias_method :m4, :m }
+  assert_equal("MA", Class.new(base) { include n }.new.m4)
 end
 
 # TODO not implemented ATM assert('Module.constants', '15.2.2.3.1') do
@@ -295,6 +322,20 @@ assert('Module#const_defined?', '15.2.2.4.20') do
   assert_false Test4ConstDefined.const_defined?(:NotExisting)
   assert_wrong_const_name{ Test4ConstDefined.const_defined?(:wrong_name) }
 
+  # class path string
+  assert_true Test4ConstDefined.const_defined?("Const4Test4ConstDefined")
+  assert_true Object.const_defined?("Test4ConstDefined::Const4Test4ConstDefined")
+  assert_true Object.const_defined?("::Test4ConstDefined::Const4Test4ConstDefined")
+  assert_true Object.const_defined?("Test4ConstDefined::Const4Test4ConstDefined", false)
+  assert_false Object.const_defined?("Test4ConstDefined::NotExisting")
+  assert_false Object.const_defined?("NotExisting::NotExisting")
+  assert_raise(TypeError){ Object.const_defined?("Test4ConstDefined::Const4Test4ConstDefined::X") }
+  assert_raise(TypeError){ Object.const_defined?(1) }
+  assert_wrong_const_name{ Object.const_defined?("") }
+  assert_wrong_const_name{ Object.const_defined?("Test4ConstDefined::") }
+  assert_wrong_const_name{ Object.const_defined?("NotExisting::") }
+  assert_wrong_const_name{ Object.const_defined?("Test4ConstDefined::wrong_name") }
+
   # shared empty iv_tbl (include)
   m = Module.new
   c = Class.new{include m}
@@ -372,6 +413,20 @@ assert('Module#const_missing', '15.2.2.4.22') do
   assert_equal 42, Test4ConstMissing.const_get(:ConstDoesntExist)
 end
 
+assert('Module#const_missing is called for each lexical read') do
+  module Test4ConstMissingEach
+    @n = 0
+    def self.const_missing(sym) = (@n += 1)
+    def self.read = Missing
+  end
+
+  assert_equal 1, Test4ConstMissingEach.read
+  assert_equal 2, Test4ConstMissingEach.read
+  # and the constant, once it is set, is what the read gives
+  Test4ConstMissingEach.const_set(:Missing, :set)
+  assert_equal :set, Test4ConstMissingEach.read
+end
+
 assert('Module#include', '15.2.2.4.27') do
   module Test4Include
     Const4Include = 42
@@ -386,6 +441,71 @@ assert('Module#include', '15.2.2.4.27') do
   assert_equal 42, Test4Include2.const_get(:Const4Include)
   assert_equal Test4Include2, Test4Include2.include_result
   assert_raise(FrozenError) { Module.new.freeze.include Test4Include }
+end
+
+assert('Module#include calls append_features') do
+  log = []
+  m = Module.new do
+    def self.append_features(base)
+      $__af_log << [:append_features, base]
+      super
+    end
+    def self.included(base)
+      $__af_log << [:included, base]
+    end
+    def hi; :hi; end
+  end
+  $__af_log = log
+  c = Class.new { include m }
+  assert_equal [[:append_features, c], [:included, c]], log
+  assert_equal :hi, c.new.hi
+  assert_true c.include?(m)
+
+  # a module that does not call super is not included
+  skip = Module.new { def self.append_features(base); end }
+  d = Class.new { include skip }
+  assert_false d.include?(skip)
+end
+
+assert('Module#prepend calls prepend_features') do
+  log = []
+  m = Module.new do
+    def self.prepend_features(base)
+      $__pf_log << :prepend_features
+      super
+    end
+    def self.prepended(base)
+      $__pf_log << :prepended
+    end
+    def hi; :mod; end
+  end
+  $__pf_log = log
+  c = Class.new { def hi; :klass; end; prepend m }
+  assert_equal [:prepend_features, :prepended], log
+  assert_equal :mod, c.new.hi
+
+  # super prepends into a module as well as a class
+  n = Module.new { prepend m }
+  assert_equal [m, n], n.ancestors[0, 2]
+end
+
+assert('Kernel#extend calls extend_object') do
+  log = []
+  m = Module.new do
+    def self.extend_object(obj)
+      $__eo_log << :extend_object
+      super
+    end
+    def self.extended(obj)
+      $__eo_log << :extended
+    end
+    def hi; :ext; end
+  end
+  $__eo_log = log
+  o = Object.new
+  o.extend(m)
+  assert_equal [:extend_object, :extended], log
+  assert_equal :ext, o.hi
 end
 
 assert('Module#include?', '15.2.2.4.28') do
@@ -593,9 +713,36 @@ assert('Module#undef_method', '15.2.2.4.42') do
   assert_true Test4UndefMethod::Parent.new.respond_to?(:hello)
   assert_false Test4UndefMethod::Child.new.respond_to?(:hello)
   assert_false Test4UndefMethod::GrandChild.new.respond_to?(:hello)
+  assert_same Test4UndefMethod::Parent, Test4UndefMethod::Parent.undef_method(:hello)
 end
 
 # Not ISO specified
+
+assert('Module#private_class_method') do
+  c = Class.new do
+    def self.a; :a; end
+    def self.b; :b; end
+  end
+  assert_same c, c.private_class_method(:a)
+  assert_raise(NoMethodError) { c.a }
+  assert_equal :b, c.b
+  assert_same c, c.private_class_method([:a, :b])
+  assert_raise(NoMethodError) { c.b }
+  assert_equal :a, c.instance_eval { a }
+  assert_same c, c.public_class_method("a", :b)
+  assert_equal [:a, :b], [c.a, c.b]
+  assert_same c, c.private_class_method
+  assert_equal :a, c.a
+  assert_raise(NameError) { c.private_class_method(:no_such_method) }
+
+  # the instances' methods stay as they were
+  k = Class.new { def self.make; new; end; private_class_method :new }
+  assert_raise(NoMethodError) { k.new }
+  assert_kind_of k, k.make
+
+  m = Module.new { def self.m; :m; end; private_class_method :m }
+  assert_raise(NoMethodError) { m.m }
+end
 
 assert('Module#dup') do
   module TestModuleDup
@@ -978,33 +1125,32 @@ end
   #   assert_equal(Test4PrependVisibilityInherited::A, Test4PrependVisibilityInherited::B.new.foo, "#{bug8238}")
   # end
 
-  # assert 'Module#prepend super in alias' do
-  #   skip "super does not currently work in aliased methods"
-  #   bug7842 = '[Bug #7842]'
+  assert 'Module#prepend super in alias' do
+    bug7842 = '[Bug #7842]'
 
-  #   p = labeled_module("P") do
-  #     def m; "P"+super; end
-  #   end
+    p = labeled_module("P") do
+      def m; "P"+super; end
+    end
 
-  #   a = labeled_class("A") do
-  #     def m; "A"; end
-  #   end
+    a = labeled_class("A") do
+      def m; "A"; end
+    end
 
-  #   b = labeled_class("B", a) do
-  #     def m; "B"+super; end
-  #     alias m2 m
-  #     prepend p
-  #     alias m3 m
-  #   end
+    b = labeled_class("B", a) do
+      def m; "B"+super; end
+      alias m2 m
+      prepend p
+      alias m3 m
+    end
 
-  #   assert_nothing_raised do
-  #     assert_equal("BA", b.new.m2, bug7842)
-  #   end
+    assert_nothing_raised do
+      assert_equal("BA", b.new.m2, bug7842)
+    end
 
-  #   assert_nothing_raised do
-  #     assert_equal("PBA", b.new.m3, bug7842)
-  #   end
-  # end
+    assert_nothing_raised do
+      assert_equal("PBA", b.new.m3, bug7842)
+    end
+  end
 
   assert 'Module#prepend each class' do
     m = labeled_module("M")
@@ -1700,4 +1846,266 @@ assert('constant and class variable lookup: a method written in a block given a 
   Test4GivenMethodMaker.install(Test4GivenMethodOwn)
   assert_raise(NameError) { Test4GivenMethodOwn.new.own_direct }
   assert_raise(NameError) { Test4GivenMethodOwn.new.own_nested }
+end
+
+assert('Module#public, #private, #protected accept String names') do
+  # respond_to? answers only for public methods; the test build has no
+  # mruby-metaprog, so private_method_defined? is not available here
+  c = Class.new do
+    def a; end
+    def b; end
+    def c; end
+    private "a"
+    protected "b", :c
+    def d; end
+    private :d
+    public "d"
+  end
+  o = c.new
+  assert_false o.respond_to?(:a)
+  assert_false o.respond_to?(:b)
+  assert_false o.respond_to?(:c)
+  assert_true o.respond_to?(:d)
+  assert_raise(NoMethodError) { o.a }
+  assert_raise(TypeError) { c.class_eval { private 1 } }
+end
+
+assert('Module#module_function accepts String names') do
+  m = Module.new do
+    def f; :f; end
+    module_function "f"
+  end
+  assert_equal :f, m.f
+  c = Class.new { include m }
+  assert_false c.new.respond_to?(:f)
+  assert_equal :f, c.new.instance_eval { f }
+end
+
+assert('Module#const_get with inherit false') do
+  module Test4ConstGetInherit
+    module A
+      X = 1
+    end
+    module B
+      include A
+    end
+  end
+  b = Test4ConstGetInherit::B
+  assert_equal 1, b.const_get(:X)
+  assert_uninitialized_const{ b.const_get(:X, false) }
+  # nor Object's constants, for a module
+  assert_uninitialized_const{ b.const_get(:String, false) }
+  assert_equal String, b.const_get(:String)
+  # a module looks in Object last, as CRuby's const_get does
+  assert_equal Test4ConstGetInherit, b.const_get(:Test4ConstGetInherit)
+  assert_equal String, Module.new.const_get("String")
+  assert_uninitialized_const{ Module.new.const_get(:I_DO_NOT_EXIST) }
+  # each segment of a path is looked up in the module before it
+  assert_equal 1, Object.const_get("Test4ConstGetInherit::A::X", false)
+  assert_uninitialized_const{ b.const_get("A::X", false) }
+  # const_missing still answers
+  c = Class.new { def self.const_missing(n) = [:missing, n] }
+  assert_equal [:missing, :Y], c.const_get(:Y, false)
+end
+
+assert('Module#const_get with a path') do
+  module Test4ConstGetPath
+    X = 1
+    module N; end
+  end
+  m = Test4ConstGetPath
+  # a module looks in Object for the first name of a path, not for a later one
+  assert_equal String, m.const_get("String")
+  assert_uninitialized_const{ Object.const_get("Test4ConstGetPath::String") }
+  assert_uninitialized_const{ m.const_get("N::String") }
+  # a path runs through modules, whatever inherit says
+  assert_raise(TypeError){ m.const_get("X::Y") }
+  assert_raise(TypeError){ m.const_get("X::Y", false) }
+  assert_raise(TypeError){ Object.const_get("Test4ConstGetPath::X::Y", false) }
+  c = Class.new { def self.const_missing(n) = 1 }
+  assert_raise(TypeError){ c.const_get("A::B", false) }
+  c = Class.new { def self.const_missing(n) = "A" }
+  assert_raise(TypeError){ c.const_get("A::B", false) }
+end
+
+assert('Module#const_get on a class looks in Object') do
+  c = Class.new
+  assert_equal String, c.const_get(:String)
+  assert_equal String, c.const_get("String")
+  assert_equal Comparable, (class << c; self; end).const_get(:Comparable)
+  assert_uninitialized_const{ c.const_get("String::Foo") }
+  assert_uninitialized_const{ c.const_get(:String, false) }
+  # Object is not an ancestor of a BasicObject subclass
+  assert_uninitialized_const{ Class.new(BasicObject).const_get(:String) }
+end
+
+assert('Module#const_get with inherit false reads the module itself') do
+  m = Module.new
+  m.const_set(:Prepended, :from_module)
+  c = Class.new
+  c.const_set(:Prepended, :own)
+  c.prepend(m)
+  assert_equal :own, c.const_get(:Prepended, false)
+  # Kernel is one of Object's ancestors, and not Object itself
+  Kernel.const_set(:Test4ConstInKernel, 1)
+  begin
+    assert_equal 1, Object.const_get(:Test4ConstInKernel)
+    assert_true Object.const_defined?(:Test4ConstInKernel)
+    assert_uninitialized_const{ Object.const_get(:Test4ConstInKernel, false) }
+    assert_false Object.const_defined?(:Test4ConstInKernel, false)
+    assert_equal 1, Module.new.const_get(:Test4ConstInKernel)
+    assert_true Module.new.const_defined?(:Test4ConstInKernel)
+  ensure
+    Kernel.__send__(:remove_const, :Test4ConstInKernel)
+  end
+end
+
+assert('Module#const_defined? agrees with const_get on a module') do
+  module Test4ConstDefinedPath; end
+  m = Test4ConstDefinedPath
+  assert_true m.const_defined?(:String)
+  assert_true m.const_defined?("String")
+  assert_true Module.new.const_defined?(:String)
+  assert_false m.const_defined?(:String, false)
+  assert_false m.const_defined?("String::Nope")
+  assert_false Object.const_defined?("Test4ConstDefinedPath::String")
+  assert_false m.const_defined?(:I_DO_NOT_EXIST)
+end
+
+assert('Module#const_get and const_defined? with const_missing changing the path') do
+  c = Class.new do
+    def self.path=(s); @path = s; end
+    def self.const_missing(n); @path.replace("A"); self; end
+  end
+  # too long to embed, so that replace frees the buffer
+  c.path = path = ("A"*60) + "::" + ("B"*40)
+  assert_equal c, c.const_get(path)
+  c.path = path = "String::" + ("B"*60)
+  assert_false c.const_defined?(path)
+end
+
+assert('Module#public, #private, #protected and #module_function return their names') do
+  r = {}
+  c = Class.new do
+    def a; end
+    def b; end
+    r[:one] = public :a
+    r[:str] = private "a"
+    r[:two] = protected :a, :b
+    r[:ary] = private [:a, :b]
+    r[:none] = public
+    r[:def] = private def d; end
+    r[:attr] = private attr_accessor :x
+  end
+  assert_equal :a, r[:one]
+  assert_equal "a", r[:str]
+  assert_equal [:a, :b], r[:two]
+  assert_equal [:a, :b], r[:ary]
+  assert_nil r[:none]
+  assert_equal :d, r[:def]
+  assert_equal [:x, :x=], r[:attr]
+  assert_raise(NoMethodError) { c.new.d }
+  Module.new do
+    def f; end
+    def g; end
+    r[:mf] = module_function :f, :g
+    r[:mf0] = module_function
+  end
+  assert_equal [:f, :g], r[:mf]
+  assert_nil r[:mf0]
+end
+
+assert('Module#private_constant') do
+  class Test4PrivateConstant
+    X = 1
+    Y = 2
+    def self.x = X
+    def self.scoped = Test4PrivateConstant::X
+    def self.self_scoped = self::X
+  end
+  c = Test4PrivateConstant
+  assert_same c, c.__send__(:private_constant, :X)
+  assert_same c, c.__send__(:private_constant)
+  e = assert_raise(NameError) { c::X }
+  assert_equal "private constant Test4PrivateConstant::X referenced", e.message
+  assert_equal :X, e.name
+  assert_equal 2, c::Y
+  # the class's own code reads it, but not through a path, as does const_get
+  assert_equal 1, c.x
+  assert_raise(NameError) { c.scoped }
+  assert_raise(NameError) { c.self_scoped }
+  assert_equal 1, c.const_get(:X)
+  assert_true c.const_defined?(:X)
+  assert_nil defined?(Test4PrivateConstant::X)
+  assert_equal "constant", defined?(Test4PrivateConstant::Y)
+  assert_raise(NameError) { c.__send__(:private_constant, :NOPE) }
+  assert_raise(TypeError) { c.__send__(:private_constant, 1) }
+  # an instance variable is not a constant
+  class Test4PrivateConstant
+    @x = 1
+  end
+  assert_raise(NameError) { c.__send__(:private_constant, :@x) }
+
+  # a subclass reaches it only lexically, and an includer too
+  class Test4PrivateConstantSub < Test4PrivateConstant
+    def self.x = X
+  end
+  e = assert_raise(NameError) { Test4PrivateConstantSub::X }
+  assert_equal "private constant Test4PrivateConstant::X referenced", e.message
+  assert_equal 1, Test4PrivateConstantSub.x
+  # a name the class only inherits is not its own to mark
+  assert_raise(NameError) { Test4PrivateConstantSub.__send__(:private_constant, :Y) }
+  module Test4PrivateConstantMod
+    Z = 3
+    private_constant :Z
+  end
+  i = Class.new { include Test4PrivateConstantMod }
+  assert_raise(NameError) { i::Z }
+
+  # it stays private when set again, and is public once removed
+  c.const_set(:X, 2)
+  assert_raise(NameError) { c::X }
+  c.__send__(:remove_const, :X)
+  c.const_set(:X, 3)
+  assert_equal 3, c::X
+
+  # a const_missing of the class's own is called instead
+  c.__send__(:private_constant, :X)
+  def c.const_missing(name) = name
+  assert_equal :X, c::X
+end
+
+assert('Module#public_constant') do
+  c = Class.new
+  c.const_set(:X, 1)
+  c.__send__(:private_constant, :X)
+  assert_same c, c.__send__(:public_constant, :X)
+  assert_equal 1, c::X
+  assert_raise(NameError) { c.__send__(:public_constant, :NOPE) }
+
+  # a copy has marks of its own
+  c.__send__(:private_constant, :X)
+  d = c.dup
+  assert_raise(NameError) { d::X }
+  d.__send__(:public_constant, :X)
+  assert_equal 1, d::X
+  assert_raise(NameError) { c::X }
+end
+
+assert('Module#deprecate_constant') do
+  c = Class.new
+  c.const_set(:X, 1)
+  assert_same c, c.__send__(:deprecate_constant, :X)
+  assert_equal 1, c::X
+  assert_raise(NameError) { c.__send__(:deprecate_constant, :NOPE) }
+end
+
+assert('Module#private_constant on a frozen module') do
+  c = Class.new
+  c.const_set(:X, 1)
+  c.freeze
+  assert_raise(FrozenError) { c.__send__(:private_constant, :X) }
+  assert_raise(FrozenError) { c.__send__(:public_constant, :X) }
+  assert_raise(FrozenError) { c.__send__(:deprecate_constant, :X) }
+  assert_equal 1, c::X
 end

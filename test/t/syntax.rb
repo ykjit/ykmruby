@@ -117,6 +117,19 @@ assert('super forwards the keyword arguments at their current values') do
   assert_equal [1, {c: 2}], anon.new.rest(a: 1, c: 2)
 end
 
+assert('super in a block in a define_method body made by another method') do
+  # the body closed over the defining method's env; a block in it must take
+  # the name of the method being run, not that of the one that defined it
+  base = Class.new { def foo; :base; end }
+  sub = Class.new(base) do
+    def self.make(name)
+      define_method(name) { [1].map { super() }.first }
+    end
+    make(:foo)
+  end
+  assert_equal :base, sub.new.foo
+end
+
 assert('super forwards from a scope that has closed') do
   # A block that outlives its method reads the method's locals through an
   # env moved off the stack when the frame popped, holding exactly the
@@ -415,6 +428,17 @@ assert('redo', '11.5.2.4.5') do
     end
   end
   assert_equal [1, 2, 3, 4, 1, 2, 3, 4, 1, 4], a
+
+  # redo restarts the block body, so the arguments are taken only once and
+  # keep the values the body gave them
+  n = 0
+  r = Proc.new { |x, (z, w), o = 5, *rest, y, k: 1|
+    x += 10; o += 1; k += 1; z += 1
+    n += 1
+    redo if n < 3
+    [x, rest, y, z, w, o, k]
+  }.call(1, [5, 6], 7, 2, 3, 4)
+  assert_equal [31, [2, 3], 4, 8, 6, 10, 4], r
 end
 
 assert('Abbreviated variable assignment', '11.4.2.3.2') do
@@ -1313,6 +1337,55 @@ assert('at-least-once loop') do
     count += 10
   end while count < 5
   assert_equal 12, count  # 1, then 2+10=12
+end
+
+# in methods, where a break with no loop to leave raises
+def at_least_once_break_test(x)
+  begin
+    break if x
+    x = 1
+  end until true
+  x
+end
+
+def at_least_once_ended_test
+  r = []
+  a = []
+  begin
+    a << 1
+    break if true
+    a << 2
+  end while false
+  r << a
+
+  a = []
+  begin
+    a << 1
+    next
+    a << 2
+  end until true
+  r << a
+
+  count = 0
+  begin
+    count += 1
+    redo if count < 3
+  end while false
+  r << count
+
+  r << (begin; 1; end while false)
+  r << (begin; break 5 if true; end until true)
+  r
+end
+
+assert('at-least-once loop whose condition ends it') do
+  # break, next and redo work when the condition is known to end the loop,
+  # and its value is nil, as any loop's
+  assert_equal [[1], [1], 3, nil, 5], at_least_once_ended_test
+  assert_equal 1, at_least_once_break_test(nil)
+  assert_equal 2, at_least_once_break_test(2)
+  # next leaves the loop, not the block
+  assert_equal [1, 2], [1, 2].map { |i| begin; next i * 10; end while false; i }
 end
 
 assert('pattern matching - basic case/in') do
@@ -2596,9 +2669,48 @@ assert('defined? on a call carrying a block') do
   assert_nil defined?(no_such_method_at_all(&:to_s))
 end
 
-# NOTE: `&nil` block-forbidding parameters live in syntax_block_forbid.rb,
-# which the build excludes when compiling with mruby-compiler-prism (the
-# Prism parser does not accept `&nil` yet).
+assert('&nil in formal parameters') do
+  def m(&nil); end
+  m
+  m(&nil)
+  assert_raise(ArgumentError) { m {} }
+
+  def m2(a, b, &nil); end
+  m2(1, 2)
+  assert_raise(ArgumentError) { m2(1, 2) {} }
+
+  def m3(a, b=1, *c, &nil); end
+  m3(1)
+  assert_raise(ArgumentError) { m3(1) {} }
+
+  def m4(a:, &nil); end
+  m4(a: 1)
+  assert_raise(ArgumentError) { m4(a: 1) {} }
+
+  f = ->(&nil) { :ok }
+  assert_equal :ok, f.call
+  assert_raise(ArgumentError) { f.call {} }
+end
+
+assert('**nil in formal parameters') do
+  def nokey(x, **nil) = x
+  assert_equal 1, nokey(1)
+  # a Hash is a positional argument, and no keywords is none
+  assert_equal({z: 2}, nokey({z: 2}))
+  h = {}
+  assert_equal 1, nokey(1, **h)
+  e = assert_raise(ArgumentError) { nokey(1, z: 2) }
+  assert_equal "no keywords accepted", e.message
+
+  f = Proc.new { |x, **nil| x }
+  assert_equal 1, f.call(1)
+  assert_raise(ArgumentError) { f.call(1, z: 2) }
+
+  def nokey2(**nil, &nil); end
+  nokey2
+  assert_raise(ArgumentError) { nokey2(z: 2) }
+  assert_raise(ArgumentError) { nokey2 {} }
+end
 
 assert('brace-less variable interpolation') do
   # `"#@iv"` is the short form of `"#{@iv}"`. It reaches the codegen as an
@@ -3219,4 +3331,65 @@ assert('super reaches a private or protected operator') do
   assert_raise_with_message(NoMethodError, "protected method '==' called for SuperOperatorSub") do
     o == 1
   end
+end
+
+assert('case/in - an alternation after a pattern that compiles to a plain jump') do
+  # The left side of `|` may compile to a plain jump into the fail chain
+  # rather than a JMPNOT, and the rewrite of a JMPNOT into a JMPIF told the
+  # two apart by reading the byte before the operand. For the jump that byte
+  # is the operand of the instruction before it, here the jump closing the
+  # clause before, whose link was then rewritten and followed off the end of
+  # the code. The shape is the reported one: three clauses, the last an
+  # alternation whose left side compiled that way when this was reported.
+  assert_raise(NoMatchingPatternError) do
+    case object_id;in Integer();in[*,su,*],{},as then in({})|{}then end
+  end
+end
+
+assert('case/in - a pattern in parentheses') do
+  # Parentheses group a pattern, as around an alternation that is one element
+  # of an array pattern. Left unread, every such pattern failed to match.
+  assert_equal :y, (case 1; in (1) then :y end)
+  assert_equal :y, (case [1, 2]; in ([Integer, *]) then :y end)
+  assert_equal 2, (case [1, 2]; in [(1 | 2), (Integer => x)] then x end)
+  assert_equal :y, (case 3; in (1) | (2) then :n; in ((3)) then :y end)
+  assert_equal :y, (case({a: 1}); in ({a: Integer}) then :y end)
+  assert_equal :else, (case 5; in (1) then :n else :else end)
+end
+
+assert('anonymous * and ** passed on from inside a block') do
+  def anon_run; yield; end
+  def anon_yield_rest(*) = anon_run { yield(*) }
+  def anon_yield_kw(**) = anon_run { yield(**) }
+  def anon_yield_both(*, **) = anon_run { yield(*, **) }
+  def anon_nested(*, **) = anon_run { anon_run { yield(*, **) } }
+  def anon_call(*, **, &b) = anon_run { b.call(*, **) }
+  def anon_return(*) = anon_run { return [*] }
+  assert_equal [1, 2], anon_yield_rest(1, 2) { |*x| x }
+  assert_equal({k: 1}, anon_yield_kw(k: 1) { |**x| x })
+  assert_equal [[1], {k: 2}], anon_yield_both(1, k: 2) { |*x, **y| [x, y] }
+  assert_equal [[1], {k: 2}], anon_nested(1, k: 2) { |*x, **y| [x, y] }
+  assert_equal [[1], {k: 2}], anon_call(1, k: 2) { |*x, **y| [x, y] }
+  assert_equal [3, 4], anon_return(3, 4)
+end
+
+assert('super(...)') do
+  base = Class.new do
+    def f(*a, **k, &b) = [a, k, b ? b.call : nil]
+    def anon_run; yield; end
+  end
+  c = Class.new(base) { def f(...) = super(...) }
+  assert_equal [[1, 2], {k: 3}, :b], c.new.f(1, 2, k: 3) { :b }
+  assert_equal [[], {}, nil], c.new.f
+  c = Class.new(base) { def f(x, ...) = super(x, 0, ...) }
+  assert_equal [[1, 0, 2], {k: 3}, :b], c.new.f(1, 2, k: 3) { :b }
+  c = Class.new(base) { def f(...) = anon_run { super(...) } }
+  assert_equal [[1], {k: 3}, :b], c.new.f(1, k: 3) { :b }
+  c = Class.new(base) do
+    def f(...)
+      super(...)                # the value is not used
+      [:kept, super(...)]
+    end
+  end
+  assert_equal [:kept, [[1], {}, nil]], c.new.f(1)
 end

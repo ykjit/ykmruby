@@ -18,25 +18,25 @@ Add the line below to your build configuration.
 
 | method                     | mruby-io | memo     |
 | -------------------------- | -------- | -------- |
-| IO.binread                 |          |          |
-| IO.binwrite                |          |          |
+| IO.binread                 | o        |          |
+| IO.binwrite                | o        |          |
 | IO.copy_stream             |          |          |
 | IO.new, IO.for_fd, IO.open | o        |          |
 | IO.foreach                 |          |          |
 | IO.pipe                    | o        |          |
 | IO.popen                   | o        |          |
 | IO.read                    | o        |          |
-| IO.readlines               |          |          |
+| IO.readlines               | o        |          |
 | IO.select                  | o        |          |
 | IO.sysopen                 | o        |          |
 | IO.try_convert             |          |          |
-| IO.write                   |          |          |
+| IO.write                   | o        |          |
 | IO#<<                      |          |          |
 | IO#advise                  |          |          |
 | IO#autoclose=              | o        |          |
 | IO#autoclose?              | o        |          |
-| IO#binmode                 |          |          |
-| IO#binmode?                |          |          |
+| IO#binmode                 | o        |          |
+| IO#binmode?                | o        |          |
 | IO#bytes                   |          | obsolete |
 | IO#chars                   |          | obsolete |
 | IO#clone, IO#dup           | o        |          |
@@ -104,23 +104,23 @@ Add the line below to your build configuration.
 | method                      | mruby-io | memo     |
 | --------------------------- | -------- | -------- |
 | File.absolute_path          |          |          |
-| File.atime                  |          |          |
+| File.atime                  | o        |          |
 | File.basename               | o        |          |
 | File.blockdev?              |          | FileTest |
 | File.chardev?               |          | FileTest |
 | File.chmod                  | o        |          |
 | File.chown                  |          |          |
-| File.ctime                  |          |          |
+| File.ctime                  | o        |          |
 | File.delete, File.unlink    | o        |          |
 | File.directory?             | o        | FileTest |
 | File.dirname                | o        |          |
-| File.executable?            |          | FileTest |
+| File.executable?            | o        | FileTest |
 | File.executable_real?       |          | FileTest |
 | File.exist?, exists?        | o        | FileTest |
 | File.expand_path            | o        |          |
 | File.extname                | o        |          |
 | File.file?                  | o        | FileTest |
-| File.fnmatch, File.fnmatch? |          |          |
+| File.fnmatch, File.fnmatch? | o        |          |
 | File.ftype                  |          |          |
 | File.grpowned?              |          | FileTest |
 | File.identical?             |          | FileTest |
@@ -129,12 +129,12 @@ Add the line below to your build configuration.
 | File.lchown                 |          |          |
 | File.link                   |          |          |
 | File.lstat                  |          |          |
-| File.mtime                  |          |          |
+| File.mtime                  | o        |          |
 | File.new, File.open         | o        |          |
 | File.owned?                 |          | FileTest |
 | File.path                   |          |          |
 | File.pipe?                  | o        | FileTest |
-| File.readable?              |          | FileTest |
+| File.readable?              | o        | FileTest |
 | File.readable_real?         |          | FileTest |
 | File.readlink               | o        |          |
 | File.realdirpath            |          |          |
@@ -152,10 +152,10 @@ Add the line below to your build configuration.
 | File.symlink?               | o        | FileTest |
 | File.truncate               |          |          |
 | File.umask                  | o        |          |
-| File.utime                  |          |          |
+| File.utime                  | o        |          |
 | File.world_readable?        |          |          |
 | File.world_writable?        |          |          |
-| File.writable?              |          | FileTest |
+| File.writable?              | o        | FileTest |
 | File.writable_real?         |          | FileTest |
 | File.zero?                  | o        | FileTest |
 | File#atime                  | o        |          |
@@ -168,6 +168,29 @@ Add the line below to your build configuration.
 | File#path                   | o        |          |
 | File#size                   |          |          |
 | File#truncate               |          |          |
+
+The `mruby-io-ftype` gem adds `File.ftype`, and these predicates to both
+`File` and `FileTest`: `blockdev?`, `chardev?`, `empty?`,
+`executable_real?`, `grpowned?`, `identical?`, `owned?`, `readable_real?`,
+`setgid?`, `setuid?`, `sticky?`, `world_readable?`, `world_writable?` and
+`writable_real?`. A build pays for them only when it asks for that gem.
+
+For the `FileTest` predicates backed by `stat`, a trailing slash requires the
+path to name a directory on POSIX-compatible platforms, and a trailing
+backslash has the same effect on Windows. A regular file followed by either
+applicable separator is reported as absent by `File.exist?` and as not a file
+by `File.file?`.
+
+## Encodings
+
+mruby reads UTF-8 and binary only, so an encoding a mode names after its
+`:` (`"r:UTF-8"`, `"rb:BOM|UTF-8"`, `"w:UTF-8:UTF-8"`), or the `encoding:` and
+`external_encoding:` options give, is read for what mruby can do with it:
+`BINARY` and `ASCII-8BIT` read binary strings, `BOM|` skips a UTF-8 byte
+order mark at the start, and any other name reads as UTF-8. A named
+encoding decides what a read answers, so `"rb:UTF-8"` reads UTF-8 strings.
+`IO.read`, `IO.write`, `IO.readlines` and `File.foreach` hand these options
+to the open.
 
 ## Porting Note
 
@@ -192,11 +215,20 @@ implement fails to link.
 | `MRB_HAL_IO_HAS_STAT_FIFO`     | `FileTest.pipe?`                | o                 |     |
 | `MRB_HAL_IO_HAS_STAT_SYMLINK`  | `FileTest.symlink?`             | o                 |     |
 | `MRB_HAL_IO_HAS_STAT_SOCKET`   | `FileTest.socket?`              | o                 |     |
+| `MRB_HAL_IO_HAS_STAT_INODE`    | `FileTest.identical?`           | o                 |     |
+| `MRB_HAL_IO_HAS_OWNER`         | `FileTest.owned?`, `grpowned?`  | o                 |     |
 | `MRB_HAL_IO_HAS_SPAWN_PROCESS` | `IO.popen`                      | o, not on iOS     | o   |
 
-The three `STAT` macros name no port function. They say which file kinds the
+`MRB_HAL_IO_HAS_OWNER` guards `mrb_hal_io_owner()`, which answers whether
+the process owns a file by its user and by its group. `MRB_IO_ACCESS_REAL`
+asks `mrb_hal_io_access()` by the real IDs rather than the effective ones,
+for the `_real?` predicates; a port where the two are one ignores it. The
+methods these two serve, and `FileTest.identical?`, are mruby-io-ftype's.
+
+The `STAT` macros name no port function. They say which file kinds the
 `st_mode` from `mrb_hal_io_stat()` can hold, and the predicate each guards
-reads that kind through the `MRB_IO_S_IS*` macros of `io_hal.h`.
+reads that kind through the `MRB_IO_S_IS*` macros of `io_hal.h`;
+`MRB_HAL_IO_HAS_STAT_INODE` says that its `st_dev` and `st_ino` name a file.
 
 `MRB_NO_IO_POPEN` is a build's veto: a configuration that defines it gets the
 gem without `IO.popen` whatever the port could do, `io_hal.h` undefining

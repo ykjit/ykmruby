@@ -183,17 +183,19 @@ void
 mrb_mt_init_rom(mrb_state *mrb, struct RClass *c,
                 const mrb_mt_entry *entries, int size)
 {
+  /* register for cleanup at mrb_close, before the wrapper is allocated:
+     if that raises, the node is all there is, and mrb_close frees it */
+  struct mrb_mt_rom_list *node =
+    (struct mrb_mt_rom_list*)mrb_malloc(mrb, sizeof(struct mrb_mt_rom_list));
+  node->tbl = NULL;
+  node->next = mrb->rom_mt;
+  mrb->rom_mt = node;
+
   mrb_mt_tbl *rom = (mrb_mt_tbl*)mrb_malloc(mrb, sizeof(mrb_mt_tbl));
   rom->size = size;
   rom->alloc = size | MRB_MT_READONLY_BIT;
   rom->ptr = (mrb_mt_entry*)entries;
-
-  /* register for cleanup at mrb_close */
-  struct mrb_mt_rom_list *node =
-    (struct mrb_mt_rom_list*)mrb_malloc(mrb, sizeof(struct mrb_mt_rom_list));
   node->tbl = rom;
-  node->next = mrb->rom_mt;
-  mrb->rom_mt = node;
 
   /* push ROM layer */
   mrb_mt_tbl *t = c->mt;
@@ -492,9 +494,9 @@ struct RClass*
 mrb_vm_define_module(mrb_state *mrb, mrb_value outer, mrb_sym id)
 {
   check_if_class_or_module(mrb, outer);
-  if (mrb_obj_iv_defined(mrb, mrb_obj_ptr(outer), id)) {
-    mrb_value old = mrb_const_get(mrb, outer, id);
-
+  /* `module X` with an autoload pending for X loads it first, as in CRuby */
+  mrb_value old;
+  if (mrb_const_lookup_at(mrb, mrb_class_ptr(outer), id, &old, TRUE)) {
     if (!mrb_module_p(old)) {
       mrb_raisef(mrb, E_TYPE_ERROR, "%!v is not a module", old);
     }
@@ -651,9 +653,8 @@ mrb_vm_define_class(mrb_state *mrb, mrb_value outer, mrb_value super, mrb_sym id
     s = NULL;
   }
   check_if_class_or_module(mrb, outer);
-  if (mrb_obj_iv_defined(mrb, mrb_obj_ptr(outer), id)) {
-    mrb_value old = mrb_const_get(mrb, outer, id);
-
+  mrb_value old;
+  if (mrb_const_lookup_at(mrb, mrb_class_ptr(outer), id, &old, TRUE)) {
     if (!mrb_class_p(old)) {
       mrb_raisef(mrb, E_TYPE_ERROR, "%!v is not a class", old);
     }
@@ -1599,6 +1600,8 @@ get_args_fast(mrb_state *mrb, const char *format, void** ptr, va_list *ap)
     case 'f': {
       mrb_float *fp = GET_ARG(mrb_float*);
       *fp = mrb_as_float(mrb, argv[i++]);
+      /* the to_f of a Numeric runs Ruby, which may move the stack */
+      argv = mrb->c->ci->stack + 1;
       break;
     }
 #endif
@@ -1884,6 +1887,9 @@ get_args_v(mrb_state *mrb, mrb_args_format format, void** ptr, va_list *ap)
         p = GET_ARG(mrb_float*);
         if (pickarg) {
           *p = mrb_as_float(mrb, *pickarg);
+          /* the to_f of a Numeric runs Ruby, which may move the stack */
+          ci = mrb->c->ci;
+          if (argv_on_stack) argv = ci->stack + 1;
         }
       }
       break;
@@ -2438,6 +2444,26 @@ mrb_prepend_module(mrb_state *mrb, struct RClass *c, struct RClass *m)
  *     end
  *     Klass.new.hello   #=> "Hello from Mod.\n"
  */
+/* the base of append_features/prepend_features: a class or a module */
+static void
+check_feature_base(mrb_state *mrb, mrb_value base)
+{
+  if (!mrb_class_p(base) && !mrb_module_p(base)) {
+    mrb_raisef(mrb, E_TYPE_ERROR, "wrong argument type %C (expected Module)", mrb_obj_class(mrb, base));
+  }
+}
+
+/* Module#prepend_features(base): the prepending itself, which a module
+ * overrides to take part in its own prepending */
+static mrb_value
+mrb_mod_prepend_features(mrb_state *mrb, mrb_value mod)
+{
+  mrb_value base = mrb_get_arg1(mrb);
+  check_feature_base(mrb, base);
+  mrb_prepend_module(mrb, mrb_class_ptr(base), mrb_class_ptr(mod));
+  return mod;
+}
+
 static mrb_value
 mrb_mod_prepend(mrb_state *mrb, mrb_value mod)
 {
@@ -2445,12 +2471,18 @@ mrb_mod_prepend(mrb_state *mrb, mrb_value mod)
   mrb_int argc;
   mrb_value *argv;
   mrb_sym prepended = MRB_SYM(prepended);
+  mrb_sym prepend_features = MRB_SYM(prepend_features);
 
   mrb_get_args(mrb, "*", &argv, &argc);
   while (argc--) {
     mrb_value m = argv[argc];
     mrb_check_type(mrb, m, MRB_TT_MODULE);
-    mrb_prepend_module(mrb, c, mrb_class_ptr(m));
+    if (mrb_func_basic_p(mrb, m, prepend_features, mrb_mod_prepend_features)) {
+      mrb_prepend_module(mrb, c, mrb_class_ptr(m));
+    }
+    else {
+      mrb_funcall_argv(mrb, m, prepend_features, 1, &mod);
+    }
     if (!mrb_func_basic_p(mrb, m, prepended, mrb_do_nothing)) {
       mrb_funcall_argv(mrb, m, prepended, 1, &mod);
     }
@@ -2475,6 +2507,17 @@ mrb_mod_prepend(mrb_state *mrb, mrb_value mod)
  *     end
  *     Klass.new.hello   #=> "Hello from Mod.\n"
  */
+/* Module#append_features(base): the inclusion itself, which a module
+ * overrides to take part in its own inclusion (ActiveSupport::Concern) */
+static mrb_value
+mrb_mod_append_features(mrb_state *mrb, mrb_value mod)
+{
+  mrb_value base = mrb_get_arg1(mrb);
+  check_feature_base(mrb, base);
+  mrb_include_module(mrb, mrb_class_ptr(base), mrb_class_ptr(mod));
+  return mod;
+}
+
 static mrb_value
 mrb_mod_include(mrb_state *mrb, mrb_value mod)
 {
@@ -2482,12 +2525,18 @@ mrb_mod_include(mrb_state *mrb, mrb_value mod)
   mrb_int argc;
   mrb_value *argv;
   mrb_sym included = MRB_SYM(included);
+  mrb_sym append_features = MRB_SYM(append_features);
 
   mrb_get_args(mrb, "*", &argv, &argc);
   while (argc--) {
     mrb_value m = argv[argc];
     mrb_check_type(mrb, m, MRB_TT_MODULE);
-    mrb_include_module(mrb, c, mrb_class_ptr(m));
+    if (mrb_func_basic_p(mrb, m, append_features, mrb_mod_append_features)) {
+      mrb_include_module(mrb, c, mrb_class_ptr(m));
+    }
+    else {
+      mrb_funcall_argv(mrb, m, append_features, 1, &mod);
+    }
     if (!mrb_func_basic_p(mrb, m, included, mrb_do_nothing)) {
       mrb_funcall_argv(mrb, m, included, 1, &mod);
     }
@@ -2534,12 +2583,24 @@ mrb_mod_include(mrb_state *mrb, mrb_value mod)
  *             If any of the included modules define an `extended` hook, it is called
  *             with `obj` as an argument.
  */
+/* Module#extend_object(obj): the extension itself, which a module
+ * overrides to take part in extending an object */
+static mrb_value
+mrb_mod_extend_object(mrb_state *mrb, mrb_value mod)
+{
+  mrb_value obj = mrb_get_arg1(mrb);
+  mrb_value cc = mrb_singleton_class(mrb, obj);
+  mrb_include_module(mrb, mrb_class_ptr(cc), mrb_class_ptr(mod));
+  return obj;
+}
+
 mrb_value
 mrb_obj_extend(mrb_state *mrb, mrb_value obj)
 {
   mrb_int argc;
   mrb_value *argv;
   mrb_sym extended = MRB_SYM(extended);
+  mrb_sym extend_object = MRB_SYM(extend_object);
 
   mrb_get_args(mrb, "*", &argv, &argc);
 
@@ -2547,7 +2608,12 @@ mrb_obj_extend(mrb_state *mrb, mrb_value obj)
   while (argc--) {
     mrb_value mod = argv[argc];
     mrb_check_type(mrb, mod, MRB_TT_MODULE);
-    mrb_include_module(mrb, mrb_class_ptr(cc), mrb_class_ptr(mod));
+    if (mrb_func_basic_p(mrb, mod, extend_object, mrb_mod_extend_object)) {
+      mrb_include_module(mrb, mrb_class_ptr(cc), mrb_class_ptr(mod));
+    }
+    else {
+      mrb_funcall_argv(mrb, mod, extend_object, 1, &obj);
+    }
     if (!mrb_func_basic_p(mrb, mod, extended, mrb_do_nothing)) {
       mrb_funcall_argv(mrb, mod, extended, 1, &obj);
     }
@@ -2665,7 +2731,68 @@ vis_scope_persist(mrb_state *mrb, mrb_callinfo **cp, struct REnv **ep, uint32_t 
   *cp = NULL;
 }
 
+/* Answers what public, private and protected answer in CRuby: nil for no
+   name, the name for one, and an Array of them for more. */
+static mrb_value
+visibility_result(mrb_state *mrb, const mrb_value *argv, mrb_int argc)
+{
+  if (argc == 0) return mrb_nil_value();
+  if (argc == 1) return argv[0];
+  return mrb_ary_new_from_values(mrb, argc, argv);
+}
+
+/* Gives each named method of `c` the visibility `vis`. */
 static void
+mod_set_visibility(mrb_state *mrb, struct RClass *c, mrb_int argc, const mrb_value *argv, int vis)
+{
+  /* A visibility change writes a copy of the method into a class's own
+     table, so the table it writes to has to be prepared the way defining
+     one prepares it: `class << self; class << self; protected :p; end;
+     end` reached mt_put() with none at all (#7293), and a frozen class
+     took the change in silence.
+
+     On a prepended class that table is the origin's, not `c`'s: `c` only
+     has the prepended module in front of it, and a copy written to `c`
+     would outrank the module instead of falling behind it. The frozen
+     check still runs on `c`, the class the caller named and the one
+     `mrb_check_frozen()` can see the flag on; `mrb_method_search()` still
+     starts its walk from `c` too, exactly as it would without this
+     change. */
+  struct RClass *t = c;
+  MRB_CLASS_ORIGIN(t);
+  mrb_mt_tbl *h = mt_writable(mrb, c, t);
+  if (argc == 1 && mrb_array_p(argv[0])) {
+    /* the names `attr_accessor` and its kin answer with */
+    argc = RARRAY_LEN(argv[0]);
+    argv = RARRAY_PTR(argv[0]);
+  }
+  for (int i=0; i<argc; i++) {
+    /* a Symbol or a String, as in CRuby */
+    mrb_sym mid = mrb_obj_to_sym(mrb, argv[i]);
+    mrb_method_t m = mrb_method_search(mrb, c, mid);
+    MRB_METHOD_SET_VISIBILITY(m, vis);
+    union mrb_mt_ptr ptr;
+    if (MRB_METHOD_PROC_P(m)) {
+      struct RProc *p = (struct RProc*)MRB_METHOD_PROC(m);
+
+      /* A method table entry is a GC field: mrb_gc_mark_mt() marks every
+         non-MRB_MT_FUNC entry as a child of the class. mrb_define_method_raw()
+         barriers the same kind of store; this one did not. */
+      ptr.proc = p;
+      if (p) {
+        mrb_field_write_barrier(mrb, (struct RBasic*)t, (struct RBasic*)p);
+      }
+    }
+    else {
+      ptr.func = MRB_METHOD_FUNC(m);
+    }
+    mt_put(mrb, h, mid, m.flags, ptr);
+    mc_clear_by_id(mrb, mid);
+    mrb_builtin_op_update(mrb, mid);
+  }
+}
+
+static mrb_value
 mrb_mod_visibility(mrb_state *mrb, mrb_value mod, int vis)
 {
   mrb_assert((vis&MT_VMASK)==vis);
@@ -2674,6 +2801,7 @@ mrb_mod_visibility(mrb_state *mrb, mrb_value mod, int vis)
   struct RClass *c = mrb_class_ptr(mod);
 
   mrb_get_args(mrb, "*!", &argv, &argc);
+  mrb_value result = visibility_result(mrb, argv, argc);
   if (argc == 0) {
     mrb_callinfo *ci;
     struct REnv *e;
@@ -2689,97 +2817,156 @@ mrb_mod_visibility(mrb_state *mrb, mrb_value mod, int vis)
     }
   }
   else {
-    /* A visibility change writes a copy of the method into a class's own
-       table, so the table it writes to has to be prepared the way defining
-       one prepares it: `class << self; class << self; protected :p; end;
-       end` reached mt_put() with none at all (#7293), and a frozen class
-       took the change in silence.
-
-       On a prepended class that table is the origin's, not `c`'s: `c` only
-       has the prepended module in front of it, and a copy written to `c`
-       would outrank the module instead of falling behind it. The frozen
-       check still runs on `c`, the class the caller named and the one
-       `mrb_check_frozen()` can see the flag on; `mrb_method_search()` still
-       starts its walk from `c` too, exactly as it would without this
-       change. */
-    struct RClass *t = c;
-    MRB_CLASS_ORIGIN(t);
-    mrb_mt_tbl *h = mt_writable(mrb, c, t);
-    if (argc == 1 && mrb_array_p(argv[0])) {
-      /* the names `attr_accessor` and its kin answer with */
-      argc = RARRAY_LEN(argv[0]);
-      argv = RARRAY_PTR(argv[0]);
-    }
-    for (int i=0; i<argc; i++) {
-      mrb_check_type(mrb, argv[i], MRB_TT_SYMBOL);
-      mrb_sym mid = mrb_symbol(argv[i]);
-      mrb_method_t m = mrb_method_search(mrb, c, mid);
-      MRB_METHOD_SET_VISIBILITY(m, vis);
-      union mrb_mt_ptr ptr;
-      if (MRB_METHOD_PROC_P(m)) {
-        struct RProc *p = (struct RProc*)MRB_METHOD_PROC(m);
-
-        /* A method table entry is a GC field: mrb_gc_mark_mt() marks every
-           non-MRB_MT_FUNC entry as a child of the class. mrb_define_method_raw()
-           barriers the same kind of store; this one did not. */
-        ptr.proc = p;
-        if (p) {
-          mrb_field_write_barrier(mrb, (struct RBasic*)t, (struct RBasic*)p);
-        }
-      }
-      else {
-        ptr.func = MRB_METHOD_FUNC(m);
-      }
-      mt_put(mrb, h, mid, m.flags, ptr);
-      mc_clear_by_id(mrb, mid);
-      mrb_builtin_op_update(mrb, mid);
-    }
+    mod_set_visibility(mrb, c, argc, argv, vis);
   }
+  return result;
 }
 
 static mrb_value
 mrb_mod_public(mrb_state *mrb, mrb_value mod)
 {
-  mrb_mod_visibility(mrb, mod, MRB_METHOD_PUBLIC_FL);
-  return mod;
+  return mrb_mod_visibility(mrb, mod, MRB_METHOD_PUBLIC_FL);
 }
 
 static mrb_value
 mrb_mod_private(mrb_state *mrb, mrb_value mod)
 {
-  mrb_mod_visibility(mrb, mod, MRB_METHOD_PRIVATE_FL);
-  return mod;
+  return mrb_mod_visibility(mrb, mod, MRB_METHOD_PRIVATE_FL);
 }
 
 static mrb_value
 mrb_mod_protected(mrb_state *mrb, mrb_value mod)
 {
-  mrb_mod_visibility(mrb, mod, MT_PROTECTED);
+  return mrb_mod_visibility(mrb, mod, MT_PROTECTED);
+}
+
+static mrb_value
+mod_class_method_visibility(mrb_state *mrb, mrb_value mod, int vis)
+{
+  mrb_int argc;
+  mrb_value *argv;
+
+  mrb_get_args(mrb, "*!", &argv, &argc);
+  if (argc > 0) {
+    struct RClass *sc = mrb_class_ptr(mrb_singleton_class(mrb, mod));
+    mod_set_visibility(mrb, sc, argc, argv, vis);
+  }
   return mod;
+}
+
+/*
+ * call-seq:
+ *   mod.public_class_method(symbol, ...)  -> mod
+ *   mod.public_class_method(array)        -> mod
+ *
+ * Makes the named class methods public.
+ */
+static mrb_value
+mrb_mod_public_class_method(mrb_state *mrb, mrb_value mod)
+{
+  return mod_class_method_visibility(mrb, mod, MRB_METHOD_PUBLIC_FL);
+}
+
+/*
+ * call-seq:
+ *   mod.private_class_method(symbol, ...)  -> mod
+ *   mod.private_class_method(array)        -> mod
+ *
+ * Makes the named class methods private, as `private_class_method :new`
+ * does for a class that hands out its instances some other way.
+ */
+static mrb_value
+mrb_mod_private_class_method(mrb_state *mrb, mrb_value mod)
+{
+  return mod_class_method_visibility(mrb, mod, MRB_METHOD_PRIVATE_FL);
+}
+
+/* marks each named constant of mod, which has to be mod's own */
+static mrb_value
+mod_const_mark(mrb_state *mrb, mrb_value mod, int flag, mrb_bool on)
+{
+  mrb_int argc;
+  mrb_value *argv;
+  struct RClass *c = mrb_class_ptr(mod);
+
+  mrb_check_frozen(mrb, c);
+  mrb_get_args(mrb, "*", &argv, &argc);
+  for (mrb_int i = 0; i < argc; i++) {
+    mrb_sym id = mrb_obj_to_sym(mrb, argv[i]);
+    mrb_int len;
+    const char *name = mrb_sym_name_len(mrb, id, &len);
+    /* constants share the table with instance variables */
+    if (!mrb_const_name_p(mrb, name, len) || !mrb_const_lookup_at(mrb, c, id, NULL, FALSE)) {
+      mrb_name_error(mrb, id, "constant %C::%n not defined", c, id);
+    }
+    mrb_const_flags_set(mrb, c, id, flag, on);
+  }
+  return mod;
+}
+
+/*
+ * call-seq:
+ *   mod.private_constant(name, ...)  -> mod
+ *
+ * Makes the named constants of mod private: a constant path,
+ * `mod::NAME`, no longer reaches them, nor does `mod.constants` list
+ * them, while code inside mod reads them as before.
+ *
+ *   class Foo
+ *     X = 1
+ *     private_constant :X
+ *     def self.x = X
+ *   end
+ *   Foo.x   #=> 1
+ *   Foo::X  #=> NameError: private constant Foo::X referenced
+ */
+static mrb_value
+mrb_mod_private_constant(mrb_state *mrb, mrb_value mod)
+{
+  return mod_const_mark(mrb, mod, MRB_CONST_PRIVATE, TRUE);
+}
+
+/*
+ * call-seq:
+ *   mod.public_constant(name, ...)  -> mod
+ *
+ * Makes the named constants of mod public again.
+ */
+static mrb_value
+mrb_mod_public_constant(mrb_state *mrb, mrb_value mod)
+{
+  return mod_const_mark(mrb, mod, MRB_CONST_PRIVATE, FALSE);
+}
+
+/*
+ * call-seq:
+ *   mod.deprecate_constant(name, ...)  -> mod
+ *
+ * Marks the named constants of mod deprecated: reading one warns, when
+ * `Warning[:deprecated]` is true (mruby-warning).
+ */
+static mrb_value
+mrb_mod_deprecate_constant(mrb_state *mrb, mrb_value mod)
+{
+  return mod_const_mark(mrb, mod, MRB_CONST_DEPRECATED, TRUE);
 }
 
 static mrb_value
 top_public(mrb_state *mrb, mrb_value self)
 {
-  self = mrb_obj_value(mrb->object_class);
-  mrb_mod_visibility(mrb, self, MRB_METHOD_PUBLIC_FL);
-  return self;
+  return mrb_mod_visibility(mrb, mrb_obj_value(mrb->object_class), MRB_METHOD_PUBLIC_FL);
 }
 
 static mrb_value
 top_private(mrb_state *mrb, mrb_value self)
 {
-  self = mrb_obj_value(mrb->object_class);
-  mrb_mod_visibility(mrb, self, MRB_METHOD_PRIVATE_FL);
-  return self;
+  return mrb_mod_visibility(mrb, mrb_obj_value(mrb->object_class), MRB_METHOD_PRIVATE_FL);
 }
 
 static mrb_value
 top_protected(mrb_state *mrb, mrb_value self)
 {
-  self = mrb_obj_value(mrb->object_class);
-  mrb_mod_visibility(mrb, self, MT_PROTECTED);
-  return self;
+  return mrb_mod_visibility(mrb, mrb_obj_value(mrb->object_class), MT_PROTECTED);
 }
 
 /*
@@ -3083,6 +3270,7 @@ static mrb_sym
 idx_op_mid(int slot)
 {
   if (slot == MRB_IDX_OP_STR_ADD) return MRB_OPSYM(add);
+  if (slot == MRB_IDX_OP_STR_EQ) return MRB_OPSYM(eq);
   return slot < MRB_IDX_OP_ARY_ASET ? MRB_OPSYM(aref) : MRB_OPSYM(aset);
 }
 
@@ -4148,7 +4336,8 @@ mrb_obj_class(mrb_state *mrb, mrb_value obj)
  *         (representing `b`) is directly used for the new alias `a`.
  *      b. If `b` is a Ruby-defined method (a non-CFUNC, non-alias `RProc`), a new `RProc`
  *         of type `MRB_PROC_ALIAS` is created. This new proc stores the original
- *         method's symbol `b` and its `RProc` as its `upper`. This ensures that
+ *         method's symbol `b`, its `RProc` as its `upper`, and the class `b` was
+ *         found in as its target class, where a `super` in it continues. This ensures that
  *         the alias `a` continues to point to the definition of `b` at the time of
  *         aliasing, even if `b` is later redefined. The visibility of `b` is copied
  *         to this new alias proc.
@@ -4161,7 +4350,11 @@ MRB_API void
 mrb_alias_method(mrb_state *mrb, struct RClass *c, mrb_sym a, mrb_sym b)
 {
   if (a == b) return;
-  mrb_method_t m = mrb_method_search(mrb, c, b);
+  struct RClass *owner = c;
+  mrb_method_t m = mrb_method_search_vm(mrb, &owner, b);
+  if (MRB_METHOD_UNDEF_P(m)) {
+    mrb_name_error(mrb, b, "undefined method '%n' for class %C", b, c);
+  }
 
   if (!MRB_METHOD_CFUNC_P(m)) {
     const struct RProc *p = MRB_METHOD_PROC(m);
@@ -4171,7 +4364,9 @@ mrb_alias_method(mrb_state *mrb, struct RClass *c, mrb_sym a, mrb_sym b)
 
       pnew->body.mid = b;
       pnew->upper = p;
-      pnew->e.env = NULL;
+      /* the class the original method was found in: a `super` in it goes
+         on from there, not from the class that holds the alias */
+      pnew->e.target_class = owner;
       pnew->flags |= MRB_PROC_ALIAS;
       MRB_METHOD_FROM_PROC(m, pnew);
       MRB_METHOD_SET_VISIBILITY(m, vis);
@@ -4241,7 +4436,10 @@ mrb_mod_to_s(mrb_state *mrb, mrb_value klass)
     mrb_value str = mrb_str_new_lit(mrb, "#<Class:");
 
     if (class_ptr_p(v)) {
+      /* the class's inspect must not reach the string under construction */
+      mrb_str_ptr(str)->c = NULL; /* hide from ObjectSpace.each_object */
       mrb_str_cat_str(mrb, str, mrb_inspect(mrb, v));
+      mrb_str_ptr(str)->c = mrb->string_class;
     }
     else {
       mrb_str_cat_str(mrb, str, mrb_any_to_s(mrb, v));
@@ -4254,9 +4452,11 @@ mrb_mod_to_s(mrb_state *mrb, mrb_value klass)
     mrb_value str = mrb_str_new_lit(mrb, "#<refinement:");
     mrb_value owner = mrb_iv_get(mrb, klass, MRB_SYM(__defined_at__));
 
+    mrb_str_ptr(str)->c = NULL; /* hide from ObjectSpace.each_object */
     mrb_str_cat_str(mrb, str, mrb_inspect(mrb, mrb_obj_value(r->super)));
     mrb_str_cat_lit(mrb, str, "@");
     mrb_str_cat_str(mrb, str, mrb_inspect(mrb, owner));
+    mrb_str_ptr(str)->c = mrb->string_class;
     return mrb_str_cat_lit(mrb, str, ">");
   }
 #endif
@@ -4274,7 +4474,8 @@ mrb_mod_alias(mrb_state *mrb, mrb_value mod)
   mrb_get_args(mrb, "nn", &new_name, &old_name);
   mrb_alias_method(mrb, c, new_name, old_name);
   mrb_method_added(mrb, c, new_name);
-  return mod;
+  /* the new name, as CRuby answers since 3.0 */
+  return mrb_symbol_value(new_name);
 }
 
 static void
@@ -4486,7 +4687,7 @@ mrb_mod_undef(mrb_state *mrb, mrb_value mod)
     mrb_undef_method_id(mrb, c, to_sym(mrb, *argv));
     argv++;
   }
-  return mrb_nil_value();
+  return mod;
 }
 
 static void
@@ -4499,39 +4700,123 @@ check_const_name_sym(mrb_state *mrb, mrb_sym id)
   }
 }
 
-static mrb_value
-mrb_mod_const_defined(mrb_state *mrb, mrb_value mod)
+/* Whether mod finds id on its way to Object, where mrb_const_get() stops for
+   a class (C::String is no constant), or anywhere for a module. */
+static mrb_bool
+const_short_of_object_p(mrb_state *mrb, mrb_value mod, mrb_sym id)
 {
-  mrb_sym id;
-  mrb_bool inherit = TRUE;
+  if (mrb_type(mod) == MRB_TT_MODULE) return mrb_const_defined(mrb, mod, id);
+  for (struct RClass *c = mrb_class_ptr(mod); c && c != mrb->object_class; c = c->super) {
+    if (mrb_const_defined_at(mrb, mrb_obj_value(c), id)) return TRUE;
+  }
+  return FALSE;
+}
 
-  mrb_get_args(mrb, "n|b", &id, &inherit);
+/* Whether Object is where const_get finds id: a module looks there, and a
+   class with Object among its ancestors does, as in CRuby, for a lone name or
+   the first name of a path. A later name does not: "M::String" is no more
+   String than M::String is. */
+static mrb_bool
+const_in_object_p(mrb_state *mrb, mrb_value mod, mrb_sym id, mrb_bool top)
+{
+  if (!top || const_short_of_object_p(mrb, mod, id)) return FALSE;
+  if (mrb_type(mod) != MRB_TT_MODULE) {
+    struct RClass *c = mrb_class_ptr(mod);
+    while (c && c != mrb->object_class) c = c->super;
+    if (!c) return FALSE;
+  }
+  return mrb_const_defined_at(mrb, mrb_obj_value(mrb->object_class), id);
+}
+
+static mrb_bool
+const_defined_sym(mrb_state *mrb, mrb_value mod, mrb_sym id, mrb_bool inherit, mrb_bool top)
+{
+  check_const_name_sym(mrb, id);
+  if (!inherit) return mrb_const_lookup_at(mrb, mrb_class_ptr(mod), id, NULL, FALSE);
+  return mrb_const_defined(mrb, mod, id) || const_in_object_p(mrb, mod, id, top);
+}
+
+/* The constant id of mod, looked up in mod's ancestors and const_in_object_p()
+   when inherit, in mod's own table otherwise; const_missing when there is none,
+   either way. */
+static mrb_value
+const_get_sym(mrb_state *mrb, mrb_value mod, mrb_sym id, mrb_bool inherit, mrb_bool top)
+{
   check_const_name_sym(mrb, id);
   if (inherit) {
-    return mrb_bool_value(mrb_const_defined(mrb, mod, id));
+    if (const_in_object_p(mrb, mod, id, top)) {
+      return mrb_const_get(mrb, mrb_obj_value(mrb->object_class), id);
+    }
+    return mrb_const_get(mrb, mod, id);
   }
-  return mrb_bool_value(mrb_const_defined_at(mrb, mod, id));
+  mrb_value v;
+  if (mrb_const_lookup_at(mrb, mrb_class_ptr(mod), id, &v, TRUE)) return v;
+  mrb_value name = mrb_symbol_value(id);
+  return mrb_funcall_argv(mrb, mod, MRB_SYM(const_missing), 1, &name);
 }
 
 static mrb_value
-mrb_const_get_sym(mrb_state *mrb, mrb_value mod, mrb_sym id)
+mrb_mod_const_defined(mrb_state *mrb, mrb_value mod)
 {
-  check_const_name_sym(mrb, id);
-  return mrb_const_get(mrb, mod, id);
+  mrb_value path;
+  mrb_bool inherit = TRUE;
+
+  mrb_get_args(mrb, "o|b", &path, &inherit);
+  if (mrb_symbol_p(path)) {
+    return mrb_bool_value(const_defined_sym(mrb, mod, mrb_symbol(path), inherit, TRUE));
+  }
+
+  /* class path string: "A::B::C", or "::A::B" from Object */
+  mrb_ensure_string_type(mrb, path);
+  /* const_missing and autoload run Ruby, which can change the string under
+     ptr, and reach a copy through ObjectSpace: walk a frozen copy */
+  path = mrb_str_dup_frozen(mrb, path);
+
+  char *ptr = RSTRING_PTR(path);
+  mrb_int len = RSTRING_LEN(path);
+  mrb_int off = 0;
+
+  if (len >= 2 && ptr[0] == ':' && ptr[1] == ':') {
+    mod = mrb_obj_value(mrb->object_class);
+    off = 2;
+  }
+  if (off == len) {
+    mrb_name_error(mrb, mrb_intern_str(mrb, path), "wrong constant name '%v'", path);
+  }
+  for (;;) {
+    mrb_int end = mrb_str_index_lit(mrb, path, "::", off);
+    if (end == -1) end = len;
+    mrb_sym id = mrb_intern(mrb, ptr+off, end-off);
+    if (end != len && end + 2 == len) { /* trailing "::" */
+      mrb_name_error(mrb, id, "wrong constant name '%v'", path);
+    }
+    if (!const_defined_sym(mrb, mod, id, inherit, off == 0)) return mrb_false_value();
+    if (end == len) return mrb_true_value();
+    mod = const_get_sym(mrb, mod, id, inherit, off == 0);
+    off = end + 2;
+    if (!mrb_class_p(mod) && !mrb_module_p(mod)) {
+      mrb_raisef(mrb, E_TYPE_ERROR, "%v does not refer to class/module", path);
+    }
+  }
 }
 
 static mrb_value
 mrb_mod_const_get(mrb_state *mrb, mrb_value mod)
 {
-  mrb_value path = mrb_get_arg1(mrb);
+  mrb_value path;
+  mrb_bool inherit = TRUE;
 
+  mrb_get_args(mrb, "o|b", &path, &inherit);
   if (mrb_symbol_p(path)) {
     /* const get with symbol */
-    return mrb_const_get_sym(mrb, mod, mrb_symbol(path));
+    return const_get_sym(mrb, mod, mrb_symbol(path), inherit, TRUE);
   }
 
   /* const get with class path string */
   mrb_ensure_string_type(mrb, path);
+  /* const_missing and autoload run Ruby, which can change the string under
+     ptr, and reach a copy through ObjectSpace: walk a frozen copy */
+  path = mrb_str_dup_frozen(mrb, path);
 
   char *ptr = RSTRING_PTR(path);
   mrb_int len = RSTRING_LEN(path);
@@ -4541,13 +4826,16 @@ mrb_mod_const_get(mrb_state *mrb, mrb_value mod)
     mrb_int end = mrb_str_index_lit(mrb, path, "::", off);
     if (end == -1) end = len;
     mrb_sym id = mrb_intern(mrb, ptr+off, end-off);
-    mod = mrb_const_get_sym(mrb, mod, id);
+    mod = const_get_sym(mrb, mod, id, inherit, off == 0);
     if (end == len)
       off = end;
     else {
       off = end + 2;
       if (off == len) {         /* trailing "::" */
         mrb_name_error(mrb, id, "wrong constant name '%v'", path);
+      }
+      if (!mrb_class_p(mod) && !mrb_module_p(mod) && !mrb_sclass_p(mod)) {
+        mrb_raisef(mrb, E_TYPE_ERROR, "%v does not refer to class/module", path);
       }
     }
   }
@@ -4579,17 +4867,72 @@ mrb_mod_remove_const(mrb_state *mrb, mrb_value mod)
   if (mrb_undef_p(val)) {
     mrb_name_error(mrb, id, "constant %n not defined", id);
   }
+  /* a constant set again under the name starts with no marks */
+  mrb_const_flags_set(mrb, mrb_class_ptr(mod), id, MRB_CONST_PRIVATE|MRB_CONST_DEPRECATED, FALSE);
+  /* a pending autoload goes with nothing to show for it */
+  if (mrb_autoload_p(val)) return mrb_nil_value();
   return val;
+}
+
+/*
+ *  call-seq:
+ *     mod.autoload(const, path)   -> nil
+ *
+ *  Registers `path` to be required, with Kernel#require, the first time
+ *  `const` is looked up in `mod`.  A constant already defined is left
+ *  alone.
+ *
+ *     module A
+ *       autoload :B, "a/b"
+ *     end
+ *     A::B   # requires "a/b" first
+ */
+static mrb_value
+mrb_mod_autoload(mrb_state *mrb, mrb_value mod)
+{
+  mrb_sym id;
+  mrb_value path;
+
+  mrb_get_args(mrb, "nS", &id, &path);
+  mrb_int len;
+  const char *name = mrb_sym_name_len(mrb, id, &len);
+  if (!mrb_const_name_p(mrb, name, len)) {
+    mrb_name_error(mrb, id, "autoload must be constant name: %n", id);
+  }
+  if (RSTRING_LEN(path) == 0) {
+    mrb_raise(mrb, E_ARGUMENT_ERROR, "empty feature name");
+  }
+  mrb_check_frozen(mrb, mrb_obj_ptr(mod));
+  mrb_autoload_define(mrb, mrb_class_ptr(mod), id, path);
+  return mrb_nil_value();
+}
+
+/*
+ *  call-seq:
+ *     mod.autoload?(const, inherit = true)   -> String or nil
+ *
+ *  Returns the path registered with Module#autoload for `const` in `mod`,
+ *  or in its ancestors when `inherit`, while it is still to be loaded; nil
+ *  otherwise.
+ */
+static mrb_value
+mrb_mod_autoload_p(mrb_state *mrb, mrb_value mod)
+{
+  mrb_sym id;
+  mrb_bool inherit = TRUE;
+
+  mrb_get_args(mrb, "n|b", &id, &inherit);
+  return mrb_autoload_path(mrb, mrb_class_ptr(mod), id, inherit);
 }
 
 mrb_value
 mrb_const_missing(mrb_state *mrb, mrb_value mod, mrb_sym sym)
 {
   if (mrb_class_real(mrb_class_ptr(mod)) != mrb->object_class) {
-    mrb_name_error(mrb, sym, "uninitialized constant %v::%n", mod, sym);
+    mrb_name_error_recv(mrb, sym, mod, "uninitialized constant %v::%n", mod, sym);
   }
   else {
-    mrb_name_error(mrb, sym, "uninitialized constant %n", sym);
+    mrb_name_error_recv(mrb, sym, mod, "uninitialized constant %n", sym);
   }
   /* not reached */
   return mrb_nil_value();
@@ -4684,14 +5027,15 @@ mrb_method_added(mrb_state *mrb, struct RClass *c, mrb_sym mid)
   }
 }
 
-static mrb_value
-define_method_m(mrb_state *mrb, struct RClass *c, int vis)
+/* The body Module#define_method is given, as a method body: the Proc
+   argument or the block, copied and made strict. */
+static struct RProc*
+define_method_proc(mrb_state *mrb, mrb_sym *mid)
 {
-  mrb_sym mid;
   mrb_value proc = mrb_undef_value();
   mrb_value blk;
 
-  mrb_get_args(mrb, "n|o&", &mid, &proc, &blk);
+  mrb_get_args(mrb, "n|o&", mid, &proc, &blk);
   switch (mrb_type(proc)) {
     case MRB_TT_PROC:
       blk = proc;
@@ -4717,28 +5061,39 @@ define_method_m(mrb_state *mrb, struct RClass *c, int vis)
   struct RProc *p = MRB_OBJ_ALLOC(mrb, MRB_TT_PROC, mrb->proc_class);
   mrb_proc_copy(mrb, p, mrb_proc_ptr(blk));
   p->flags |= MRB_PROC_STRICT;
+  return p;
+}
 
-  mrb_method_t m;
-  MRB_METHOD_FROM_PROC(m, p);
+/* Defines `m` as `mid` on `c` the way Module#define_method does once it has
+   a body: with the visibility the caller's scope gives it, so that a
+   `private` or `module_function` written in the class body reaches it as it
+   would a `def` there, and announced through method_added. */
+void
+mrb_mod_define_method_scoped(mrb_state *mrb, struct RClass *c, mrb_sym mid, mrb_method_t m)
+{
+  mrb_bool modfunc;
+  int vis = caller_scope_visibility(mrb, c, &modfunc);
+
   MRB_METHOD_SET_VISIBILITY(m, vis);
   mrb_define_method_raw(mrb, c, mid, m);
   mrb_method_added(mrb, c, mid);
-  return mrb_symbol_value(mid);
+  if (modfunc) {
+    /* the copy is made of what the name now resolves to, as the copy
+       `module_function :name` makes is */
+    define_modfunc_copy(mrb, c, mid, mrb_method_search(mrb, c, mid));
+  }
 }
 
 mrb_value
 mrb_mod_define_method_m(mrb_state *mrb, struct RClass *c)
 {
-  mrb_bool modfunc;
-  int vis = caller_scope_visibility(mrb, c, &modfunc);
-  mrb_value name = define_method_m(mrb, c, vis);
-  if (modfunc) {
-    /* the copy is made of what the name now resolves to, as the copy
-       `module_function :name` makes is */
-    mrb_sym mid = mrb_symbol(name);
-    define_modfunc_copy(mrb, c, mid, mrb_method_search(mrb, c, mid));
-  }
-  return name;
+  mrb_sym mid;
+  struct RProc *p = define_method_proc(mrb, &mid);
+  mrb_method_t m;
+
+  MRB_METHOD_FROM_PROC(m, p);
+  mrb_mod_define_method_scoped(mrb, c, mid, m);
+  return mrb_symbol_value(mid);
 }
 
 static mrb_value
@@ -4750,7 +5105,15 @@ mod_define_method(mrb_state *mrb, mrb_value self)
 static mrb_value
 top_define_method(mrb_state *mrb, mrb_value self)
 {
-  return define_method_m(mrb, mrb->object_class, MRB_METHOD_PRIVATE_FL);
+  mrb_sym mid;
+  struct RProc *p = define_method_proc(mrb, &mid);
+  mrb_method_t m;
+
+  MRB_METHOD_FROM_PROC(m, p);
+  MRB_METHOD_SET_VISIBILITY(m, MRB_METHOD_PRIVATE_FL);
+  mrb_define_method_raw(mrb, mrb->object_class, mid, m);
+  mrb_method_added(mrb, mrb->object_class, mid);
+  return mrb_symbol_value(mid);
 }
 
 static mrb_value
@@ -4794,15 +5157,14 @@ mrb_mod_module_function(mrb_state *mrb, mrb_value mod)
       MRB_CI_SET_VISIBILITY(ci, MRB_METHOD_PRIVATE_FL >> 25);
       MRB_CI_SET_MODFUNC(ci);
     }
-    return mod;
+    return mrb_nil_value();
   }
 
   struct RClass *rclass = mrb_class_ptr(mod);
   int ai = mrb_gc_arena_save(mrb);
   for (int i=0; i<argc; i++) {
-    mrb_check_type(mrb, argv[i], MRB_TT_SYMBOL);
-
-    mrb_sym mid = mrb_symbol(argv[i]);
+    /* a Symbol or a String, as in CRuby */
+    mrb_sym mid = mrb_obj_to_sym(mrb, argv[i]);
     mrb_method_t m = mrb_method_search(mrb, rclass, mid);
 
     prepare_singleton_class(mrb, (struct RBasic*)rclass);
@@ -4814,7 +5176,7 @@ mrb_mod_module_function(mrb_state *mrb, mrb_value mod)
     mrb_gc_arena_restore(mrb, ai);
   }
 
-  return mod;
+  return visibility_result(mrb, argv, argc);
 }
 
 static struct RClass*
@@ -4839,6 +5201,7 @@ mrb_singleton_class_clone(mrb_state *mrb, mrb_value obj)
     clone->super = klass->super;
     if (klass->iv) {
       mrb_iv_copy(mrb, mrb_obj_value(clone), mrb_obj_value(klass));
+      mrb_const_flags_copy(mrb, clone, klass);
       mrb_obj_iv_set(mrb, (struct RObject*)clone, MRB_SYM(__attached__), obj);
     }
     if (klass->mt) {
@@ -4900,14 +5263,27 @@ init_copy(mrb_state *mrb, mrb_value dest, mrb_value obj)
     case MRB_TT_MODULE:
       copy_class(mrb, dest, obj);
       mrb_iv_copy(mrb, dest, obj);
+      mrb_const_flags_copy(mrb, mrb_class_ptr(dest), mrb_class_ptr(obj));
       mrb_iv_remove(mrb, dest, MRB_SYM(__classname__));
       break;
     case MRB_TT_OBJECT:
     case MRB_TT_SCLASS:
     case MRB_TT_HASH:
     case MRB_TT_CDATA:
-    case MRB_TT_EXCEPTION:
       mrb_iv_copy(mrb, dest, obj);
+      break;
+    case MRB_TT_EXCEPTION:
+      {
+        struct RException *d = mrb_exc_ptr(dest);
+        struct RException *s = mrb_exc_ptr(obj);
+
+        mrb_iv_copy(mrb, dest, obj);
+        /* the message and the backtrace live outside the instance variables */
+        d->mesg = s->mesg;
+        d->backtrace = s->backtrace;
+        if (d->mesg) mrb_field_write_barrier(mrb, (struct RBasic*)d, d->mesg);
+        if (d->backtrace) mrb_field_write_barrier(mrb, (struct RBasic*)d, d->backtrace);
+      }
       break;
     case MRB_TT_ISTRUCT:
       mrb_istruct_copy(dest, obj);
@@ -4938,6 +5314,11 @@ init_copy(mrb_state *mrb, mrb_value dest, mrb_value obj)
 
     default:
       break;
+  }
+  if (!mrb_obj_iv_slot_p(mrb_unboxed_type(obj))) {
+    /* a String, Array, Range, ... keeps its instance variables in a side
+       table; the copy takes them as an Object's copy does */
+    mrb_iv_copy(mrb, dest, obj);
   }
   if (!mrb_func_basic_p(mrb, dest, MRB_SYM(initialize_copy), mrb_obj_init_copy)) {
     mrb_funcall_argv(mrb, dest, MRB_SYM(initialize_copy), 1, &obj);
@@ -5082,7 +5463,7 @@ mrb_value mrb_obj_id_m(mrb_state *mrb, mrb_value self);
 mrb_noreturn void
 mrb_method_missing(mrb_state *mrb, mrb_sym name, mrb_value self, mrb_value args)
 {
-  mrb_no_method_error(mrb, name, args, "undefined method '%n' for %T", name, self);
+  mrb_no_method_error_recv(mrb, name, self, args, "undefined method '%n' for %T", name, self);
 }
 
 /* 15.3.1.3.30 */
@@ -5224,15 +5605,21 @@ MRB_YK_STATIC const mrb_mt_entry mod_rom_entries[] = {
   MRB_MT_ENTRY(mrb_mod_attr_accessor,   MRB_SYM(attr_accessor),    MRB_ARGS_ANY()),                    /* 15.2.2.4.12 */
   MRB_MT_ENTRY(mrb_mod_attr_reader,     MRB_SYM(attr_reader),      MRB_ARGS_ANY()),                    /* 15.2.2.4.13 */
   MRB_MT_ENTRY(mrb_mod_attr_writer,     MRB_SYM(attr_writer),      MRB_ARGS_ANY()),                    /* 15.2.2.4.14 */
+  MRB_MT_ENTRY(mrb_mod_autoload,        MRB_SYM(autoload),         MRB_ARGS_REQ(2)),
+  MRB_MT_ENTRY(mrb_mod_autoload_p,      MRB_SYM_Q(autoload),       MRB_ARGS_ARG(1,1)),
   MRB_MT_ENTRY(mrb_mod_module_eval,     MRB_SYM(class_eval),       MRB_ARGS_ANY()),                    /* 15.2.2.4.15 */
   MRB_MT_ENTRY(mrb_do_nothing,          MRB_SYM(const_added),      MRB_ARGS_REQ(1) | MRB_MT_PRIVATE),
   MRB_MT_ENTRY(mrb_mod_const_defined,   MRB_SYM_Q(const_defined),  MRB_ARGS_ARG(1,1)),                 /* 15.2.2.4.20 */
-  MRB_MT_ENTRY(mrb_mod_const_get,       MRB_SYM(const_get),        MRB_ARGS_REQ(1)),                   /* 15.2.2.4.21 */
+  MRB_MT_ENTRY(mrb_mod_const_get,       MRB_SYM(const_get),        MRB_ARGS_ARG(1,1)),                 /* 15.2.2.4.21 */
   MRB_MT_ENTRY(mrb_mod_const_missing,   MRB_SYM(const_missing),    MRB_ARGS_REQ(1)),
   MRB_MT_ENTRY(mrb_mod_const_set,       MRB_SYM(const_set),        MRB_ARGS_REQ(2)),                   /* 15.2.2.4.23 */
   MRB_MT_ENTRY(mod_define_method,       MRB_SYM(define_method),    MRB_ARGS_ARG(1,1)),
+  MRB_MT_ENTRY(mrb_mod_deprecate_constant, MRB_SYM(deprecate_constant), MRB_ARGS_ANY()),
   MRB_MT_ENTRY(mrb_mod_dup,             MRB_SYM(dup),              MRB_ARGS_NONE()),
   MRB_MT_ENTRY(mrb_do_nothing,          MRB_SYM(extended),         MRB_ARGS_REQ(1) | MRB_MT_PRIVATE),  /* 15.2.2.4.26 */
+  MRB_MT_ENTRY(mrb_mod_extend_object,   MRB_SYM(extend_object),    MRB_ARGS_REQ(1) | MRB_MT_PRIVATE),
+  MRB_MT_ENTRY(mrb_mod_append_features, MRB_SYM(append_features),  MRB_ARGS_REQ(1) | MRB_MT_PRIVATE),
+  MRB_MT_ENTRY(mrb_mod_prepend_features, MRB_SYM(prepend_features), MRB_ARGS_REQ(1) | MRB_MT_PRIVATE),
   MRB_MT_ENTRY(mrb_mod_include,         MRB_SYM(include),          MRB_ARGS_ANY()),                    /* 15.2.2.4.27 */
   MRB_MT_ENTRY(mrb_mod_include_p,       MRB_SYM_Q(include),        MRB_ARGS_REQ(1)),                   /* 15.2.2.4.28 */
   MRB_MT_ENTRY(mrb_do_nothing,          MRB_SYM(included),         MRB_ARGS_REQ(1) | MRB_MT_PRIVATE),  /* 15.2.2.4.29 */
@@ -5247,8 +5634,12 @@ MRB_YK_STATIC const mrb_mt_entry mod_rom_entries[] = {
   MRB_MT_ENTRY(mrb_mod_prepend,         MRB_SYM(prepend),          MRB_ARGS_ANY()),
   MRB_MT_ENTRY(mrb_do_nothing,          MRB_SYM(prepended),        MRB_ARGS_REQ(1) | MRB_MT_PRIVATE),
   MRB_MT_ENTRY(mrb_mod_private,         MRB_SYM(private),          MRB_ARGS_ANY() | MRB_MT_PRIVATE),   /* 15.2.2.4.36 */
+  MRB_MT_ENTRY(mrb_mod_private_class_method, MRB_SYM(private_class_method), MRB_ARGS_ANY()),
+  MRB_MT_ENTRY(mrb_mod_private_constant, MRB_SYM(private_constant), MRB_ARGS_ANY()),
   MRB_MT_ENTRY(mrb_mod_protected,       MRB_SYM(protected),        MRB_ARGS_ANY() | MRB_MT_PRIVATE),   /* 15.2.2.4.37 */
   MRB_MT_ENTRY(mrb_mod_public,          MRB_SYM(public),           MRB_ARGS_ANY() | MRB_MT_PRIVATE),   /* 15.2.2.4.38 */
+  MRB_MT_ENTRY(mrb_mod_public_class_method, MRB_SYM(public_class_method), MRB_ARGS_ANY()),
+  MRB_MT_ENTRY(mrb_mod_public_constant, MRB_SYM(public_constant), MRB_ARGS_ANY()),
   MRB_MT_ENTRY(mrb_mod_remove_const,    MRB_SYM(remove_const),     MRB_ARGS_REQ(1) | MRB_MT_PRIVATE),  /* 15.2.2.4.40 */
   MRB_MT_ENTRY(mrb_mod_to_s,            MRB_SYM(to_s),             MRB_ARGS_NONE()),
   MRB_MT_ENTRY(mrb_mod_undef,           MRB_SYM(undef_method),     MRB_ARGS_ANY()),                    /* 15.2.2.4.41 */

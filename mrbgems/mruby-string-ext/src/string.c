@@ -726,11 +726,12 @@ str_hex(mrb_state *mrb, mrb_value self)
   return mrb_str_to_integer(mrb, self, 16, FALSE);
 }
 
-/* Internal helper for String#oct - converts octal string to integer */
+/* Internal helper for String#oct - converts octal string to integer; a
+   negative base honors a 0b, 0o, 0d or 0x prefix, as CRuby's oct does */
 static mrb_value
 str_oct(mrb_state *mrb, mrb_value self)
 {
-  return mrb_str_to_integer(mrb, self, 8, FALSE);
+  return mrb_str_to_integer(mrb, self, -8, FALSE);
 }
 
 /*
@@ -1662,6 +1663,7 @@ str_uplus(mrb_state *mrb, mrb_value str)
 /*
  * call-seq:
  *   -string -> frozen_string
+ *   string.dedup -> frozen_string
  *
  * Returns `self` if `self` is already frozen.
  *
@@ -2462,7 +2464,9 @@ str_insert(mrb_state *mrb, mrb_value self)
 
   char *p = RSTRING_PTR(self);
   memmove(p + idx + insert_len, p + idx, self_len - idx);
-  memcpy(p + idx, RSTRING_PTR(str_to_insert), insert_len);
+  /* The receiver inserted into itself is read from the same buffer, and the
+     bytes it is copied over are its own, so the two ranges overlap. */
+  memmove(p + idx, RSTRING_PTR(str_to_insert), insert_len);
   str_mark_spliced_bytes(self, str_to_insert);
 
   return self;
@@ -2586,6 +2590,7 @@ MRB_YK_STATIC const mrb_mt_entry string_ext_rom_entries[] = {
   MRB_MT_ENTRY(str_casecmp_p,       MRB_SYM_Q(casecmp),       MRB_ARGS_REQ(1)),
   MRB_MT_ENTRY(str_uplus,           MRB_OPSYM(plus),          MRB_ARGS_NONE()),
   MRB_MT_ENTRY(str_uminus,          MRB_OPSYM(minus),         MRB_ARGS_NONE()),
+  MRB_MT_ENTRY(str_uminus,          MRB_SYM(dedup),           MRB_ARGS_NONE()),
   MRB_MT_ENTRY(str_ascii_only_p,    MRB_SYM_Q(ascii_only),    MRB_ARGS_NONE()),
   MRB_MT_ENTRY(str_b,               MRB_SYM(b),               MRB_ARGS_NONE()),
   MRB_MT_ENTRY(str_lines,           MRB_SYM(__lines),         MRB_ARGS_NONE()),

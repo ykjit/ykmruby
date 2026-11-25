@@ -13,7 +13,8 @@
 #include "mrc_pool.h"
 
 #if defined(MRC_TARGET_MRUBY)
-extern mrb_state *global_mrb; /* defined in mruby-compiler (ccontext.c) */
+#include <mruby/error.h>
+extern MRC_THREAD_LOCAL mrb_state *global_mrb; /* defined in mruby-compiler (ccontext.c) */
 #else
 #define global_mrb NULL
 #endif
@@ -67,6 +68,24 @@ mrb_free(mrb_state* mrb, void *p)
 {
   free(p);
 }
+
+#if defined(MRC_TARGET_MRUBY)
+/* mruby-compiler catches a raise from mrb_malloc() with mrb_protect_error()
+   where it has an mrb_state to raise on. mrbc compiles without one, so the
+   two are never reached here and are defined for the link alone. */
+mrb_value
+mrb_protect_error(mrb_state *mrb, mrb_protect_error_func *body, void *userdata, mrb_bool *error)
+{
+  if (error) *error = FALSE;
+  return body(mrb, userdata);
+}
+
+void
+mrb_exc_raise(mrb_state *mrb, mrb_value exc)
+{
+  abort();
+}
+#endif
 
 /*
 * Workaround: even if PICORB_NO_LIBC_ALLOC is defined, we use libc's alloc functions

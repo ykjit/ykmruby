@@ -272,18 +272,24 @@ rational_new_b(mrb_state *mrb, mrb_value n, mrb_value d)
   d = mrb_bint_mul(mrb, d, ONE);
   struct RClass *c = mrb_class_get_id(mrb, MRB_SYM(Rational));
   struct RBasic *rat;
-  struct mrb_rational *p = rat_alloc(mrb, c, &rat);
   if (!mrb_bigint_p(n) && !mrb_bigint_p(d)) {
     /* both halves fit mrb_int: store the same layout mrb_rational_new()
        would, so this value hashes the same as one built from fixnums */
+    struct mrb_rational *p = rat_alloc(mrb, c, &rat);
     p->numerator = mrb_integer(n);
     p->denominator = mrb_integer(d);
     rat->frozen = 1;
     return mrb_obj_value(rat);
   }
+  /* Box a half that fits mrb_int before the Rational is allocated, not
+     after: a GC run by that allocation can leave the Rational old, and a
+     young half stored into it has no barrier to keep it alive. */
+  n = mrb_as_bint(mrb, n);
+  d = mrb_as_bint(mrb, d);
+  struct mrb_rational *p = rat_alloc(mrb, c, &rat);
   rat->flags |= RAT_BIGINT;
-  p->b.num = (struct RBasic*)mrb_obj_ptr(mrb_as_bint(mrb, n));
-  p->b.den = (struct RBasic*)mrb_obj_ptr(mrb_as_bint(mrb, d));
+  p->b.num = (struct RBasic*)mrb_obj_ptr(n);
+  p->b.den = (struct RBasic*)mrb_obj_ptr(d);
   rat->frozen = 1;
   return mrb_obj_value(rat);
 }
@@ -395,7 +401,8 @@ rational_new_f(mrb_state *mrb, mrb_float f)
   else if (exp < 0) {
     /* exp is negative, so we need to multiply denominator by 2^(-exp) */
     int neg_exp = -exp;
-    if (neg_exp >= MRB_INT_BIT - 1 || mrb_int_mul_overflow(deno, ((mrb_int)1)<<neg_exp, &deno)) {
+    mrb_int temp;
+    if (neg_exp >= MRB_INT_BIT - 1 || mrb_int_mul_overflow(deno, ((mrb_int)1)<<neg_exp, &temp)) {
 #ifndef RAT_BIGINT
       rat_overflow(mrb);
 #else
@@ -403,6 +410,7 @@ rational_new_f(mrb_state *mrb, mrb_float f)
       return rational_new_b(mrb, mrb_bint_new_int(mrb, nume), d);
 #endif
     }
+    deno = temp;
   }
   return rational_new_i(mrb, nume, deno);
 }
@@ -592,6 +600,9 @@ rational_new(mrb_state *mrb, mrb_value a, mrb_value b)
   else {
     mrb_float x = mrb_as_float(mrb, a);
     mrb_float y = mrb_as_float(mrb, b);
+    /* a zero denominator is a ZeroDivisionError, as with Integers, and
+       never reaches the division */
+    if (y == 0.0) rat_zerodiv(mrb);
     return rational_new_f(mrb, x/y);
   }
 #endif

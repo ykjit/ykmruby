@@ -195,3 +195,64 @@ assert('a `def` in a method written in a block given to class_exec or module_exe
   assert_true Class.new { include m }.new.respond_to?(:from_direct)
   assert_false Object.new.respond_to?(:from_direct, true)
 end
+
+assert('Module#< and friends with singleton classes') do
+  m = Module.new
+  o = Object.new
+  sc = class << o; self; end
+  assert_nil sc < m
+  o.extend m
+  assert_true sc < m
+  assert_true sc <= m
+  assert_false m < sc
+  assert_true m > sc
+  assert_equal(-1, sc <=> m)
+  string_sc = class << String; self; end
+  object_sc = class << Object; self; end
+  assert_true string_sc < Class
+  assert_true string_sc < object_sc
+  assert_nil Comparable <=> string_sc
+end
+
+assert 'Module#set_temporary_name' do
+  m = Module.new
+  assert_same m, m.set_temporary_name("fake_name")
+  assert_equal "fake_name", m.name
+  assert_equal "fake_name", m.to_s
+  assert_equal "fake_name", m.inspect
+  assert_true m.name.frozen?
+
+  c = Class.new
+  c.set_temporary_name("again")
+  assert_equal "again", c.name
+  c.set_temporary_name(nil)
+  assert_nil c.name
+  assert_equal "#<Class:", c.to_s[0, 8]
+end
+
+assert 'Module#set_temporary_name gives way to a constant' do
+  m = Module.new
+  m.set_temporary_name("fake_outer")
+  m::Inner = Class.new
+  m::Inner.set_temporary_name("fake_inner")
+  assert_equal "fake_inner", m::Inner.name
+
+  # a constant gives the module and what is in it permanent names
+  ModuleTestTemporaryName = m
+  assert_equal "ModuleTestTemporaryName", m.name
+  assert_equal "ModuleTestTemporaryName", m.to_s
+  assert_equal "ModuleTestTemporaryName::Inner", m::Inner.name
+  assert_equal "ModuleTestTemporaryName::Inner", m::Inner.inspect
+  assert_raise(RuntimeError) { m.set_temporary_name("other") }
+  assert_raise(RuntimeError) { m::Inner.set_temporary_name("other") }
+end
+
+assert 'Module#set_temporary_name checks the name' do
+  m = Module.new
+  assert_raise(ArgumentError) { m.set_temporary_name("") }
+  assert_raise(ArgumentError) { m.set_temporary_name("Foo") }
+  assert_raise(ArgumentError) { m.set_temporary_name("Foo::Bar") }
+  assert_raise(TypeError) { m.set_temporary_name(:sym) }
+  assert_equal "foo::Bar", m.set_temporary_name("foo::Bar").name
+  assert_raise(RuntimeError) { String.set_temporary_name("str") }
+end

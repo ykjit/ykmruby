@@ -17,6 +17,35 @@ assert('String#%') do
   assert_equal "0012345.12", "%010.2f" % 12345.1234
 end
 
+assert('String#% with the 0 flag and a sign') do
+  skip unless Object.const_defined?(:Float)
+  assert_equal "-001.500", "%08.3f" % -1.5
+  assert_equal "+001.500", "%+08.3f" % 1.5
+  assert_equal " 001.500", "% 08.3f" % 1.5
+  assert_equal "-1.500", "%05.3f" % -1.5
+  assert_equal "-1.5", "%0.1f" % -1.5
+  assert_equal "-01.50e+00", "%010.2e" % -1.5
+  assert_equal "-00001.5", "%08.3g" % -1.5
+  assert_equal "-1.500  ", "%-08.3f" % -1.5
+end
+
+assert('String#% with the 0 flag and a leading 9') do
+  skip unless Object.const_defined?(:Float)
+  assert_equal "009.5", "%05.1f" % 9.5
+  assert_equal "-009.5", "%06.1f" % -9.5
+  assert_equal "+009.5", "%+06.1f" % 9.5
+  assert_equal "009.50e+00", "%010.2e" % 9.5
+  assert_equal "0099.5", "%06g" % 99.5
+end
+
+assert('String#% %#g of zero keeps the decimal point') do
+  skip unless Object.const_defined?(:Float)
+  assert_equal "0.", "%#.0g" % 0.0
+  assert_equal "0.", "%#.1g" % 0.0
+  assert_equal "  -0.", "%#5.1g" % -0.0
+  assert_equal "0.0", "%#.2g" % 0.0
+end
+
 assert('String#% with inf') do
   skip unless Object.const_defined?(:Float)
   inf = Float::INFINITY
@@ -77,6 +106,70 @@ end
 
 assert("String#% %b") do
   assert_equal("..10115", "%0b5" % -5)
+end
+
+assert("String#% %x, %o and %b of a negative number and with a sign flag") do
+  assert_equal("..F01", "%X" % -255)
+  assert_equal("0X..F01", "%#X" % -255)
+  assert_equal("..1011", "%B" % -5)
+  assert_equal("+FF", "%+X" % 255)
+  assert_equal("-FF", "%+X" % -255)
+  assert_equal("+ff", "%+x" % 255)
+  assert_equal(" 101", "% b" % 5)
+  assert_equal("-10", "% o" % -8)
+end
+
+assert("String#% pads the two's complement of a negative number") do
+  assert_equal("     ..f", "%8x" % -1)
+  assert_equal("..ffffff", "%08x" % -1)
+  assert_equal("..ffffffffff", "%.12x" % -1)
+  assert_equal("   0x..f", "%#8x" % -1)
+  assert_equal("0x..f   ", "%-#8.3x" % -1)
+  assert_equal("0X..FF01", "%#08X" % -255)
+  assert_equal("..770", "%#.5o" % -8)
+  assert_equal("..110   ", "%-8.5B" % -2)
+  assert_equal("..f0", "%.3x" % -16)
+  assert_equal("0x..f0", "%#x" % -16)
+end
+
+assert("String#% %o keeps a leading 1 or 3 digit of a negative number") do
+  assert_equal("..71", "%o" % -7)
+  assert_equal("..710", "%o" % -56)
+  assert_equal("..7177777777", "%o" % -100663297)
+  assert_equal("..70", "%o" % -8)
+  assert_equal("..7", "%o" % -1)
+end
+
+assert("String#% %o keeps other leading digits of a negative big integer") do
+  begin
+    big = 1 << 93
+  rescue RangeError
+    skip 'requires mruby-bigint'
+  end
+  assert_equal("..767777777777777777777777777777770", "%o" % (-big - 8))
+end
+
+assert("String#% %o keeps the sign digits of a big integer's two's complement") do
+  begin
+    big = 3 << 62
+  rescue RangeError
+    skip 'requires mruby-bigint'
+  end
+  assert_equal("..76400000000000000000000", "%o" % -big)
+  assert_equal("..7777776400000000000000000000", "%.30o" % -big)
+end
+
+assert("String#% %d of a big integer with a sign") do
+  k = 70
+  begin
+    big = 1 << k
+  rescue RangeError
+    skip 'requires mruby-bigint'
+  end
+  assert_equal("-00000001180591620717411303424", "%030d" % -big)
+  assert_equal("+1180591620717411303424", "%+d" % big)
+  assert_equal(" 1180591620717411303424", "% d" % big)
+  assert_equal("-0001180591620717411303424", "%.25d" % -big)
 end
 
 assert("String#% %d") do
@@ -257,4 +350,52 @@ assert('sprintf - the widths a buffer can still be asked for keep working') do
   assert_equal 1000, sprintf("%1000d", 7).size
   assert_equal 500, sprintf("%500s", "x").size
   assert_equal "     1.000000", sprintf("%13f", 1.0) if Object.const_defined?(:Float)
+end
+
+assert('sprintf("%*") takes a width or precision only as an int') do
+  # The value was cut to int before it was checked, so 2**32 + 3 was read as
+  # 3. Computed rather than written out, as above, for MRB_INT32 builds.
+  shift = 32
+  big = begin
+    (1 << shift) + 3
+  rescue RangeError
+    nil
+  end
+  skip "no integer past 32 bits" unless big
+  # RangeError where the value is a big integer rather than an mrb_int
+  assert_raise(ArgumentError, RangeError) { sprintf("%*d", big, 7) }
+  assert_raise(ArgumentError, RangeError) { sprintf("%*d", -big, 7) }
+  assert_raise(ArgumentError, RangeError) { sprintf("%.*d", big, 7) }
+  assert_raise(ArgumentError, RangeError) { sprintf("%.*d", -big, 7) }
+  assert_raise(ArgumentError, RangeError) { sprintf("%.*s", big, "abcdef") }
+end
+
+assert('sprintf("%.*") ignores the smallest negative precision') do
+  # an ignored precision kept its value, and the ".." of a negative number
+  # took 3 from it
+  int_min = -(1 << 30) * 2
+  assert_equal "..f", sprintf("%.*x", int_min, -1)
+  assert_equal "..f", sprintf("%.*x", -1, -1)
+end
+
+assert('sprintf keeps the result it builds out of a callback\'s reach') do
+  # A %s argument's to_s could find the half-built result through ObjectSpace
+  # and replace its buffer with a smaller one, which the next write overran.
+  skip unless Object.const_defined?(:ObjectSpace)
+  other = "B" * 32
+  evil = Object.new
+  def evil.other=(o)
+    @other = o
+  end
+  def evil.to_s
+    o = @other
+    ObjectSpace.each_object(String) do |s|
+      s.replace(o) if s.empty? && !s.frozen? && !s.equal?(o)
+    end
+    "C" * 64
+  end
+  evil.other = other
+  assert_equal "A" * 40 + "C" * 64, sprintf("A" * 40 + "%s", evil)
+  assert_equal "B" * 32, other
+  assert_equal String, sprintf("%s", 1).class
 end

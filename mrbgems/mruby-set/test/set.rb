@@ -71,6 +71,80 @@ assert("Set#dup") do
   assert_equal(Set[1,2], set2)
 end
 
+assert("Set#initialize_copy keeps the elements of an old receiver alive") do
+  # An old receiver takes young elements in one copy; without a barrier the
+  # next minor GCs free them while the receiver still holds them.
+  origin = [GC.generational_mode, GC.interval_ratio]
+  begin
+    GC.generational_mode = true
+    # A minor GC every GC_STEP_SIZE allocations, in a heap with many more
+    # free slots than that: a small heap runs out first, and the full GC that
+    # reclaims it marks the receiver. Pages stay while any slot is live, so
+    # one object kept in sixteen holds a heap grown with the GC off.
+    GC.interval_ratio = 100
+    GC.disable
+    ballast = Array.new(8192) { |i| s = "b" * 30; s if i % 8 == 0 }
+    GC.enable
+    copy_young = ->(t, n) {
+      s = Set.new
+      n.times { |i| s << "value#{i}" * 4 }
+      t.__send__(:initialize_copy, s)
+    }
+    target = Set.new
+    GC.start
+    copy_young.(target, 20)
+    100_000.times { "garbage" * 4 }
+    assert_equal 20, target.size
+    20.times { |i| assert_include target.to_a, "value#{i}" * 4 }
+    assert_equal 8192, ballast.size
+  ensure
+    GC.enable
+    GC.generational_mode, GC.interval_ratio = origin
+  end
+end
+
+assert("Set#^ keeps the elements of a result its initialize made old") do
+  # Set#^ copies the receiver into a new result in one go; a subclass's
+  # initialize can run GC and leave that result old, so without a barrier the
+  # next minor GCs free the copied elements while the result holds them.
+  origin = [GC.generational_mode, GC.interval_ratio]
+  klass = Class.new(Set) do
+    def initialize(*a)
+      super
+      h = $set_xor_hook
+      $set_xor_hook = nil
+      h.call if h
+    end
+  end
+  begin
+    GC.generational_mode = true
+    GC.interval_ratio = 100
+    GC.disable
+    ballast = Array.new(8192) { |i| s = "b" * 30; s if i % 8 == 0 }
+    GC.enable
+    recv = klass.new
+    recv << 0
+    other = klass.new
+    $set_xor_hook = -> {
+      GC.start
+      young = klass.new
+      20.times { |i| young << "value#{i}" * 4 }
+      recv.__send__(:initialize_copy, young)
+      young.clear
+    }
+    result = recv ^ other
+    recv.clear
+    100_000.times { "garbage" * 4 }
+    assert_equal 20, result.size
+    20.times { |i| assert_include result.to_a, "value#{i}" * 4 }
+    assert_equal 8192, ballast.size
+  ensure
+    $set_xor_hook = nil
+    GC.enable
+    GC.generational_mode, GC.interval_ratio = origin
+  end
+end
+
 assert("Set#size") do
   assert_equal(0, Set[].size)
   assert_equal(1, Set[nil].size)
@@ -659,39 +733,6 @@ assert("Set#divide") do
   # assert_equal(Set, ret.class)
 end
 
-# freeze is not implemented yet
-#assert("freeze") do
-#  orig = set = Set[1,2,3]
-#  assert_equal false, set.frozen?
-#  set << 4
-#  assert_same orig, set.freeze
-#  assert_equal true, set.frozen?
-#  assert_raise(RuntimeError) {
-#    set << 5
-#  }
-#  assert_equal 4, set.size
-#end
-#  assert("freeze_dup") do
-#    set1 = Set[1,2,3]
-#    set1.freeze
-#    set2 = set1.dup
-#
-#    assert_not_predicate set2, :frozen?
-#    assert_nothing_raised {
-#      set2.add 4
-#    }
-#  end
-#  assert("reeze_clone") do
-#    set1 = Set[1,2,3]
-#    set1.freeze
-#    set2 = set1.clone
-#
-#    assert_predicate set2, :frozen?
-#    assert_raise(RuntimeError) {
-#      set2.add 5
-#    }
-#  end
-#
 assert("Set#inspect") do
   set = Set[1,1,1]
   assert_equal("Set[1]", set.inspect)
@@ -804,4 +845,89 @@ assert('Set - adding and deleting past the small-table mode') do
   assert_equal 100, s.size
   assert_true s.include?("seed0")
   assert_false s.include?("fresh0")
+end
+
+assert("Set#inspect and Set#join keep the string they build out of reach") do
+  skip unless Object.const_defined?(:ObjectSpace)
+  seen = []
+  w = Class.new do
+    define_method(:inspect) do
+      ObjectSpace.each_object(String) { |o| seen << o }
+      "w"
+    end
+    alias_method :to_s, :inspect
+  end.new
+  s = Set[w].inspect
+  assert_equal "Set[w]", s
+  assert_false seen.any? { |o| o.equal?(s) }
+  seen.clear
+  s = Set[w].join("-")
+  assert_equal "w", s
+  assert_false seen.any? { |o| o.equal?(s) }
+end
+
+assert("Set: instance variables") do
+  c = Class.new(Set) { attr_accessor :tag }
+  s = c.new([1])
+  s.tag = "tag"
+  d = s.dup
+  GC.start
+  assert_equal "tag", s.tag
+  assert_equal "tag", d.tag
+end
+
+assert("Enumerable#to_set") do
+  assert_equal Set[3, 1], [3, 1, 3].to_set
+  assert_equal Set[2, 4, 6], (1..3).to_set { |x| x * 2 }
+  assert_equal Set[[:a, 1]], {a: 1}.to_set
+  assert_kind_of Set, [].to_set
+end
+
+assert("Set#to_set") do
+  s = Set[1, 2]
+  assert_same s, s.to_set
+  assert_equal Set[2, 3], s.to_set { |x| x + 1 }
+  sub = Class.new(Set)
+  t = sub.new([1]).to_set
+  assert_equal Set, t.class
+  assert_equal Set[1], t
+end
+
+assert("Set#dup of an empty Set") do
+  d = Set.new.dup
+  assert_equal Set[:x], d.add(:x)
+  assert_equal Set[:x], Set.new.clone.add(:x)
+  assert_equal Set[:x], Set.new.freeze.dup.add(:x)
+  assert_equal Set[:x], Set.new.freeze + [:x]
+  assert_equal Set[], Set.new.dup
+end
+
+assert("Set refuses changes once frozen") do
+  s = Set[1, 2].freeze
+  [-> { s.add(3) }, -> { s << 3 }, -> { s.add?(3) }, -> { s.delete(1) },
+   -> { s.delete(9) }, -> { s.delete?(1) }, -> { s.clear }, -> { s.merge([3]) },
+   -> { s.merge(Set[]) }, -> { s.subtract(Set[1]) }, -> { s.replace([3]) },
+   -> { s.delete_if { true } }, -> { s.keep_if { false } }, -> { s.map! { _1 } },
+   -> { s.instance_eval { initialize_copy(Set[3]) } }, -> { s.clone.add(3) },
+   -> { Set.new.freeze.clone.add(:x) }, -> { Set[Set[1]].freeze.flatten! }].each do |change|
+    assert_raise(FrozenError) { change.call }
+  end
+  assert_equal Set[1, 2], s
+  # nothing to change: as in CRuby, no refusal
+  assert_nil s.add?(1)
+  assert_nil s.delete?(9)
+  assert_nil s.reject! { false }
+  assert_nil s.flatten!
+  assert_same s, s.delete_if { false }
+  assert_equal Set[1, 2, 3], s.dup.add(3)
+end
+
+assert('symbol GC keeps the symbols in a Set') do
+  stress
+  s = Set["gc-set-element-#{1}".to_sym]
+
+  6000.times { |i| "gc-filler-set-element-#{i}".to_sym }
+  GC.start
+
+  assert_equal ["gc-set-element-1"], s.to_a.map(&:to_s)
 end

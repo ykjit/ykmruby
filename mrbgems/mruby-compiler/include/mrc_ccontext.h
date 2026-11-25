@@ -73,12 +73,11 @@ typedef struct mrc_ccontext {
   mrc_pool *pool; // for codedump
 #endif
 
-  /* The arena everything Prism allocates for this context is taken from, and
-     the arena of the context this one was made inside of, put back when this
-     one is freed. Unused where Prism allocates through libc; see
-     prism_xallocator.h for what the arena is for. */
-  void *prism_arena;
-  void *prism_arena_outer;
+  /* The arena Prism builds the tree of a parse in. Prism 2 takes it from the
+     caller and gives the parser's own state a separate one, so the tree goes
+     back with this arena rather than node by node. Its blocks come from
+     Prism's allocator; see prism_xallocator.h. */
+  pm_arena_t node_arena;
 
   /* How deep the brackets stand where the lexer is, so that a nesting Prism
      would recurse through is refused instead. See src/compile.c. */

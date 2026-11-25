@@ -46,6 +46,12 @@ assert 'Method#arity' do
     def mo6(a, *b, c, &d) end
     def mo7(a, b = nil, *c, d, &e) end
     def ma1((a), &b) nil && a end
+    def mk1(a, k: nil) end
+    def mk2(a, k:) end
+    def mk3(a, **k) end
+    def mk4(*a, k:) end
+    def mk5(k: 1) end
+    def mk6(a, b = 1, k:, j: 2) end
 
     def run
       assert_equal(0, method(:m0).arity)
@@ -59,6 +65,12 @@ assert 'Method#arity' do
       assert_equal(-3, method(:mo6).arity)
       assert_equal(-3, method(:mo7).arity)
       assert_equal(1, method(:ma1).arity)
+      assert_equal(-2, method(:mk1).arity)
+      assert_equal(2, method(:mk2).arity)
+      assert_equal(-2, method(:mk3).arity)
+      assert_equal(-2, method(:mk4).arity)
+      assert_equal(-1, method(:mk5).arity)
+      assert_equal(-3, method(:mk6).arity)
 
       assert_equal(-2, method(:__send__).arity)
       assert_equal(-1, method(:nothing).arity)
@@ -639,4 +651,174 @@ assert 'Method/UnboundMethod on C-defined (native) methods' do
 
   # binding a C UnboundMethod to an incompatible receiver still raises cleanly.
   assert_raise(TypeError) { String.instance_method(:upcase).bind(42) }
+end
+
+assert 'Method#inspect keeps the string it builds out of reach' do
+  # A singleton method's receiver answers to_s while the string is built.
+  skip unless Object.const_defined?(:ObjectSpace)
+  seen = $method_inspect_seen = []
+  o = Object.new
+  def o.to_s
+    ObjectSpace.each_object(String) { |s| $method_inspect_seen << s }
+    "obj"
+  end
+  def o.foo; end
+  s = o.method(:foo).inspect
+  $method_inspect_seen = nil
+  assert_equal "#<Method: obj.foo", s[0, 17]
+  assert_false seen.any? { |x| x.equal?(s) }
+end
+
+assert('Module#public_instance_method') do
+  c = Class.new do
+    def pub; :pub; end
+    def priv; :priv; end
+    private :priv
+    def prot; :prot; end
+    protected :prot
+  end
+  assert_equal :pub, c.public_instance_method(:pub).bind(c.new).call
+  assert_raise(NameError) { c.public_instance_method(:priv) }
+  assert_raise(NameError) { c.public_instance_method(:prot) }
+  assert_raise(NameError) { c.public_instance_method(:missing) }
+end
+
+assert('Module#define_method with a Method or UnboundMethod') do
+  a = Class.new do
+    def orig(x) x * 2 end
+    define_method(:copy, instance_method(:orig))
+    def orig(x) x * 3 end
+  end
+  assert_equal 4, a.new.copy(2)   # the body it was taken with
+  assert_equal 6, a.new.orig(2)
+
+  b = Class.new(a) do
+    define_method(:inherited_copy, a.instance_method(:orig))
+    define_method(:bound_copy, a.new.method(:orig))
+  end
+  assert_equal 6, b.new.inherited_copy(2)
+  assert_equal 6, b.new.bound_copy(2)
+
+  m = Module.new do
+    def from_module; :from_module; end
+  end
+  c = Class.new do
+    define_method(:any_class, m.instance_method(:from_module))
+  end
+  assert_equal :from_module, c.new.any_class
+
+  e = Class.new
+  assert_raise(TypeError) { e.define_method(:push, Array.instance_method(:push)) }
+  assert_raise(TypeError) { e.define_method(:orig, a.new.method(:orig)) }
+  assert_false e.method_defined?(:push)
+  o = Object.new
+  def o.single; :single; end
+  assert_raise(TypeError) { e.define_method(:single, o.method(:single)) }
+  (class << o; self; end).define_method(:single2, o.method(:single))
+  assert_equal :single, o.single2
+
+  assert_raise(TypeError) { Class.new { define_method(:x, 1) } }
+
+  # a method an alias stands for
+  f = Class.new do
+    def orig(x) x * 2 end
+    alias_method :renamed, :orig
+    define_method(:from_alias, instance_method(:renamed))
+    define_method(:from_bound_alias, new.method(:renamed))
+  end
+  assert_equal 8, f.new.from_alias(4)
+  assert_equal 10, f.new.from_bound_alias(5)
+
+  # and a super in it goes on from the class it is defined in
+  g = Class.new { def m; "G"; end }
+  h = Class.new(g) { def m; "H" + super; end }
+  k = Class.new(h) { alias_method :m2, :m; define_method(:m3, instance_method(:m2)) }
+  assert_equal "HHG", k.new.m3
+end
+
+assert('Kernel#define_singleton_method with a Method or UnboundMethod') do
+  skip "no Kernel#define_singleton_method" unless Object.new.respond_to?(:define_singleton_method)
+  a = Class.new do
+    def self.new(*) :custom end
+  end
+  b = Class.new(a)
+  assert_equal :custom, b.new
+  assert_equal :new, b.define_singleton_method(:new, Class.instance_method(:new))
+  assert_kind_of b, b.new
+  assert_equal :custom, a.new
+
+  o = Object.new
+  def o.single; :single; end
+  o.define_singleton_method(:single2, o.method(:single))
+  assert_equal :single, o.single2
+
+  k = Class.new { def hi; :hi; end }
+  k.new.define_singleton_method(:hello, k.instance_method(:hi))
+  assert_raise(TypeError) { Object.new.define_singleton_method(:hello, k.instance_method(:hi)) }
+
+  # a class method named define_method is not what defines it
+  k = Class.new do
+    def self.define_method(*) :taken end
+    def hi; :hi; end
+  end
+  o = k.new
+  assert_equal :hello, o.define_singleton_method(:hello, k.instance_method(:hi))
+  assert_equal :hi, o.hello
+end
+
+assert('Module#define_method with a Method takes the scope visibility') do
+  a = Class.new do
+    def orig; :orig; end
+    private
+    define_method(:priv, instance_method(:orig))
+    public
+    define_method(:pub, instance_method(:orig))
+  end
+  assert_false a.new.respond_to?(:priv)
+  assert_true a.new.respond_to?(:pub)
+  assert_raise(NoMethodError) { a.new.priv }
+  assert_equal :orig, a.new.pub
+  assert_equal :orig, a.new.__send__(:priv)
+end
+
+assert('Module#define_method with a Method and method_added') do
+  $define_method_added = []
+  a = Class.new do
+    def self.method_added(name) $define_method_added << name end
+    def orig; :orig; end
+    define_method(:copy, instance_method(:orig))
+  end
+  assert_equal [:orig, :copy], $define_method_added
+  $define_method_added = nil
+  assert_equal :orig, a.new.copy
+end
+
+assert('Module#define_method with a Proc still works through mruby-method') do
+  a = Class.new do
+    define_method(:one) { 1 }
+    define_method(:two, proc { 2 })
+    private
+    define_method(:three) { 3 }
+  end
+  assert_equal 1, a.new.one
+  assert_equal 2, a.new.two
+  assert_false a.new.respond_to?(:three)
+  assert_raise(ArgumentError) { Class.new { define_method(:x) } }
+end
+
+assert('UnboundMethod#bind_call of a module method goes on from where it was taken') do
+  # [Bug #22505]
+  m = Module.new { def m; [:m, *super]; end }
+  c = Class.new { prepend m; def m; [:c]; end }
+  sc = Class.new(c) { prepend m; def m; [:sc, *super]; end }
+  assert_equal [:m, :c], c.instance_method(:m).bind_call(sc.new)
+  assert_equal [:m, :c], c.instance_method(:m).bind(sc.new).call
+  assert_equal [:m, :sc, :m, :c], sc.instance_method(:m).bind_call(sc.new)
+  assert_equal [:m, :sc, :m, :c], m.instance_method(:m).bind_call(sc.new)
+
+  n = Module.new { def n; [:n, *super]; end }
+  d = Class.new { def n; [:d]; end }
+  e = Class.new(d) { include n }
+  assert_equal [:n, :d], e.instance_method(:n).bind_call(e.new)
+  assert_equal [:n, :d], n.instance_method(:n).bind_call(e.new)
 end

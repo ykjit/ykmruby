@@ -50,6 +50,9 @@ typedef struct mrb_gc_prof_hist {
 
 typedef struct mrb_gc {
   struct kh_gcroot *root;          /* mrb_gc_register()ed objects -> pin count */
+#ifdef MRB_USE_GC_WEAK
+  struct mrb_gc_weak *weaks;       /* mrb_gc_weak_add()ed tables */
+#endif
   struct mrb_heap_page *heaps;     /* all heaps pages */
   struct mrb_heap_page *free_heaps;/* heaps for allocation */
   struct mrb_heap_page *sweeps;    /* page where sweep starts */
@@ -59,12 +62,15 @@ typedef struct mrb_gc {
   mrb_bool gray_overflow:1;        /* gray stack overflowed; needs heap rescan */
   size_t live;                     /* count of live objects */
   size_t live_after_mark;          /* old generation objects */
+  size_t reclaim_hold;             /* heap capacity at the last reclaim that
+                                      found too little garbage; 0=none */
   mrb_int gc_debt;                 /* <0:credit, >0:needs GC */
   size_t oldgen_threshold;         /* threshold to kick major GC */
   mrb_gc_state state;              /* current state of gc */
   int interval_ratio;
   int step_ratio;
   int current_white_part :2;       /* make white object by white_part */
+  mrb_bool giv_proc      :1;       /* a Proc has an ivar in the side table */
   mrb_bool iterating     :1;       /* currently iterating over objects */
   mrb_bool disabled      :1;       /* GC disabled */
   mrb_bool generational  :1;       /* generational GC mode */

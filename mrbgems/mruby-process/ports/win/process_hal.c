@@ -123,6 +123,54 @@ mrb_hal_process_ppid(mrb_state *mrb)
 }
 
 /*
+ Windows does not implement fork(2):
+ we set errno (ENOSYS), return -1 and
+ then raise NotImplementedError in the
+ process_fork function (see process.c)
+*/
+mrb_int
+mrb_hal_process_fork(mrb_state *mrb)
+{
+  errno = ENOSYS;
+  return -1;
+}
+
+/* Nor can a process replace its own image with another program. */
+int
+mrb_hal_process_exec(mrb_state *mrb, const char *cmd, char *const argv[])
+{
+  (void)mrb; (void)cmd; (void)argv;
+  errno = ENOSYS;
+  return -1;
+}
+
+/* Windows has no numeric user or group IDs; like CRuby, report 0 for all
+   of them. */
+mrb_int
+mrb_hal_process_uid(mrb_state *mrb)
+{
+  return 0;
+}
+
+mrb_int
+mrb_hal_process_euid(mrb_state *mrb)
+{
+  return 0;
+}
+
+mrb_int
+mrb_hal_process_gid(mrb_state *mrb)
+{
+  return 0;
+}
+
+mrb_int
+mrb_hal_process_egid(mrb_state *mrb)
+{
+  return 0;
+}
+
+/*
  * Signalling
  */
 

@@ -691,6 +691,16 @@ assert('Hash#merge', '15.2.13.4.22') do
   end
 end
 
+assert('Hash#merge with a block and several hashes') do
+  # the block sees the value merged so far, not only the receiver's
+  assert_equal({a: 6}, {a: 1}.merge({a: 2}, {a: 3}) {|k, v1, v2| v1 + v2})
+  assert_equal({a: 1, b: 5}, {a: 1}.merge({b: 2}, {b: 3}) {|k, v1, v2| v1 + v2})
+  h = {foo: 0, bar: 1, baz: 2}
+  assert_equal({foo: 0, bar: 5, baz: 2, bat: 9, bam: 5},
+               h.merge({bat: 3, bar: 4}, {bam: 5, bat: 6}) {|k, v1, v2| v1 + v2})
+  assert_equal({foo: 0, bar: 1, baz: 2}, h)
+end
+
 assert("Hash#replace", "15.2.13.4.23") do
   cls = Class.new(Hash){attr_accessor :foo}
   e = [ar_entries, ht_entries]
@@ -765,6 +775,26 @@ assert("Hash#replace", "15.2.13.4.23") do
 
     assert_raise(FrozenError){h1.freeze.replace(h1)}
     assert_raise(FrozenError){{}.freeze.replace({})}
+  end
+end
+
+assert('Hash#replace keeps the entries of an old receiver alive') do
+  # An old receiver takes young entries in one copy; without a barrier the
+  # next minor GCs free them while the receiver still holds them.
+  origin = GC.generational_mode
+  begin
+    GC.generational_mode = true
+    young = ->(n) { s = {}; n.times { |i| s["key#{i}"] = "value#{i}" * 4 }; s }
+    [4, 20].each do |n| # the entry array alone, and with a hash table
+      target = {}
+      GC.start
+      target.replace(young.(n))
+      100_000.times { "garbage" * 4 }
+      assert_equal n, target.size
+      target.each { |k, v| assert_equal "value#{k[3..]}" * 4, v }
+    end
+  ensure
+    GC.generational_mode = origin
   end
 end
 
@@ -1348,4 +1378,88 @@ assert('Hash#== and #eql? with recursive values') do
     assert_true a.__send__(op, b), op.to_s
     assert_false a.__send__(op, c), op.to_s
   end
+end
+
+assert('Hash#compare_by_identity') do
+  a = "k"
+  h = {}
+  assert_same h, h.compare_by_identity
+  assert_true h.compare_by_identity?
+  assert_false({}.compare_by_identity?)
+  h[a] = 1
+  h["k".dup] = 2
+  assert_equal 2, h.size
+  assert_equal 1, h[a]
+  assert_nil h["k".dup]
+  # a String key is the object itself, not a frozen copy
+  assert_same a, h.keys[0]
+  assert_false h.keys[0].frozen?
+  assert_equal [a, 1], h.assoc(a)
+  # assoc walks the pairs and asks each key, as in CRuby
+  assert_equal [a, 1], h.assoc("k".dup)
+  assert_equal 1, h.delete(a)
+  assert_equal 1, h.size
+  # Symbols and Integers are the same objects when equal
+  s = {}.compare_by_identity
+  s[:x] = 1
+  s[1] = 2
+  assert_equal 1, s[:x]
+  assert_equal 2, s[1]
+  assert_nil s[1.0]
+end
+
+assert('Hash#compare_by_identity rehashes what the hash holds') do
+  h = {1 => :a, "x" => :b}
+  h.compare_by_identity
+  assert_equal :a, h[1]
+  assert_nil h["x"]
+  big = {}
+  keys = (0...40).map { |i| "k#{i}" }
+  keys.each_with_index { |k, i| big[k] = i }
+  # the copies the hash made of the unfrozen keys are what it holds
+  held = big.keys
+  big.compare_by_identity
+  assert_equal 40, big.size
+  assert_equal 7, big[held[7]]
+  assert_nil big[keys[7]]
+end
+
+assert('Hash#compare_by_identity is kept by dup, clone and replace') do
+  h = {}.compare_by_identity
+  h["a"] = 1
+  assert_true h.dup.compare_by_identity?
+  assert_true h.clone.compare_by_identity?
+  assert_true h.merge({}).compare_by_identity?
+  x = {}
+  x.replace(h)
+  assert_true x.compare_by_identity?
+  y = {}.compare_by_identity
+  y.replace({})
+  assert_false y.compare_by_identity?
+end
+
+assert('Hash#== and #eql? with a hash that compares by identity') do
+  assert_true({}.compare_by_identity == {})
+  assert_false({"a" => 1}.compare_by_identity == {"a" => 1})
+  assert_false({"a" => 1} == {"a" => 1}.compare_by_identity)
+  assert_false({"a" => 1}.compare_by_identity.eql?({"a" => 1}))
+  a = "a".freeze
+  assert_true({a => 1}.compare_by_identity == {a => 1}.compare_by_identity)
+end
+
+assert('Hash#compare_by_identity on a frozen Hash') do
+  assert_raise(FrozenError) { {}.freeze.compare_by_identity }
+  f = {}.compare_by_identity.freeze
+  assert_same f, f.compare_by_identity
+end
+
+assert('Hash#select and Hash#reject keep compare_by_identity') do
+  h = {}.compare_by_identity
+  h["a".dup] = 1
+  h["a".dup] = 2
+  assert_true h.select { true }.compare_by_identity?
+  assert_equal 2, h.select { true }.size
+  assert_true h.reject { false }.compare_by_identity?
+  assert_equal 2, h.reject { false }.size
+  assert_false({"a" => 1}.select { true }.compare_by_identity?)
 end

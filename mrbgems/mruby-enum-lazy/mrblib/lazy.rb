@@ -285,6 +285,8 @@ class Enumerator
     #   lazy.collect_concat {|obj| block } -> lazy_enumerator
     #
     # Like Enumerable#flat_map, but chains operation to be lazy-evaluated.
+    # Besides an array, a result that is itself lazy (responds to +each+
+    # and +force+) is flattened.
     #
     #   ["foo", "bar"].lazy.flat_map {|i| i.each_char.lazy}.force
     #   #=> ["f", "o", "o", "b", "a", "r"]
@@ -292,7 +294,7 @@ class Enumerator
     def flat_map(&block)
       Lazy.new(self){|yielder, val|
         result = block.call(val)
-        if result.respond_to?(:each)
+        if Array === result || (result.respond_to?(:each) && result.respond_to?(:force))
           result.each {|x| yielder << x }
         else
           yielder << result

@@ -46,6 +46,24 @@ assert('Kernel#instance_variable_set', '15.3.1.3.22') do
   end
   assert_raise(FrozenError) { o.freeze.instance_variable_set(:@a, 2) }
   assert_raise(FrozenError, ArgumentError) { nil.instance_variable_set(:@a, 2) }
+  # a type without an iv slot keeps them in a side table
+  s = "abc"
+  assert_equal 1, s.instance_variable_set(:@a, 1)
+  assert_equal 1, s.instance_variable_get(:@a)
+  assert_true s.instance_variable_defined?(:@a)
+  assert_equal [:@a], s.instance_variables
+  assert_equal [], "bare".instance_variables
+  assert_equal [], [].instance_variables
+  assert_equal [], (1..2).instance_variables
+  a = []
+  a.instance_variable_set(:@b, 2)
+  assert_equal [:@b], a.instance_variables
+  assert_equal [:@b], a.dup.instance_variables
+  assert_equal 2, a.remove_instance_variable(:@b)
+  assert_equal [], a.instance_variables
+  assert_raise(FrozenError) { "frozen".freeze.instance_variable_set(:@a, 2) }
+  assert_raise(FrozenError, ArgumentError) { 1.instance_variable_set(:@a, 2) }
+  assert_raise(FrozenError, ArgumentError) { :sym.instance_variable_set(:@a, 2) }
 end
 
 assert('Kernel#instance_variables', '15.3.1.3.23') do
@@ -95,6 +113,23 @@ assert('Kernel#public_methods', '15.3.1.3.38') do
   assert_equal [:foo], c.new.public_methods(false)
 end
 
+assert('Kernel#public_methods and #private_methods take the nearest definition') do
+  a = Class.new do
+    private def foo; end
+    def bar; end
+  end
+  b = Class.new(a) do
+    public def foo; end
+    private def bar; end
+  end
+  o = b.new
+  assert_include o.public_methods, :foo
+  assert_not_include o.private_methods, :foo
+  assert_include o.private_methods, :bar
+  assert_not_include o.public_methods, :bar
+  assert_not_include o.methods, :bar
+end
+
 assert('Kernel#singleton_methods', '15.3.1.3.45') do
   assert_equal singleton_methods.class, Array
 end
@@ -132,6 +167,14 @@ assert('Kernel#local_variables', '15.3.1.3.28') do
   k = Class.new
   local_var_dm_maker(k)
   assert_equal [:b, :kl], k.new.dm_list
+
+  # a pattern nested in a destructured parameter adds no name of its own
+  def local_var_nested((((a, b)), c), d) local_variables end
+  assert_equal [:a, :b, :c, :d], local_var_nested([[[1, 2]], 3], 4).sort
+  def local_var_nested_blk
+    Proc.new { |((x, y)), z| local_variables }.call([[1, 2]], 3)
+  end
+  assert_equal [:x, :y, :z], local_var_nested_blk.sort
 end
 
 # Kernel.local_variables is not provided by mruby. '15.3.1.2.7'
@@ -145,6 +188,19 @@ assert('Kernel#define_singleton_method') do
   assert_equal :singleton_method_ok, o.test_method
   assert_raise(TypeError) { 2.define_singleton_method(:f){} }
   assert_raise(FrozenError) { [].freeze.define_singleton_method(:f){} }
+
+  # a Proc body
+  o = Object.new
+  assert_equal :by_proc, o.define_singleton_method(:by_proc, Proc.new { :proc_ok })
+  assert_equal :proc_ok, o.by_proc
+  assert_raise(TypeError) { o.define_singleton_method(:f, 1) }
+  assert_raise(ArgumentError) { o.define_singleton_method(:f) }
+
+  # a class method named define_method is not what defines it
+  k = Class.new { def self.define_method(*) :taken end }
+  o = k.new
+  assert_equal :by_block, o.define_singleton_method(:by_block) { :block_ok }
+  assert_equal :block_ok, o.by_block
 end
 
 assert('Kernel#singleton_class') do
@@ -343,6 +399,22 @@ assert('Module#instance_methods', '15.2.2.4.33') do
   assert_equal Array, r.class
   assert_true r.include?(:method3)
   assert_true r.include?(:method2)
+end
+
+assert('Module#public_instance_methods and #private_instance_methods take the nearest definition') do
+  a = Class.new do
+    private def foo; end
+    def bar; end
+  end
+  b = Class.new(a) do
+    public def foo; end
+    private def bar; end
+  end
+  assert_include b.public_instance_methods, :foo
+  assert_not_include b.private_instance_methods, :foo
+  assert_include b.private_instance_methods, :bar
+  assert_not_include b.public_instance_methods, :bar
+  assert_not_include b.instance_methods, :bar
 end
 
 assert('Module#instance_methods lists a method that is unimplemented here') do
@@ -574,6 +646,18 @@ assert('Object#public_send visibility') do
     end
   end.new
   assert_equal [:nope, [1]], mm.public_send(:nope, 1)
+end
+
+assert('Kernel#send and #public_send to method_missing pass keywords') do
+  mm = Class.new do
+    def method_missing(name, *args, **opts, &blk)
+      [name, args, opts, blk&.call]
+    end
+  end.new
+  assert_equal [:nope, [1], { k: 2 }, nil], mm.send(:nope, 1, k: 2)
+  assert_equal [:nope, [1], { k: 2 }, 3], mm.send(:nope, 1, k: 2) { 3 }
+  assert_equal [:nope, [], { k: 2 }, nil], mm.public_send(:nope, k: 2)
+  assert_equal [:nope, [{ k: 2 }], {}, nil], mm.send(:nope, { k: 2 })
 end
 
 assert('Module#remove_method on a module prepended to Integer restores the builtin operator') do

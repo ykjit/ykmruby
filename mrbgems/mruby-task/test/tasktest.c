@@ -5,6 +5,7 @@
 #include <mruby/data.h>
 #include <mruby/array.h>
 #include <mruby/error.h>
+#include <mruby/internal.h>
 #include "task.h"
 
 /* Burn CPU until `ms` milliseconds of CPU time have elapsed, then raise.
@@ -24,6 +25,21 @@ tasktest_block_then_raise(mrb_state *mrb, mrb_value self)
   }
   mrb_raise(mrb, E_RUNTIME_ERROR, "raised after blocking");
   return mrb_nil_value(); /* not reached */
+}
+
+/* Burn CPU for `ms` milliseconds, as block_then_raise does, and return.
+   Called from Ruby, the ticks it spans expire the running task's timeslice,
+   so a switch is pending when it returns. */
+static mrb_value
+tasktest_block(mrb_state *mrb, mrb_value self)
+{
+  mrb_int ms;
+  mrb_get_args(mrb, "i", &ms);
+  clock_t end = clock() + (clock_t)(((double)ms / 1000.0) * (double)CLOCKS_PER_SEC);
+  while (clock() < end) {
+    /* busy-wait; ticks keep firing */
+  }
+  return mrb_nil_value();
 }
 
 /* Scheduler-hook probes. Two counters so the replace semantics can be
@@ -118,6 +134,28 @@ tasktest_reinit_context(mrb_state *mrb, mrb_value self)
   return mrb_nil_value();
 }
 
+/* Run the block under a C frame (mrb_yield marks it CINFO_SKIP), the
+   shape of a block called back from a C extension. */
+static mrb_value
+tasktest_yield_from_c(mrb_state *mrb, mrb_value self)
+{
+  mrb_value blk;
+  mrb_get_args(mrb, "&", &blk);
+  if (mrb_nil_p(blk)) {
+    mrb_raise(mrb, E_ARGUMENT_ERROR, "block required");
+  }
+  return mrb_yield_argv(mrb, blk, 0, NULL);
+}
+
+/* Give the current frame a special variable, as a regexp match does: the
+   context allocates its svars array for it. */
+static mrb_value
+tasktest_set_svar(mrb_state *mrb, mrb_value self)
+{
+  mrb_vm_svar_set(mrb, MRB_SVAR_LASTLINE, mrb_true_value());
+  return mrb_nil_value();
+}
+
 /* Drive the synchronous-execution teardown path. */
 static mrb_value
 tasktest_run_sync(mrb_state *mrb, mrb_value self)
@@ -156,6 +194,25 @@ tasktest_proc_set_stack(mrb_state *mrb, mrb_value self)
      stack (unfixed build) fails as a clean assertion, not a later crash. */
   mrb_terminate_task(mrb, task);
   return mrb_ary_new_from_values(mrb, 2, r);
+}
+
+/* Run a finished task again with another body, the way picoruby-sandbox
+   runs each irb line on one task: suspend it (as Sandbox#suspend does after
+   each run; resume only wakes a suspended task), reset the context, set the
+   proc, resume. The caller runs the scheduler for the result. */
+static mrb_value
+tasktest_rerun(mrb_state *mrb, mrb_value self)
+{
+  mrb_value task, blk;
+  mrb_get_args(mrb, "o&", &task, &blk);
+  if (mrb_nil_p(blk)) {
+    mrb_raise(mrb, E_ARGUMENT_ERROR, "block required");
+  }
+  mrb_suspend_task(mrb, task);
+  mrb_task_reset_context(mrb, task);
+  mrb_task_proc_set(mrb, task, mrb_proc_ptr(blk));
+  mrb_resume_task(mrb, task);
+  return mrb_nil_value();
 }
 
 struct extend_probe {
@@ -267,19 +324,125 @@ tasktest_proc_set_deep(mrb_state *mrb, mrb_value self)
   return mrb_ary_new_from_values(mrb, 4, r);
 }
 
+#ifdef MRB_USE_TASK_TRACE
+/* Trace hook recorder. The hook must not allocate, so events go into a
+   fixed array; trace_log turns them into Ruby values afterwards. */
+#define TRACE_MAX 64
+static struct {
+  const mrb_task *task;
+  uint8_t event, status, reason;
+} trace_buf[TRACE_MAX];
+static int trace_len;
+
+static void
+tasktest_trace_hook(mrb_state *mrb, const mrb_task *t, int event, void *ud)
+{
+  (void)mrb; (void)ud;
+  if (trace_len < TRACE_MAX) {
+    trace_buf[trace_len].task = t;
+    trace_buf[trace_len].event = (uint8_t)event;
+    trace_buf[trace_len].status = t->status;
+    trace_buf[trace_len].reason = t->reason;
+    trace_len++;
+  }
+}
+
+static mrb_value
+tasktest_trace_start(mrb_state *mrb, mrb_value self)
+{
+  trace_len = 0;
+  mrb_task_set_trace_hook(mrb, tasktest_trace_hook, NULL);
+  return mrb_nil_value();
+}
+
+static mrb_value
+tasktest_trace_stop(mrb_state *mrb, mrb_value self)
+{
+  mrb_task_set_trace_hook(mrb, NULL, NULL);
+  return mrb_nil_value();
+}
+
+static mrb_value
+tasktest_trace_count(mrb_state *mrb, mrb_value self)
+{
+  return mrb_fixnum_value(trace_len);
+}
+
+static const char*
+trace_status_name(uint8_t status)
+{
+  switch (status) {
+  case MRB_TASK_STATUS_DORMANT:   return "dormant";
+  case MRB_TASK_STATUS_READY:     return "ready";
+  case MRB_TASK_STATUS_RUNNING:   return "running";
+  case MRB_TASK_STATUS_WAITING:   return "waiting";
+  case MRB_TASK_STATUS_SUSPENDED: return "suspended";
+  default:                        return "unknown";
+  }
+}
+
+static const char*
+trace_reason_name(uint8_t reason)
+{
+  switch (reason) {
+  case MRB_TASK_REASON_NONE:  return "none";
+  case MRB_TASK_REASON_SLEEP: return "sleep";
+  case MRB_TASK_REASON_MUTEX: return "mutex";
+  case MRB_TASK_REASON_JOIN:  return "join";
+  case MRB_TASK_REASON_QUEUE: return "queue";
+  default:                    return "unknown";
+  }
+}
+
+/* Events of the given tasks as [index, event, status, reason], where
+   index is the task's position in the argument array. */
+static mrb_value
+tasktest_trace_log(mrb_state *mrb, mrb_value self)
+{
+  static const char *const event_names[] = {
+    "create", "switch_in", "switch_out", "state", "free"
+  };
+  mrb_value tasks, log;
+  mrb_get_args(mrb, "A", &tasks);
+  log = mrb_ary_new(mrb);
+  for (int i = 0; i < trace_len; i++) {
+    for (mrb_int j = 0; j < RARRAY_LEN(tasks); j++) {
+      if ((const mrb_task*)DATA_PTR(RARRAY_PTR(tasks)[j]) != trace_buf[i].task) continue;
+      mrb_value e[4];
+      e[0] = mrb_fixnum_value(j);
+      e[1] = mrb_symbol_value(mrb_intern_cstr(mrb, event_names[trace_buf[i].event]));
+      e[2] = mrb_symbol_value(mrb_intern_cstr(mrb, trace_status_name(trace_buf[i].status)));
+      e[3] = mrb_symbol_value(mrb_intern_cstr(mrb, trace_reason_name(trace_buf[i].reason)));
+      mrb_ary_push(mrb, log, mrb_ary_new_from_values(mrb, 4, e));
+    }
+  }
+  return log;
+}
+#endif
+
 void
 mrb_mruby_task_gem_test(mrb_state* mrb)
 {
   struct RClass *tasktest = mrb_define_module(mrb, "TaskTest");
   mrb_define_module_function(mrb, tasktest, "block_then_raise", tasktest_block_then_raise, MRB_ARGS_REQ(1));
+  mrb_define_module_function(mrb, tasktest, "block", tasktest_block, MRB_ARGS_REQ(1));
   mrb_define_module_function(mrb, tasktest, "install_probe_hook", tasktest_install_probe_hook, MRB_ARGS_REQ(1));
   mrb_define_module_function(mrb, tasktest, "probe_count", tasktest_probe_count, MRB_ARGS_REQ(1));
   mrb_define_module_function(mrb, tasktest, "install_wake_hook", tasktest_install_wake_hook, MRB_ARGS_REQ(1));
   mrb_define_module_function(mrb, tasktest, "clear_hook", tasktest_clear_hook, MRB_ARGS_NONE());
   mrb_define_module_function(mrb, tasktest, "run_once", tasktest_run_once, MRB_ARGS_NONE());
   mrb_define_module_function(mrb, tasktest, "reinit_context", tasktest_reinit_context, MRB_ARGS_REQ(1) | MRB_ARGS_BLOCK());
+  mrb_define_module_function(mrb, tasktest, "yield_from_c", tasktest_yield_from_c, MRB_ARGS_BLOCK());
   mrb_define_module_function(mrb, tasktest, "run_sync", tasktest_run_sync, MRB_ARGS_BLOCK());
+  mrb_define_module_function(mrb, tasktest, "set_svar", tasktest_set_svar, MRB_ARGS_NONE());
   mrb_define_module_function(mrb, tasktest, "proc_set_stack", tasktest_proc_set_stack, MRB_ARGS_REQ(2));
+  mrb_define_module_function(mrb, tasktest, "rerun", tasktest_rerun, MRB_ARGS_REQ(1) | MRB_ARGS_BLOCK());
   mrb_define_module_function(mrb, tasktest, "extend_past_stend", tasktest_extend_past_stend, MRB_ARGS_REQ(3));
   mrb_define_module_function(mrb, tasktest, "proc_set_deep", tasktest_proc_set_deep, MRB_ARGS_REQ(2));
+#ifdef MRB_USE_TASK_TRACE
+  mrb_define_module_function(mrb, tasktest, "trace_start", tasktest_trace_start, MRB_ARGS_NONE());
+  mrb_define_module_function(mrb, tasktest, "trace_stop", tasktest_trace_stop, MRB_ARGS_NONE());
+  mrb_define_module_function(mrb, tasktest, "trace_count", tasktest_trace_count, MRB_ARGS_NONE());
+  mrb_define_module_function(mrb, tasktest, "trace_log", tasktest_trace_log, MRB_ARGS_REQ(1));
+#endif
 }

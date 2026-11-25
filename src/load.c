@@ -9,6 +9,7 @@
 #include <mruby/irep.h>
 #include <mruby/proc.h>
 #include <mruby/string.h>
+#include <mruby/array.h>
 #include <mruby/debug.h>
 #include <mruby/error.h>
 #include <mruby/data.h>
@@ -93,7 +94,11 @@ prescan_pool_syms(const uint8_t *src, const uint8_t *end, uint16_t *plenp, uint1
       src += bin_to_uint8(src) + 2;
       break;
     case IREP_TT_FLOAT:
+#ifndef MRB_NO_FLOAT
       src += sizeof(double);
+#else
+      src += MRB_DUMP_FLOAT_SIZE;
+#endif
       break;
     case IREP_TT_STR:
       if (src + sizeof(uint16_t) > end) return FALSE;
@@ -169,6 +174,9 @@ read_irep_record_1(mrb_state *mrb, const uint8_t *bin, const uint8_t *end, size_
   mrb_irep *irep;
   int ai = mrb_gc_arena_save(mrb);
 
+  /* record size, nlocals, nregs, rlen, clen, ilen */
+  if (end < src || (size_t)(end - src) < sizeof(uint32_t)*2 + sizeof(uint16_t)*4) return FALSE;
+
   /* skip record size */
   src += sizeof(uint32_t);
 
@@ -198,11 +206,15 @@ read_irep_record_1(mrb_state *mrb, const uint8_t *bin, const uint8_t *end, size_
     const uint8_t *pool_start = src;
     uint16_t pre_plen, pre_slen;
     if (ilen > 0) {
-      size_t iseq_len;
+      size_t iseq_len, rest = (size_t)(end - src);
       if (SIZE_ERROR_MUL(ilen, sizeof(mrb_code))) return FALSE;
-      iseq_len = sizeof(mrb_code) * ilen +
-                 sizeof(struct mrb_irep_catch_handler) * clen;
-      if (src + iseq_len > end) return FALSE;
+      iseq_len = sizeof(mrb_code) * ilen;
+      /* compare each part with what is left, so that adding the catch
+         handler table cannot wrap the total on a 32-bit size_t */
+      if (iseq_len > rest ||
+          clen > (rest - iseq_len) / sizeof(struct mrb_irep_catch_handler))
+        return FALSE;
+      iseq_len += sizeof(struct mrb_irep_catch_handler) * clen;
       pool_start = src + iseq_len;
     }
     if (!prescan_pool_syms(pool_start, end, &pre_plen, &pre_slen)) return FALSE;
@@ -259,7 +271,10 @@ read_irep_record_1(mrb_state *mrb, const uint8_t *bin, const uint8_t *end, size_
         }
         break;
       case IREP_TT_INT64:
-#ifdef MRB_INT64
+        /* Read whatever mrb_int is: an mrbc whose integers are 64 bits wide
+           writes one for a literal past 32 bits, and where mrb_int is
+           narrower the VM decides what the value becomes when it is loaded
+           (OP_LOADL), as it does for an IREP_TT_BIGINT entry. */
         {
           if (src + sizeof(uint32_t)*2 > end) return FALSE;
           uint64_t i64 = bin_to_uint32(src);
@@ -271,9 +286,6 @@ read_irep_record_1(mrb_state *mrb, const uint8_t *bin, const uint8_t *end, size_
           pool[i].u.i64 = (int64_t)i64;
         }
         break;
-#else
-        return FALSE;
-#endif
 
       case IREP_TT_BIGINT:
         pool_data_len = bin_to_uint8(src) + 2; /* pool data length */
@@ -294,10 +306,18 @@ read_irep_record_1(mrb_state *mrb, const uint8_t *bin, const uint8_t *end, size_
         pool[i].tt = tt;
         pool[i].u.f = str_to_double(mrb, (const char*)src);
         src += sizeof(double);
-        break;
 #else
-        return FALSE;           /* MRB_NO_FLOAT */
+        /* Without Float there is no value to make, but the rest of the
+           irep may never need one: keep the bytes as they came, so that
+           OP_LOADL refuses only the literal that runs and dump.c writes
+           the entry back unchanged. The pool union holds 64 bits
+           everywhere. */
+        if (src + MRB_DUMP_FLOAT_SIZE > end) return FALSE;
+        pool[i].tt = tt;
+        memcpy(&pool[i].u.i64, src, MRB_DUMP_FLOAT_SIZE);
+        src += MRB_DUMP_FLOAT_SIZE;
 #endif
+        break;
 
       case IREP_TT_STR:
         pool_data_len = bin_to_uint16(src); /* pool data length */
@@ -333,6 +353,7 @@ read_irep_record_1(mrb_state *mrb, const uint8_t *bin, const uint8_t *end, size_
     syms = (mrb_sym*)irep->syms; /* in consolidated block */
 
     for (i = 0; i < irep->slen; i++) {
+      if (src + sizeof(uint16_t) > end) return FALSE;
       snl = bin_to_uint16(src);               /* symbol name length */
       src += sizeof(uint16_t);
 
@@ -403,8 +424,9 @@ read_section_irep(mrb_state *mrb, const uint8_t *bin, size_t size, uint8_t flags
 
   mrb_irep **irepp = (mrb_irep**)&(*proc)->body.irep;
   size_t len;
+  const uint8_t *end = bin + size;  /* size counts from the section header */
   bin += sizeof(struct rite_section_irep_header);
-  if (read_irep_record(mrb, bin, bin+size, &len, flags, irepp)) {
+  if (read_irep_record(mrb, bin, end, &len, flags, irepp)) {
     return *irepp;
   }
   else {
@@ -413,7 +435,7 @@ read_section_irep(mrb_state *mrb, const uint8_t *bin, size_t size, uint8_t flags
 }
 
 static int
-read_debug_record(mrb_state *mrb, const uint8_t *start, const uint8_t *end, mrb_irep* irep, size_t *record_len, const mrb_sym *filenames, size_t filenames_len)
+read_debug_record(mrb_state *mrb, const uint8_t *start, const uint8_t *end, mrb_irep* irep, size_t *record_len, const mrb_value *filenames, size_t filenames_len)
 {
   const uint8_t *bin = start;
   ptrdiff_t diff;
@@ -455,7 +477,7 @@ read_debug_record(mrb_state *mrb, const uint8_t *start, const uint8_t *end, mrb_
     filename_idx = bin_to_uint16(bin);
     bin += sizeof(uint16_t);
     if (filename_idx >= filenames_len) return MRB_DUMP_GENERAL_FAILURE;
-    file->filename_sym = filenames[filename_idx];
+    file->filename_sym = mrb_symbol(filenames[filename_idx]);
 
     file->line_entry_count = bin_to_uint32(bin);
     bin += sizeof(uint32_t);
@@ -544,8 +566,9 @@ read_section_debug(mrb_state *mrb, const uint8_t *start, size_t size, mrb_irep *
   if ((size_t)(end - bin) < sizeof(uint16_t)) return MRB_DUMP_GENERAL_FAILURE;
   uint16_t filenames_len = bin_to_uint16(bin);
   bin += sizeof(uint16_t);
-  mrb_value filenames_obj = mrb_str_new(mrb, NULL, sizeof(mrb_sym) * (size_t)filenames_len);
-  mrb_sym *filenames = (mrb_sym*)RSTRING_PTR(filenames_obj);
+  /* an Array, not a byte buffer: the symbol GC an intern below can run
+     sees the names interned before it */
+  mrb_value filenames = mrb_ary_new_capa(mrb, filenames_len);
   for (uint16_t i = 0; i < filenames_len; i++) {
     if ((size_t)(end - bin) < sizeof(uint16_t)) {
       result = MRB_DUMP_GENERAL_FAILURE;
@@ -557,16 +580,14 @@ read_section_debug(mrb_state *mrb, const uint8_t *start, size_t size, mrb_irep *
       result = MRB_DUMP_GENERAL_FAILURE;
       goto debug_exit;
     }
-    if (flags & FLAG_SRC_MALLOC) {
-      filenames[i] = mrb_intern(mrb, (const char*)bin, (size_t)f_len);
-    }
-    else {
-      filenames[i] = mrb_intern_static(mrb, (const char*)bin, (size_t)f_len);
-    }
+    mrb_sym sym = (flags & FLAG_SRC_MALLOC) ?
+      mrb_intern(mrb, (const char*)bin, (size_t)f_len) :
+      mrb_intern_static(mrb, (const char*)bin, (size_t)f_len);
+    mrb_ary_push(mrb, filenames, mrb_symbol_value(sym));
     bin += f_len;
   }
 
-  result = read_debug_record(mrb, bin, end, irep, &len, filenames, filenames_len);
+  result = read_debug_record(mrb, bin, end, irep, &len, RARRAY_PTR(filenames), filenames_len);
   if (result != MRB_DUMP_OK) goto debug_exit;
 
   bin += len;
@@ -577,12 +598,12 @@ read_section_debug(mrb_state *mrb, const uint8_t *start, size_t size, mrb_irep *
   }
 
 debug_exit:
-  mrb_str_resize(mrb, filenames_obj, 0);
+  mrb_ary_clear(mrb, filenames);
   return result;
 }
 
 static int
-read_lv_record(mrb_state *mrb, const uint8_t *start, const uint8_t *end, mrb_irep *irep, size_t *record_len, mrb_sym const *syms, uint32_t syms_len)
+read_lv_record(mrb_state *mrb, const uint8_t *start, const uint8_t *end, mrb_irep *irep, size_t *record_len, const mrb_value *syms, uint32_t syms_len)
 {
   const uint8_t *bin = start;
 
@@ -601,7 +622,7 @@ read_lv_record(mrb_state *mrb, const uint8_t *start, const uint8_t *end, mrb_ire
       if (sym_idx >= syms_len) {
         return MRB_DUMP_GENERAL_FAILURE;
       }
-      lv[i] = syms[sym_idx];
+      lv[i] = mrb_symbol(syms[sym_idx]);
     }
   }
 
@@ -632,8 +653,7 @@ read_section_lv(mrb_state *mrb, const uint8_t *start, size_t size, mrb_irep *ire
   size_t len = 0;
   int result;
   uint32_t syms_len;
-  mrb_sym *syms;
-  mrb_value syms_obj;
+  mrb_value syms;
   mrb_sym (*intern_func)(mrb_state*, const char*, size_t) =
     (flags & FLAG_SRC_MALLOC)? mrb_intern : mrb_intern_static;
 
@@ -644,19 +664,21 @@ read_section_lv(mrb_state *mrb, const uint8_t *start, size_t size, mrb_irep *ire
   if ((size_t)(end - bin) < sizeof(uint32_t)) return MRB_DUMP_READ_FAULT;
   syms_len = bin_to_uint32(bin);
   bin += sizeof(uint32_t);
-  if (SIZE_ERROR_MUL(syms_len, sizeof(mrb_sym))) return MRB_DUMP_GENERAL_FAILURE;
-  syms_obj = mrb_str_new(mrb, NULL, sizeof(mrb_sym) * (size_t)syms_len);
-  syms = (mrb_sym*)RSTRING_PTR(syms_obj);
+  /* each name takes at least its length field */
+  if (syms_len > (size_t)(end - bin) / sizeof(uint16_t)) return MRB_DUMP_READ_FAULT;
+  /* an Array, not a byte buffer: the symbol GC an intern below can run
+     sees the names interned before it */
+  syms = mrb_ary_new_capa(mrb, (mrb_int)syms_len);
   for (i = 0; i < syms_len; i++) {
     if ((size_t)(end - bin) < sizeof(uint16_t)) return MRB_DUMP_READ_FAULT;
     uint16_t const str_len = bin_to_uint16(bin);
     bin += sizeof(uint16_t);
     if (bin + str_len > end) return MRB_DUMP_READ_FAULT;
-    syms[i] = intern_func(mrb, (const char*)bin, str_len);
+    mrb_ary_push(mrb, syms, mrb_symbol_value(intern_func(mrb, (const char*)bin, str_len)));
     bin += str_len;
   }
 
-  result = read_lv_record(mrb, bin, end, irep, &len, syms, syms_len);
+  result = read_lv_record(mrb, bin, end, irep, &len, RARRAY_PTR(syms), syms_len);
   if (result != MRB_DUMP_OK) goto lv_exit;
 
   bin += len;
@@ -667,7 +689,7 @@ read_section_lv(mrb_state *mrb, const uint8_t *start, size_t size, mrb_irep *ire
   }
 
 lv_exit:
-  mrb_str_resize(mrb, syms_obj, 0);
+  mrb_ary_clear(mrb, syms);
   return result;
 }
 
@@ -726,6 +748,8 @@ read_irep(mrb_state *mrb, const uint8_t *bin, size_t bufsize, uint8_t flags)
     section_header = (const struct rite_section_header*)bin;
     uint32_t section_size = bin_to_uint32(section_header->section_size);
     if (bin_size < section_size) return NULL;
+    /* a section must cover its own header, or the loop never advances */
+    if (section_size < sizeof(struct rite_section_header)) return NULL;
     if (memcmp(section_header->section_ident, RITE_SECTION_IREP_IDENT, sizeof(section_header->section_ident)) == 0) {
       irep = read_section_irep(mrb, bin, bin_size, flags, &proc);
       if (!irep) return NULL;

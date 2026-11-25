@@ -54,6 +54,130 @@ assert('IO.open', '15.2.20.4.1') do
   assert_io_open(:open)
 end
 
+assert('IO.open passes keywords on to new') do
+  IO.open(IO.sysopen($mrbtest_io_rfname), mode: "r", binmode: true) do |io|
+    assert_true io.binmode?
+    assert_equal $mrbtest_io_msg, io.read
+  end
+  File.open($mrbtest_io_wfname, "w", binmode: true) { |f| assert_true f.binmode? }
+end
+
+assert('IO#binmode and IO#binmode?') do
+  io = IO.open(IO.sysopen($mrbtest_io_rfname), "r")
+  assert_false io.binmode?
+  assert_same io, io.binmode
+  assert_true io.binmode?
+  assert_true io.dup.binmode?
+  assert_equal $mrbtest_io_msg, io.read
+  io.close
+  assert_raise(IOError) { io.binmode }
+  assert_raise(IOError) { io.binmode? }
+
+  io = IO.open(IO.sysopen($mrbtest_io_rfname), "rb")
+  assert_true io.binmode?
+  io.close
+  io = IO.new(IO.sysopen($mrbtest_io_rfname), "r", binmode: true)
+  assert_true io.binmode?
+  io.close
+  io = IO.new(IO.sysopen($mrbtest_io_rfname), File::RDONLY | File::BINARY)
+  assert_true io.binmode?
+  io.close
+  File.open($mrbtest_io_rfname, "rb") { |f| assert_true f.binmode? }
+  File.open($mrbtest_io_rfname) { |f| assert_false f.binmode? }
+end
+
+assert('IO#binmode reads line endings as they are') do
+  File.open($mrbtest_io_wfname, "wb") { |f| f.write "a\r\nb" }
+  File.open($mrbtest_io_wfname, "r") { |f| f.binmode; assert_equal "a\r\nb", f.read }
+  IO.open(IO.sysopen($mrbtest_io_wfname), "r", binmode: true) { |f| assert_equal "a\r\nb", f.read }
+  File.open($mrbtest_io_wfname, "w") {}  # other tests expect it empty
+end
+
+assert('IO reads return byte strings in binary mode and by length') do
+  skip unless "\u3042".length == 1   # a UTF-8 build tells the two apart
+  data = "a\u00e9\nb\u00e9\n"           # each \u00e9 is two bytes
+  File.open($mrbtest_io_wfname, "wb") { |f| f.write data }
+  begin
+    # binary mode: every read counts bytes
+    File.open($mrbtest_io_wfname, "rb") do |f|
+      assert_equal 8, f.read.length
+    end
+    File.open($mrbtest_io_wfname, "rb") do |f|
+      assert_equal 4, f.gets.length
+      assert_equal "b", f.getc
+      assert_equal [0xC3], f.getc.bytes   # one byte, not the character
+      assert_equal [0xA9], f.getc.bytes
+      assert_equal ["\n"], f.readlines
+    end
+    File.open($mrbtest_io_wfname, "r") do |f|
+      f.binmode
+      assert_equal 4, f.readline.length
+    end
+    # text mode: lines and characters are characters, but a read by length,
+    # sysread and pread count bytes
+    File.open($mrbtest_io_wfname, "r") do |f|
+      assert_equal 3, f.gets.length
+      assert_equal "b", f.getc
+      assert_equal "\u00e9", f.getc
+    end
+    File.open($mrbtest_io_wfname, "r") do |f|
+      assert_equal 6, f.read.length
+    end
+    File.open($mrbtest_io_wfname, "r") do |f|
+      s = f.read(3)
+      assert_equal 3, s.length
+      assert_equal [0x61, 0xC3, 0xA9], s.bytes
+    end
+    File.open($mrbtest_io_wfname, "r") do |f|
+      assert_equal 3, f.sysread(3).length if f.respond_to?(:sysread)
+    end
+    File.open($mrbtest_io_wfname, "r") do |f|
+      assert_equal 2, f.pread(2, 1).length if f.respond_to?(:pread)
+    end
+    # a buffer handed in keeps its own encoding
+    File.open($mrbtest_io_wfname, "rb") do |f|
+      buf = "\u3042".dup
+      f.read(3, buf)
+      assert_equal 2, buf.length    # "a\u00e9", still UTF-8
+    end
+    File.open($mrbtest_io_wfname, "r") do |f|
+      buf = "\u3042".dup
+      f.sysread(3, buf)
+      assert_equal 2, buf.length
+    end if File.method_defined?(:sysread)
+    File.open($mrbtest_io_wfname, "r") do |f|
+      buf = "\u3042".dup
+      f.pread(3, 0, buf)
+      assert_equal 2, buf.length
+    end if File.method_defined?(:pread)
+    assert_equal 8, File.binread($mrbtest_io_wfname).length
+    assert_equal 6, File.read($mrbtest_io_wfname).length
+  ensure
+    File.open($mrbtest_io_wfname, "w") {}  # other tests expect it empty
+  end
+end
+
+assert('IO.new with autoclose: false') do
+  io = IO.open(IO.sysopen($mrbtest_io_rfname), "r")
+  dup = IO.new(io.fileno, "r", autoclose: false)
+  assert_false dup.autoclose?
+  dup.close
+  assert_equal $mrbtest_io_msg, io.read
+  io.close
+  assert_true IO.new(IO.sysopen($mrbtest_io_rfname), "r", {}).autoclose?
+
+  # the keywords without a positional mode
+  io = IO.open(IO.sysopen($mrbtest_io_rfname), "r")
+  dup = IO.new(io.fileno, autoclose: false)
+  assert_false dup.autoclose?
+  dup.close
+  io.close
+  io = IO.new(IO.sysopen($mrbtest_io_wfname, "w"), mode: "w")
+  assert_equal 2, io.write("ok")
+  io.close
+  File.open($mrbtest_io_wfname, "w") {}  # other tests expect it empty
+end
+
 assert('IO#close', '15.2.20.5.1') do
   io = IO.new(IO.sysopen($mrbtest_io_rfname))
   assert_nil io.close
@@ -195,6 +319,57 @@ assert('IO#puts with an element that replaces the array') do
   assert_equal "x\n" + "0\n" * 63, File.read($mrbtest_io_wfname)
 end
 
+assert('IO#puts keeps a nested array its element drops') do
+  # The element's #to_s drops the inner array from the outer one and runs GC
+  # while puts is still walking the inner one, which nothing else holds.
+  elem = Class.new do
+    attr_accessor :outer
+    def to_s
+      @outer[0] = nil
+      GC.start
+      $io_puts_keep = Array.new(2000) { ["r"] * 4 }
+      "d"
+    end
+  end
+  e = elem.new
+  e.outer = [[e, "a", "b"] + ["c"] * 30]
+  io = IO.new(IO.sysopen($mrbtest_io_wfname, 'w'), 'w')
+  io.puts e.outer
+  io.close
+  $io_puts_keep = nil
+  assert_equal "d\na\nb\n" + "c\n" * 30, File.read($mrbtest_io_wfname)
+end
+
+assert('IO writers do not write to a descriptor #to_s closed') do
+  # #to_s closes the stream and opens another file, which is handed the number
+  # the close freed. The write has to find the stream closed, not land there.
+  elem = Class.new do
+    attr_reader :other
+    def initialize(io, path); @io = io; @path = path; end
+    def to_s
+      @io.close
+      @other = File.open(@path, "w")
+      "leak"
+    end
+  end
+  dir = MRubyIOTestUtil.mkdtemp("mruby-io-test.XXXXXX")
+  path = "#{dir}/other"
+  begin
+    [[:write, false], [:print, false], [:<<, false], [:putc, false],
+     [:puts, false], [:puts, true]].each do |m, nest|
+      io = IO.new(IO.sysopen($mrbtest_io_wfname, 'w'), 'w')
+      e = elem.new(io, path)
+      label = "IO##{m}#{nest ? ' with an array' : ''}"
+      assert_raise(IOError, label) { io.__send__(m, nest ? [e] : e) }
+      e.other.close
+      assert_equal "", File.read(path), label
+    end
+  ensure
+    File.delete(path) rescue nil
+    MRubyIOTestUtil.rmdir dir
+  end
+end
+
 assert('IO#read', '15.2.20.5.14') do
   IO.open(IO.sysopen($mrbtest_io_rfname)) do |io|
     assert_raise(ArgumentError) { io.read(-5) }
@@ -272,6 +447,21 @@ assert('IO#readchar', '15.2.20.5.15') do
     assert_raise(EOFError) do
       io.readchar
     end
+  end
+end
+
+assert('IO.readlines') do
+  path = "#{$mrbtest_io_wfname}.readlines"
+  File.write(path, "a\nbXc\n\nd")
+  begin
+    assert_equal ["a\n", "bXc\n", "\n", "d"], IO.readlines(path)
+    assert_equal ["a\n", "bXc\n", "\n", "d"], File.readlines(path)
+    assert_equal ["a", "bXc", "", "d"], IO.readlines(path, chomp: true)
+    assert_equal ["a\nbX", "c\n\nd"], IO.readlines(path, "X")
+    assert_equal ["a\nb", "c\n\nd"], IO.readlines(path, "X", chomp: true)
+    assert_raise(Errno::ENOENT) { IO.readlines("#{path}.none") }
+  ensure
+    File.delete(path)
   end
 end
 
@@ -372,6 +562,17 @@ assert('IO.sysopen("./nonexistent")') do
   end
 end
 
+assert('IO.sysopen with a nil permission') do
+  fd = IO.sysopen $mrbtest_io_rfname, "r", nil
+  io = IO.new(fd)
+  assert_equal $mrbtest_io_msg, io.read
+  io.close
+
+  File.open($mrbtest_io_wfname, "w", nil) { |f| f.write "abc" }
+  assert_equal "abc", File.read($mrbtest_io_wfname)
+  assert_raise(TypeError) { IO.sysopen $mrbtest_io_rfname, "r", "0644" }
+end
+
 assert('IO.sysopen, IO#sysread') do
   fd = IO.sysopen $mrbtest_io_rfname
   io = IO.new(fd)
@@ -452,6 +653,26 @@ assert('IO#ungetc after grow and partial read') do
   end
 end
 
+assert('IO#ungetbyte') do
+  io = IO.new(IO.sysopen($mrbtest_io_rfname))
+  assert_equal 'm', io.getc
+  assert_nil io.ungetbyte(0x4d)
+  assert_equal 'M', io.getc
+  assert_nil io.ungetbyte(-0xbf)
+  assert_equal 'A', io.getc
+  assert_nil io.ungetbyte("B")
+  assert_equal 'B', io.getc
+
+  # nil pushes nothing back, and an object that is neither an Integer nor
+  # a String is refused rather than read as an Integer
+  assert_nil io.ungetbyte(nil)
+  assert_raise(TypeError) { io.ungetbyte([0x41]) }
+  assert_raise(TypeError) { io.ungetbyte(:A) }
+  assert_raise(TypeError) { io.ungetbyte(Object.new) }
+  assert_equal 'r', io.getc
+  io.close
+end
+
 assert('IO#isatty') do
   unless MRubyIOTestUtil.win?
     begin
@@ -526,6 +747,10 @@ assert('IO#gets') do
   # gets with limit
   io.pos = 0
   assert_equal $mrbtest_io_msg[0, 5], io.gets(5), "gets with limit"
+  if Object.const_defined?(:Float)
+    io.pos = 0
+    assert_equal $mrbtest_io_msg[0, 5], io.gets(5.0), "gets with a Float limit"
+  end
 
   # gets with rs
   io.pos = 0
@@ -535,6 +760,14 @@ assert('IO#gets') do
   # gets with rs, limit
   io.pos = 0
   assert_equal $mrbtest_io_msg[0, 5], io.gets(' ', 5), "gets with rs, limit"
+
+  # gets with nil, the rest of the file
+  io.pos = 0
+  assert_equal $mrbtest_io_msg[0, 3], io.gets(3)
+  assert_equal $mrbtest_io_msg[3..], io.gets(nil), "gets with nil"
+  assert_equal nil, io.gets(nil), "gets with nil returns nil, when EOF"
+  io.pos = 0
+  assert_equal $mrbtest_io_msg[0, 4], io.gets(nil, 4), "gets with nil, limit"
   io.close
   assert_equal true, io.closed?, "close success"
 
@@ -561,6 +794,23 @@ assert('IO#gets') do
   # gets third line
   assert_equal nil, io.gets, "gets third line; returns nil"
 
+  io.close
+end
+
+assert('IO#gets(nil) on a file of many lines') do
+  fd = IO.sysopen $mrbtest_io_wfname, "w"
+  io = IO.new(fd, "w")
+  io.write "a\nb\n\nc"
+  io.close
+
+  io = IO.new(IO.sysopen($mrbtest_io_wfname))
+  assert_equal "a\n", io.gets
+  assert_equal "b\n\nc", io.gets(nil)
+  assert_equal nil, io.gets(nil)
+  io.close
+
+  io = IO.new(IO.sysopen($mrbtest_io_wfname))
+  assert_equal ["a\nb\n\nc"], io.readlines(nil)
   io.close
 end
 
@@ -648,6 +898,29 @@ assert('IO.popen with in option') do
       assert_equal "", r.read
     end
     assert_raise(ArgumentError) { IO.popen("hello", "r", in: Object.new) }
+  rescue NotImplementedError => e
+    skip e.message
+  end
+end
+
+assert('IO.popen with a redirect descriptor past int') do
+  # 2**32 + 1 was cut to 1, and the command wrote to the standard output.
+  # Computed, not written out, so the file still compiles where mrb_int is
+  # 32 bits.
+  # A big integer is not an mrb_int either, and is no redirect action.
+  shift = 32
+  big = nil
+  wide = begin
+    big = (1 << shift) + 1  # RangeError where mrb_int is 32 bits and bigint is absent
+    [][big]                 # nil for an mrb_int index, RangeError for a big integer
+    true
+  rescue RangeError
+    false
+  end
+  skip "needs 64-bit mrb_int" unless wide
+  begin
+    assert_raise(RangeError) { IO.popen("#{$cmd}echo mruby-io", "r", out: big) { |i| i.read } }
+    assert_raise(RangeError) { IO.popen($cat, "r", in: big) { |i| i.read } }
   rescue NotImplementedError => e
     skip e.message
   end
@@ -976,6 +1249,173 @@ assert('IO#autoclose?, IO#autoclose=') do
   io.autoclose = true
   assert_true io.autoclose?
   io.close
+end
+
+assert('IO.select with a Float timeout that stands for no Integer') do
+  # The seconds are truncated toward zero, so a Float no `mrb_int` holds spells
+  # no timeout at all and is out of range rather than whatever the C cast makes
+  # of it: the cast read `Float::NAN` as a zero timeout on AArch64, so the
+  # select returned at once instead of saying the timeout was unusable.
+  skip unless Object.const_defined?(:Float)
+  assert_raise(RangeError) { IO.select(nil, nil, nil, Float::INFINITY) }
+  assert_raise(RangeError) { IO.select(nil, nil, nil, -Float::INFINITY) }
+  assert_raise(RangeError) { IO.select(nil, nil, nil, Float::NAN) }
+  assert_raise(RangeError) { IO.select(nil, nil, nil, 1e30) }
+end
+
+assert('IO.write, IO.binread and IO.binwrite') do
+  assert_equal 3, IO.write($mrbtest_io_wfname, "abc")
+  assert_equal "abc", IO.read($mrbtest_io_wfname)
+  # an offset writes there and keeps the rest
+  assert_equal 1, IO.write($mrbtest_io_wfname, "Z", 1)
+  assert_equal "aZc", IO.read($mrbtest_io_wfname)
+  # no offset truncates
+  assert_equal 1, IO.write($mrbtest_io_wfname, "q")
+  assert_equal "q", IO.read($mrbtest_io_wfname)
+  assert_equal 2, IO.binwrite($mrbtest_io_wfname, "\xff\xfe")
+  assert_equal "\xff\xfe".bytes, IO.binread($mrbtest_io_wfname).bytes
+  assert_equal [0xfe], IO.binread($mrbtest_io_wfname, 1, 1).bytes
+  assert_equal 1, IO.binwrite($mrbtest_io_wfname, "x", 1)
+  assert_equal [0xff, 0x78], IO.binread($mrbtest_io_wfname).bytes
+  assert_equal "q", File.write($mrbtest_io_wfname, "q") && File.read($mrbtest_io_wfname)
+  File.open($mrbtest_io_wfname, "w") {}  # other tests expect it empty
+end
+
+assert('IO.read, IO.write and File.open take an encoding') do
+  path = $mrbtest_io_wfname
+  assert_equal 5, File.write(path, "hello", encoding: "UTF-8")
+  assert_equal 5, File.write(path, "hello", mode: "w:UTF-8")
+  assert_equal "hello", File.read(path, encoding: "UTF-8")
+  assert_equal "hello", File.read(path, mode: "r:UTF-8")
+  assert_equal "hello", File.read(path, external_encoding: "UTF-8")
+  assert_equal ["hello"], File.readlines(path, encoding: "UTF-8")
+  lines = []
+  File.foreach(path, encoding: "UTF-8") { |l| lines << l }
+  assert_equal ["hello"], lines
+  assert_equal "hello", File.open(path, "r:UTF-8") { |f| f.read }
+  assert_equal "hello", File.open(path, "r:UTF-8:UTF-8") { |f| f.read }
+  # an encoding mruby does not have reads as it is
+  assert_equal "hello", File.open(path, "r:ISO-8859-1") { |f| f.read }
+
+  # a binary encoding reads bytes
+  File.write(path, "\xC3\xA9")
+  assert_equal 2, File.open(path, "r:BINARY") { |f| f.read.size }
+  assert_equal 2, File.read(path, encoding: "ASCII-8BIT").size
+  File.open(path, "w") {}  # other tests expect it empty
+end
+
+assert('BOM| skips a byte order mark') do
+  path = $mrbtest_io_wfname
+  File.write(path, "\xEF\xBB\xBFhello")
+  assert_equal 8, File.read(path, mode: "rb").bytesize
+  assert_equal "hello", File.read(path, mode: "r:BOM|UTF-8")
+  assert_equal "hello", File.read(path, encoding: "BOM|UTF-8")
+  assert_equal "hello", File.open(path, "rb:BOM|UTF-8") { |f| f.read }
+  # a file that does not start with one, or is shorter than one
+  File.write(path, "hi")
+  assert_equal "hi", File.read(path, mode: "r:BOM|UTF-8")
+  File.write(path, "")
+  assert_equal "", File.read(path, mode: "r:BOM|UTF-8")
+  File.open(path, "w") {}  # other tests expect it empty
+end
+
+assert('File.foreach and IO#each take a separator') do
+  path = $mrbtest_io_wfname
+  File.write(path, "a|b|c")
+  lines = []
+  File.foreach(path, "|") { |l| lines << l }
+  assert_equal ["a|", "b|", "c"], lines
+  File.open(path) { |f| assert_equal ["a|", "b|", "c"], f.each("|").to_a } if Object.const_defined?(:Enumerator)
+  File.open(path, "w") {}  # other tests expect it empty
+end
+
+assert('BOM| skips a byte order mark that comes in pieces') do
+  skip "no popen" unless IO.respond_to?(:_popen) && !MRubyIOTestUtil.win?
+  io = IO.popen("printf '\\357'; sleep 0.2; printf '\\273\\277hi'")
+  begin
+    r = IO.new(io.fileno, "r:BOM|UTF-8", autoclose: false)
+    assert_equal "hi", r.read
+  ensure
+    io.close
+  end
+end
+
+# opens a stream that cannot read its byte order mark, in a method of its own
+# so that no register here holds the stream that did not open
+def io_test_open_bom(dir, how)
+  how == :read ? IO.read(dir, mode: "r:BOM|UTF-8") : File.open(dir, "r:BOM|UTF-8")
+rescue SystemCallError
+  :raised
+end
+
+assert('a stream that cannot read its byte order mark leaves the descriptor to its opener') do
+  skip "a directory reads on Windows" if MRubyIOTestUtil.win?
+  dir = MRubyIOTestUtil.mkdtemp("mruby-io-test.XXXXXX")
+  begin
+    [:read, :open].each do |how|
+      assert_equal :raised, io_test_open_bom(dir, how)
+      # the descriptor the opener closed is the one the next open is handed;
+      # a stream that still held it would close it again when collected
+      File.open($mrbtest_io_rfname) do |f|
+        GC.start
+        assert_equal $mrbtest_io_msg, f.read, how.to_s
+      end
+    end
+  ensure
+    MRubyIOTestUtil.rmdir dir
+  end
+end
+
+assert('IO.read and IO.write with an offset that cannot be sought') do
+  IO.write($mrbtest_io_wfname, "abc")
+  assert_raise(Errno::EINVAL) { IO.write($mrbtest_io_wfname, "Z", -1) }
+  assert_raise(Errno::EINVAL) { IO.binwrite($mrbtest_io_wfname, "Z", -1) }
+  assert_equal "abc", IO.read($mrbtest_io_wfname)
+  assert_raise(Errno::EINVAL) { IO.read($mrbtest_io_wfname, 1, -1) }
+  assert_raise(Errno::EINVAL) { IO.binread($mrbtest_io_wfname, 1, -1) }
+  assert_raise(TypeError) { IO.write($mrbtest_io_wfname, "Z", "1") }
+  assert_raise(TypeError) { IO.read($mrbtest_io_wfname, 1, "1") }
+  # nil is no offset, as it is for IO.write
+  assert_equal "abc", IO.read($mrbtest_io_wfname, nil, nil)
+  assert_equal "abc", IO.binread($mrbtest_io_wfname, nil, nil)
+  File.open($mrbtest_io_wfname, "w") {}  # other tests expect it empty
+end
+
+assert('IO#initialize keeps its descriptor when an option lookup initializes the stream again') do
+  fd1 = IO.sysopen($mrbtest_io_rfname)
+  fd2 = IO.sysopen($mrbtest_io_rfname)
+  io = IO.new(fd1, autoclose: false)
+  opt = Hash.new { |h, k| io.instance_eval { initialize(fd2) } if k == :encoding; nil }
+  io.instance_eval { initialize(fd1, "r", opt) }
+  assert_equal fd1, io.fileno
+  assert_equal $mrbtest_io_msg, io.read
+  io.close
+end
+
+assert('IO#initialize does not adopt the descriptor its stream would close') do
+  fd = IO.sysopen($mrbtest_io_rfname)
+  io = IO.new(fd)
+  assert_raise(SystemCallError) { io.instance_eval { initialize(fd) } }
+  assert_equal fd, io.fileno
+  assert_equal $mrbtest_io_msg, io.read
+
+  # the same descriptor, made the stream's own by an option lookup
+  io2 = IO.new(IO.sysopen($mrbtest_io_rfname), autoclose: false)
+  fd2 = io2.fileno
+  opt = Hash.new { |h, k| io2.instance_eval { initialize(fd2) } if k == :encoding; nil }
+  assert_raise(SystemCallError) { io2.instance_eval { initialize(fd2, "r", opt) } }
+  assert_equal fd2, io2.fileno
+  assert_equal $mrbtest_io_msg, io2.read
+  io.close
+  io2.close
+end
+
+assert('IO#initialize does not adopt a descriptor an option lookup closed') do
+  fd = IO.sysopen($mrbtest_io_rfname)
+  io = IO.new(fd)
+  opt = Hash.new { |h, k| io.close if k == :encoding; nil }
+  assert_raise(SystemCallError) { io.instance_eval { initialize(fd, "r", opt) } }
+  assert_true io.closed?
 end
 
 MRubyIOTestUtil.io_test_cleanup

@@ -58,8 +58,15 @@ mrb_open_core(void)
 #endif
 
   if (mrb_core_init_protect(mrb, init_gc_and_core, NULL)) {
-    /* Return mrb with mrb->exc set for caller to inspect */
-    return mrb;
+    if (mrb->exc) {
+      /* Return mrb with mrb->exc set for caller to inspect */
+      return mrb;
+    }
+    /* Memory ran out before NoMemoryError existed (mrb_core_init_abort()),
+       so there is no exception to report: returned, the half-built state
+       would pass MRB_OPEN_FAILURE() as a working one. */
+    mrb_close(mrb);
+    return NULL;
   }
 
   mrb_method_cache_clear(mrb);
@@ -202,6 +209,7 @@ mrb_close(mrb_state *mrb)
 
   /* free */
   mrb_gc_free_gv(mrb);
+  mrb_gc_free_giv_all(mrb);
   mrb_gc_destroy(mrb, &mrb->gc);
 #ifdef MRB_USE_REFINEMENTS
   mrb_free(mrb, mrb->refscopes);

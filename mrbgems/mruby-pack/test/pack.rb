@@ -22,9 +22,47 @@ assert('pack("m")') do
 
   assert_equal "QQ==\n", ["A", "B"].pack("m50")
   assert_equal ["A"], "QQ==\n".unpack("m50")
+  assert_equal "YWFh\nYWFh\n", ["aaaaaa"].pack("m3")
+  assert_equal "YWFh\nYWFh\nYQ==\n", ["aaaaaaa"].pack("m3")
+  assert_equal "YWFh" * 15 + "\n", ["a" * 45].pack("m")
   assert_equal "QQ==Qg==", ["A", "B"].pack("m0 m0")
   assert_equal ["A", "B"], "QQ==Qg==".unpack("m10 m10")
   assert_pack "m0", "YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXpBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWg==", ["abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"]
+end
+
+# unpack 'm' without padding (unpadded tail groups)
+assert('unpack("m") unpadded base64') do
+  # negative controls (already correct)
+  assert_equal ["abcd"], "YWJjZA==".unpack("m")
+  assert_equal ["abc"], "YWJj".unpack("m")
+
+  # final group 2/3 chars without '=' padding
+  assert_equal ["a"], "YQ".unpack("m")
+  assert_equal ["a"], "YQ=".unpack("m")
+  assert_equal ["ab"], "YWI".unpack("m")
+  assert_equal ["abcd"], "YWJjZA".unpack("m")
+  assert_equal ["abcde"], "YWJjZGU".unpack("m")
+
+  # whitespace / newlines in or after input
+  assert_equal ["abcd"], "YWJj ZA".unpack("m")
+  assert_equal ["abcd"], "YWJj\nZA".unpack("m")
+  assert_equal ["abcd"], "YWJjZA\n".unpack("m")
+
+  # single char, empty, all whitespace
+  assert_equal [""], "Y".unpack("m")
+  assert_equal [""], "".unpack("m")
+  assert_equal [""], " \n\t".unpack("m")
+
+  # multi-field templates (same consume/position semantics as CRuby 3.3)
+  assert_equal ["a\x06\x10", ""], "YQYQ".unpack("m m")
+  assert_equal ["ab\x18", ""], "YWIYQ".unpack("m a*")
+
+  # round-trip: pack without padding then unpack
+  21.times do |n|
+    bytes = (0...n).map { |i| (i * 7 + 13) & 0xff }.pack("C*")
+    b64 = [bytes].pack("m0").gsub("=", "")
+    assert_equal bytes, b64.unpack1("m")
+  end
 end
 
 # pack & unpack 'M' (Quoted-printable)
@@ -415,4 +453,79 @@ assert 'unpack of a fixed size directive past the end' do
   assert_equal [], "".unpack("U")
   assert_equal [], "".unpack("w")
   assert_equal [""], "".unpack("a")
+end
+
+assert 'pack and unpack of an unsigned value past mrb_int' do
+  # 0x83AA7E80 (the NTP epoch offset) is formed at run time: the literal does
+  # not fit MRB_INT32 without bigint and would stop this file from compiling.
+  # With bigint it is a big integer there, and a plain mrb_int on MRB_INT64.
+  hi = 0x83AA
+  value = begin
+    (hi << 16) | 0x7E80  # RangeError where mrb_int is 32 bits and bigint is absent
+  rescue RangeError
+    nil
+  end
+  if value
+    assert_equal [0x83, 0xAA, 0x7E, 0x80], [value].pack("N").unpack("C*")
+    assert_equal [0x80, 0x7E, 0xAA, 0x83], [value].pack("V").unpack("C*")
+    assert_equal [value], "\x83\xAA\x7E\x80".unpack("N")
+    assert_equal [value], "\x80\x7E\xAA\x83".unpack("V")
+    assert_equal [value], [value].pack("Q").unpack("Q")
+    # the low bits are kept, as CRuby keeps them, for a value past the directive
+    shift = 32
+    assert_equal [0x41], [(1 << shift) + 0x41].pack("N").unpack("N")
+    assert_equal [0x7E80], [value].pack("n").unpack("n")
+  else
+    assert_raise(RangeError) { "\x83\xAA\x7E\x80".unpack("N") }
+  end
+  # 2**64 - 1 exists only with bigint, whatever the width of mrb_int
+  shift = 64
+  top = begin
+    (1 << shift) - 1
+  rescue RangeError
+    nil
+  end
+  if top
+    assert_equal [0xFF] * 8, [top].pack("Q").unpack("C*")
+    assert_equal [top], ("\xFF" * 8).unpack("Q")
+    assert_equal [-1], ("\xFF" * 8).unpack("q")
+    # past 64 bits the low bits are kept, two's complement for a negative value
+    assert_equal "A", [top + 66].pack("C")
+    assert_equal [-1], [-top - 2].pack("q").unpack("q")
+    # one big integer per element over a "*" count must not fill the GC arena
+    assert_equal [top] * 128, ("\xFF" * 8 * 128).unpack("Q*")
+    # nor one made from each Float element while it is converted
+    if Object.const_defined?(:Float)
+      assert_equal [0x80, 0, 0, 0] * 128, ([2147483648.0] * 128).pack("N*").unpack("C*")
+    end
+  end
+end
+
+# What unpack hands back for a, A, Z, m, M and u holds bytes, as CRuby's
+# ASCII-8BIT strings do: an index counts bytes, even where the bytes would
+# read as UTF-8 characters or as none.
+assert('unpack gives bytes for a, A, Z, m, M and u') do
+  bytes = "\xE3\x81\x82\xFFab"
+  %w[a* A* Z*].each do |d|
+    s = bytes.unpack1(d)
+    assert_equal 6, s.size, d
+    assert_equal "\xE3", s[0], d
+  end
+  m = [bytes].pack("m0").unpack1("m0")
+  assert_equal 6, m.size
+  assert_equal "\xFFab", m[3..]
+  assert_equal 6, [bytes].pack("M").unpack1("M").size
+  assert_equal 6, [bytes].pack("u").unpack1("u").size
+  assert_equal "e38182", "\xE3\x81\x82".unpack1("H*")
+end
+
+assert('pack gives bytes unless only U, m, M and u are used') do
+  assert_equal 2, [0xE3, 0x81].pack("C*").size
+  assert_equal 3, ["\xE3\x81\x82"].pack("a*").size
+  assert_equal 4, [0x3042, 0].pack("Ux").size
+  if __ENCODING__ == "UTF-8"
+    # U alone is text: a character each
+    assert_equal 1, [0x3042].pack("U").size
+    assert_equal 2, [0x3042, 0x3044].pack("U*").size
+  end
 end
