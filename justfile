@@ -18,6 +18,7 @@ test-plain: build-plain
 test-yk: build-yk
     build/yk_build_config/bin/mruby -e 'puts "hello"'
     YKD_SERIALISE_COMPILATION=1 build/yk_build_config/bin/mruby test/yk/hot_method_change.rb
+    YKD_SERIALISE_COMPILATION=1 build/yk_build_config/bin/mruby test/yk/hot_shape_change.rb
 
 hello: build-plain
     build/host/bin/mruby -e 'puts "hello"'
