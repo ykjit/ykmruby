@@ -125,6 +125,8 @@ repos:
       - id: shellcheck
         name: run shellcheck
         description: check shell scripts with a static analysis tool
+        # Copied from ykcpython; keep it in sync rather than lint-clean.
+        exclude: ^\.buildbot\.sh$
   - repo: https://github.com/adrienverge/yamllint
     rev: v1.38.0
     hooks:
